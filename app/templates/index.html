@@ -1,0 +1,285 @@
+{% extends "base.html" %}
+
+{% block title %}抖音文案提取{% endblock %}
+
+{% block content %}
+  <section class="card card-tight">
+    <div class="status-grid">
+      <div class="status-item">
+        <span class="status-label">FFmpeg</span>
+        <strong>{{ health.ffmpeg }}</strong>
+      </div>
+      <div class="status-item">
+        <span class="status-label">MLX Whisper</span>
+        <strong>{{ health.mlx }}</strong>
+      </div>
+      <div class="status-item">
+        <span class="status-label">SenseVoice</span>
+        <strong>{{ health.sensevoice }}</strong>
+      </div>
+      <div class="status-item">
+        <span class="status-label">默认模型</span>
+        <strong class="mono">{{ health.default_model }}</strong>
+      </div>
+    </div>
+  </section>
+
+  {% if page_error %}
+    <section class="card card-error">
+      <strong>处理失败</strong>
+      <p>{{ page_error }}</p>
+    </section>
+  {% endif %}
+
+  <section class="card">
+    <div class="section-head">
+      <h2>导入表格</h2>
+      <p>支持批量上传，按顺序逐个处理。</p>
+    </div>
+    <form class="stack-form" action="/preview" method="post" enctype="multipart/form-data">
+      <label class="field">
+        <span>文件</span>
+        <input type="file" name="files" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required />
+      </label>
+      <button class="button button-primary" type="submit">读取表头</button>
+    </form>
+  </section>
+
+  {% if batch %}
+    <section class="card">
+      <div class="section-head">
+        <h2>批次配置</h2>
+        <p>{{ batch.total_files }} 个文件 · {{ batch.total_rows }} 行</p>
+      </div>
+
+      {% if batch.resumable_files %}
+        <div class="card-inline card-error">
+          <strong>检测到已有进度</strong>
+          <p>{{ batch.resumable_files }} 个文件存在同名 `*.processed.csv`，可直接继续处理，已完成的“成功 / 已删除”行会自动跳过。</p>
+        </div>
+      {% endif %}
+
+      {% if batch.common_columns %}
+        <form class="stack-form" action="/batches/{{ batch.batch_id }}/run" method="post" autocomplete="off">
+          <div class="field-grid">
+            <label class="field">
+              <span>链接列</span>
+              <select name="url_column" required>
+                {% for column in batch.common_columns %}
+                  <option value="{{ column }}">{{ column }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label class="field">
+              <span>文本列</span>
+              <input
+                type="text"
+                name="transcript_column"
+                value="{{ default_transcript_column }}"
+                placeholder="视频文本"
+                required
+              />
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>下载并发</span>
+              <input
+                type="number"
+                name="download_workers"
+                min="1"
+                max="{{ max_download_workers }}"
+                step="1"
+                value="{{ default_download_workers }}"
+                required
+              />
+            </label>
+
+            <label class="field">
+              <span>ASR 并发</span>
+              <input
+                type="number"
+                name="asr_workers"
+                min="1"
+                max="{{ max_asr_workers }}"
+                step="1"
+                value="{{ default_asr_workers }}"
+                required
+              />
+            </label>
+
+            <label class="field">
+              <span>批间等待</span>
+              <input
+                type="number"
+                name="batch_delay_seconds"
+                min="0"
+                max="{{ max_batch_delay_seconds }}"
+                step="1"
+                value="{{ default_batch_delay_seconds }}"
+                required
+              />
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>风控连续阈值</span>
+              <input
+                type="number"
+                name="anti_crawl_streak_threshold"
+                min="1"
+                max="{{ max_anti_crawl_streak_threshold }}"
+                step="1"
+                value="{{ default_anti_crawl_streak_threshold }}"
+                required
+              />
+            </label>
+
+            <label class="field">
+              <span>风控冷却(分钟)</span>
+              <input
+                type="number"
+                name="anti_crawl_cooldown_minutes"
+                min="0"
+                max="{{ max_cooldown_minutes }}"
+                step="1"
+                value="{{ default_anti_crawl_cooldown_minutes }}"
+                required
+              />
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>主动冷却批次</span>
+              <input
+                type="number"
+                name="proactive_cooldown_batch_threshold"
+                min="1"
+                max="{{ max_proactive_cooldown_batch_threshold }}"
+                step="1"
+                value="{{ default_proactive_cooldown_batch_threshold }}"
+                required
+              />
+            </label>
+
+            <label class="field">
+              <span>主动冷却(分钟)</span>
+              <input
+                type="number"
+                name="proactive_cooldown_minutes"
+                min="0"
+                max="{{ max_cooldown_minutes }}"
+                step="1"
+                value="{{ default_proactive_cooldown_minutes }}"
+                required
+              />
+            </label>
+          </div>
+
+          <label class="field">
+            <span>模型</span>
+            <textarea
+              name="model_names"
+              rows="4"
+              required
+              placeholder="每行一个模型名"
+            >{{ default_model_names_text }}</textarea>
+          </label>
+
+          <div class="preset-box">
+            <span class="preset-title">快速选择</span>
+            <div class="preset-list">
+              {% for preset in model_presets %}
+                <button
+                  type="button"
+                  class="preset-button"
+                  data-models="{{ preset.models | join('\n') }}"
+                >
+                  {{ preset.label }}
+                </button>
+              {% endfor %}
+            </div>
+            <div class="preset-notes">
+              {% for preset in model_presets %}
+                <p><strong>{{ preset.label }}</strong><span>{{ preset.note }}</span></p>
+              {% endfor %}
+            </div>
+          </div>
+
+          <label class="checkbox">
+            <input type="checkbox" name="overwrite" />
+            <span>覆盖已有文本</span>
+          </label>
+
+          <div class="action-row">
+            <button class="button button-accent" type="submit">开始批量处理</button>
+            {% if batch.resumable_files %}
+              <button class="button button-secondary" type="submit" formaction="/batches/{{ batch.batch_id }}/continue">
+                继续已有结果
+              </button>
+            {% endif %}
+          </div>
+        </form>
+      {% else %}
+        <div class="card-inline card-error">
+          <strong>无法统一配置</strong>
+          <p>这批文件没有共同表头，暂时不能一次性统一运行。</p>
+        </div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <h2>文件列表</h2>
+        <p>按上传顺序处理</p>
+      </div>
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>文件</th>
+              <th>格式</th>
+              <th>行数</th>
+              <th>已有结果</th>
+              <th>表头</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in batch.jobs %}
+              <tr>
+                <td>{{ job.sequence }}</td>
+                <td>{{ job.original_filename }}</td>
+                <td>{{ job.file_type }}</td>
+                <td>{{ job.row_count }}</td>
+                <td>
+                  {% if job.resume_available %}
+                    <span class="pill">可继续</span>
+                  {% else %}
+                    <span class="pill pill-muted">无</span>
+                  {% endif %}
+                </td>
+                <td>{{ job.columns | join(" / ") }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+
+  <script>
+    const modelTextarea = document.querySelector('textarea[name="model_names"]');
+    document.querySelectorAll(".preset-button").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (modelTextarea) {
+          modelTextarea.value = button.dataset.models || "";
+        }
+      });
+    });
+  </script>
+{% endblock %}

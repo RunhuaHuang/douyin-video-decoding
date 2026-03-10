@@ -1,0 +1,995 @@
+from pathlib import Path
+
+import httpx
+import pandas as pd
+
+from app.csv_service import inspect_csv
+from app.job_manager import JobManager
+from app.pipeline import JobProcessor
+from app.transcription_service import TranscriptionService
+
+
+class FakeVideo:
+    def __init__(self, title: str, download_url: str) -> None:
+        self.title = title
+        self.download_urls = (download_url,)
+        self.share_url = "https://v.douyin.com/example/"
+        self.page_url = "https://www.douyin.com/video/1234567890"
+        self.resolved_by = "测试替身"
+        self.is_deleted = False
+
+    @property
+    def download_url(self) -> str:
+        return self.download_urls[0]
+
+
+class FakeDownloadResult:
+    def __init__(
+        self,
+        source_url: str,
+        strategy: str = "测试直连",
+        attempts: int = 1,
+        audio_source_url: str = "",
+        audio_attempts: int = 0,
+    ) -> None:
+        self.source_url = source_url
+        self.strategy = strategy
+        self.attempts = attempts
+        self.audio_source_url = audio_source_url
+        self.audio_attempts = audio_attempts
+
+
+class FakeDouyinService:
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        return FakeVideo(title=f"title:{share_text[-4:]}", download_url="https://example.com/video.mp4")
+
+    def download_video(
+        self,
+        video: FakeVideo,
+        output_path: Path,
+        audio_output_path: Path | None = None,
+    ) -> FakeDownloadResult:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake-video")
+        return FakeDownloadResult(source_url=video.download_url)
+
+    def close(self) -> None:
+        return None
+
+
+class FakeFfmpegService:
+    def __init__(self) -> None:
+        self.last_supplemental_audio_path: Path | None = None
+
+    def is_available(self) -> bool:
+        return True
+
+    def extract_audio(
+        self,
+        video_path: Path,
+        output_path: Path,
+        sample_rate: int = 16000,
+        supplemental_audio_path: Path | None = None,
+    ) -> None:
+        self.last_supplemental_audio_path = supplemental_audio_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake-audio")
+
+
+class FakeTranscriptionService:
+    def __init__(self, default_model: str) -> None:
+        self.default_model = default_model
+
+    @staticmethod
+    def model_alias(model_name: str) -> str:
+        return model_name.rsplit("/", 1)[-1].replace("-", "_")
+
+    def transcribe(self, audio_path: Path, model_name: str = "", language: str = "") -> str:
+        if "bad-model" in (model_name or self.default_model):
+            raise RuntimeError("boom")
+        return f"transcript:{audio_path.stem}:{model_name or self.default_model}"
+
+
+class FlakyDouyinService(FakeDouyinService):
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        self.attempts += 1
+        if self.attempts < 3:
+            raise httpx.ReadTimeout("timed out")
+        return super().parse_share_text(share_text)
+
+
+class AlwaysFailDouyinService(FakeDouyinService):
+    def download_video(
+        self,
+        video: FakeVideo,
+        output_path: Path,
+        audio_output_path: Path | None = None,
+    ) -> FakeDownloadResult:
+        raise RuntimeError("403 Forbidden")
+
+
+class BrokenDouyinService:
+    def __init__(self) -> None:
+        raise ImportError("missing optional dependency")
+
+
+class DeletedVideoDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        video = super().parse_share_text(share_text)
+        video.title = "在抖音记录美好生活20260308 - 抖音"
+        video.is_deleted = True
+        video.download_urls = ()
+        return video
+
+
+class NoAudioFfmpegService(FakeFfmpegService):
+    def extract_audio(
+        self,
+        video_path: Path,
+        output_path: Path,
+        sample_rate: int = 16000,
+        supplemental_audio_path: Path | None = None,
+    ) -> None:
+        raise RuntimeError("视频没有音轨")
+
+
+class BrowserSidecarDouyinService(FakeDouyinService):
+    def download_video(
+        self,
+        video: FakeVideo,
+        output_path: Path,
+        audio_output_path: Path | None = None,
+    ) -> FakeDownloadResult:
+        result = super().download_video(video, output_path, audio_output_path)
+        if audio_output_path is not None:
+            audio_output_path.parent.mkdir(parents=True, exist_ok=True)
+            audio_output_path.write_bytes(b"fallback-audio")
+            result.audio_source_url = "https://browser.example.com/audio.m4a"
+        return result
+
+
+class PreviewOnlyDeleteHeuristicDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        raise RuntimeError(
+            "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
+            "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+            "detail API: Expecting value: line 1 column 1 (char 0) | "
+            "浏览器兜底: 浏览器兜底命中通用页，仅捕获到预览片段"
+        )
+
+
+class InvalidLinkDeleteHeuristicDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        raise RuntimeError("未在单元格中找到有效的抖音链接")
+
+
+class RecoverAfterAntiCrawlDouyinService(FakeDouyinService):
+    def __init__(self) -> None:
+        self.attempts_by_url = {}
+
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        attempts = self.attempts_by_url.get(share_text, 0) + 1
+        self.attempts_by_url[share_text] = attempts
+        if attempts == 1:
+            video = FakeVideo(title="在抖音记录美好生活20260310 - 抖音", download_url="")
+            video.resolved_by = "浏览器兜底"
+            video.is_deleted = True
+            video.download_urls = ()
+            return video
+        return super().parse_share_text(share_text)
+
+
+def test_pipeline_writes_transcripts_to_same_row(tmp_path, monkeypatch):
+    csv_path = tmp_path / "input.csv"
+    dataframe = pd.DataFrame(
+        [
+            {"url": "https://v.douyin.com/AAA111/", "name": "a"},
+            {"url": "", "name": "b"},
+            {"url": "https://v.douyin.com/BBB222/", "name": "c"},
+        ]
+    )
+    dataframe.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="input.csv",
+        upload_path=csv_path,
+        columns=["url", "name"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert job.output_path is not None
+
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    assert result.loc[0, "视频文本"].startswith("transcript:audio:mlx-community/test-model")
+    assert result.loc[1, "视频文本"] == ""
+    assert result.loc[2, "视频文本"].startswith("transcript:audio:mlx-community/test-model")
+    assert result.loc[0, "处理状态"] == "成功"
+    assert result.loc[1, "处理状态"] == "跳过"
+    assert result.loc[2, "处理状态"] == "成功"
+
+
+def test_inspect_csv_supports_single_column_utf8_file(tmp_path):
+    csv_path = tmp_path / "single_column.csv"
+    csv_path.write_text("链接\r\nhttps://www.douyin.com/video/7407774468921183522\r\n", encoding="utf-8")
+
+    inspection = inspect_csv(csv_path)
+
+    assert inspection.columns == ["链接"]
+    assert inspection.row_count == 1
+    assert inspection.preview_rows[0]["链接"] == "https://www.douyin.com/video/7407774468921183522"
+
+
+def test_pipeline_writes_multiple_model_columns(tmp_path, monkeypatch):
+    csv_path = tmp_path / "compare.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="compare.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model-a\nmlx-community/test-model-b",
+        model_names=["mlx-community/test-model-a", "mlx-community/test-model-b"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=1,
+        sleep_fn=lambda seconds: None,
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+    assert "视频文本__test_model_a" in result.columns
+    assert "视频文本__test_model_b" in result.columns
+
+
+def test_continue_existing_prefers_processed_output_file(tmp_path, monkeypatch):
+    upload_path = tmp_path / "input.csv"
+    processed_path = tmp_path / "input.processed.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(upload_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [{"url": "https://v.douyin.com/AAA111/", "视频文本": "已有文本", "处理状态": "成功", "失败原因": "", "尝试次数": "1"}]
+    ).to_csv(processed_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="input.csv",
+        upload_path=upload_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+        resume_output_path=processed_path,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: None,
+    )
+    processor.process(session.job_id, mode="continue_existing")
+
+    result = pd.read_csv(manager.require(session.job_id).output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    assert result.loc[0, "视频文本"] == "已有文本"
+    assert result.loc[0, "处理状态"] == "成功"
+
+
+def test_pipeline_keeps_partial_results_when_one_model_fails(tmp_path, monkeypatch):
+    csv_path = tmp_path / "partial.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="partial.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/good-model\nmlx-community/bad-model",
+        model_names=["mlx-community/good-model", "mlx-community/bad-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=1,
+        sleep_fn=lambda seconds: None,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert job.succeeded_rows == 1
+    assert job.failed_rows == 0
+    assert result.loc[0, "处理状态"] == "部分成功"
+    assert "转写失败" in result.loc[0, "失败原因"]
+    assert result.loc[0, "尝试次数"] == "1"
+    assert result.loc[0, "视频文本__good_model"].startswith("transcript:audio:mlx-community/good-model")
+    assert result.loc[0, "视频文本__bad_model"] == ""
+
+
+def test_transcription_service_aliases_sensevoice_model():
+    assert (
+        TranscriptionService.model_alias("FunAudioLLM/SenseVoiceSmall")
+        == "sensevoice_small"
+    )
+
+
+def test_pipeline_retries_and_then_succeeds(tmp_path, monkeypatch):
+    csv_path = tmp_path / "retry_success.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="retry_success.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FlakyDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=3,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+    assert sleeps == [5]
+    assert result.loc[0, "处理状态"] == "成功"
+    assert result.loc[0, "尝试次数"] == "3"
+    assert result.loc[0, "失败原因"] == ""
+
+
+def test_pipeline_records_final_failure_reason(tmp_path, monkeypatch):
+    csv_path = tmp_path / "retry_fail.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="retry_fail.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=AlwaysFailDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=2,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert job.failed_rows == 1
+    assert sleeps == [5]
+    assert result.loc[0, "处理状态"] == "失败"
+    assert result.loc[0, "尝试次数"] == "3"
+    assert result.loc[0, "失败原因"] == "下载失败: 403 Forbidden"
+
+
+def test_pipeline_keeps_preview_only_parse_failures_retryable_until_max_attempts(tmp_path, monkeypatch):
+    csv_path = tmp_path / "preview_only.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/7337254060967447834"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="preview_only.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=PreviewOnlyDeleteHeuristicDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=3,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    assert sleeps == [5]
+    assert result.loc[0, "处理状态"] == "失败"
+    assert result.loc[0, "视频文本"] == ""
+    assert result.loc[0, "尝试次数"] == "3"
+    assert "浏览器兜底命中通用页，仅捕获到预览片段" in result.loc[0, "失败原因"]
+
+
+def test_pipeline_cools_down_after_suspected_anti_crawl_streak_and_restores_false_deletes(tmp_path, monkeypatch):
+    csv_path = tmp_path / "anti_crawl.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+            {"url": "https://www.douyin.com/video/3"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="anti_crawl.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        download_workers=1,
+        asr_workers=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=3,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=RecoverAfterAntiCrawlDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        retry_delay_seconds=0,
+        batch_size=3,
+        anti_crawl_streak_threshold=3,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert sum(sleeps) == 60
+    assert all(result["处理状态"] == "成功")
+    assert all(result["视频文本"].str.startswith("transcript:audio:mlx-community/test-model"))
+    assert all(result["尝试次数"] == "2")
+    assert any("自动冷却" in line for line in job.logs)
+    assert any("恢复为“待重试”" in line for line in job.logs)
+
+
+def test_pipeline_marks_deleted_after_repeated_invalid_link_failures(tmp_path, monkeypatch):
+    csv_path = tmp_path / "invalid_link.csv"
+    pd.DataFrame([{"url": "not-a-douyin-link"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="invalid_link.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=InvalidLinkDeleteHeuristicDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=3,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    assert sleeps == []
+    assert result.loc[0, "处理状态"] == "已删除"
+    assert result.loc[0, "视频文本"] == "已删除"
+
+
+def test_pipeline_proactively_cools_down_after_healthy_batch_streak(tmp_path, monkeypatch):
+    csv_path = tmp_path / "healthy.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+            {"url": "https://www.douyin.com/video/3"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="healthy.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        download_workers=1,
+        asr_workers=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=2,
+        proactive_cooldown_seconds=30,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        retry_delay_seconds=0,
+        batch_size=1,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=2,
+        proactive_cooldown_seconds=30,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert sum(sleeps) == 30
+    assert all(result["处理状态"] == "成功")
+    assert any("主动冷却" in line for line in job.logs)
+
+
+def test_pipeline_allows_manual_skip_during_cooldown(tmp_path, monkeypatch):
+    csv_path = tmp_path / "skip_cooldown.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+            {"url": "https://www.douyin.com/video/3"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="skip_cooldown.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        download_workers=1,
+        asr_workers=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=3,
+        anti_crawl_cooldown_seconds=180,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    def sleep_and_skip(seconds: int) -> None:
+        sleeps.append(seconds)
+        manager.request_skip_cooldown(session.job_id)
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=RecoverAfterAntiCrawlDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=sleep_and_skip,
+        retry_delay_seconds=0,
+        batch_size=3,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert sleeps == [60]
+    assert any("已手动跳过当前冷却" in line for line in job.logs)
+
+
+def test_pipeline_marks_job_failed_when_service_init_raises(tmp_path, monkeypatch):
+    csv_path = tmp_path / "broken_init.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="broken_init.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=BrokenDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "failed"
+    assert "missing optional dependency" in job.error_message
+
+
+def test_pipeline_marks_deleted_rows_without_retry(tmp_path, monkeypatch):
+    csv_path = tmp_path / "deleted.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="deleted.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=DeletedVideoDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+    assert result.loc[0, "处理状态"] == "已删除"
+    assert result.loc[0, "视频文本"] == "已删除"
+    assert result.loc[0, "尝试次数"] == "1"
+
+
+def test_pipeline_retries_audio_extraction_no_audio_errors_twice(tmp_path, monkeypatch):
+    csv_path = tmp_path / "no_audio.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="no_audio.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=NoAudioFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        max_retries=5,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+    assert sleeps == [5]
+    assert result.loc[0, "处理状态"] == "失败"
+    assert result.loc[0, "尝试次数"] == "3"
+    assert "视频没有音轨" in result.loc[0, "失败原因"]
+
+
+def test_pipeline_passes_browser_audio_sidecar_to_ffmpeg(tmp_path, monkeypatch):
+    csv_path = tmp_path / "sidecar.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    ffmpeg_service = FakeFfmpegService()
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="sidecar.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=BrowserSidecarDouyinService,
+        ffmpeg_service_factory=lambda: ffmpeg_service,
+        transcription_service_factory=FakeTranscriptionService,
+    )
+    processor.process(session.job_id)
+
+    assert ffmpeg_service.last_supplemental_audio_path is not None
+    assert ffmpeg_service.last_supplemental_audio_path.name == "fallback_audio.m4a"

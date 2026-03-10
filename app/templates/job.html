@@ -1,0 +1,257 @@
+{% extends "base.html" %}
+
+{% block title %}任务 | 抖音文案提取{% endblock %}
+
+{% block content %}
+  <section class="card">
+    <div class="section-head">
+      <h2>任务</h2>
+      <p class="mono" id="job-id">{{ job.job_id }}</p>
+    </div>
+
+    <div class="pill-row">
+      <span class="pill" id="job-status">{{ job.status }}</span>
+      <span class="pill pill-muted">{{ job.original_filename }}</span>
+      {% if job.batch_id %}
+        <span class="pill pill-muted">批次 {{ job.batch_id[:8] }}</span>
+      {% endif %}
+      <span class="pill pill-muted">链接列 {{ job.url_column or "-" }}</span>
+      <span class="pill pill-muted">文本列 {{ job.transcript_column or "-" }}</span>
+      <span class="pill pill-muted">下载并发 {{ job.download_workers }}</span>
+      <span class="pill pill-muted">ASR 并发 {{ job.asr_workers }}</span>
+      <span class="pill pill-muted">批间等待 {{ job.batch_delay_seconds }}s</span>
+      <span class="pill pill-muted">风控阈值 {{ job.anti_crawl_streak_threshold }} 条</span>
+      <span class="pill pill-muted">风控冷却 {{ (job.anti_crawl_cooldown_seconds // 60) }} 分钟</span>
+      <span class="pill pill-muted">主动冷却 {{ job.proactive_cooldown_batch_threshold }} 批</span>
+      <span class="pill pill-muted">主动冷却时长 {{ (job.proactive_cooldown_seconds // 60) }} 分钟</span>
+      <span class="pill pill-muted">{{ (job.model_names or []) | join(" | ") }}</span>
+    </div>
+
+    <div class="metric-grid">
+      <div class="metric-card">
+        <span>总数</span>
+        <strong id="metric-total">{{ job.total_rows or job.row_count }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>完成</span>
+        <strong id="metric-processed">{{ job.processed_rows }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>成功</span>
+        <strong id="metric-success">{{ job.succeeded_rows }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>失败</span>
+        <strong id="metric-failed">{{ job.failed_rows }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>跳过</span>
+        <strong id="metric-skipped">{{ job.skipped_rows }}</strong>
+      </div>
+    </div>
+
+    <div class="progress-panel">
+      <div class="progress-meta">
+        <span id="progress-message">{{ job.current_message or "等待中" }}</span>
+        <span id="progress-url" class="mono">{{ job.current_url }}</span>
+      </div>
+      <div class="progress-track">
+        {% set total = job.total_rows or job.row_count or 1 %}
+        {% set percent = (job.processed_rows / total * 100) if total else 0 %}
+        <div class="progress-fill" id="progress-fill" style="width: {{ percent }}%;"></div>
+      </div>
+    </div>
+
+    <div id="error-box" class="card-inline card-error {% if not job.error_message %}is-hidden{% endif %}">
+      <strong>失败</strong>
+      <p id="error-text">{{ job.error_message }}</p>
+    </div>
+
+    <div class="action-row">
+      <a class="button button-secondary" href="{% if job.batch_id %}/batches/{{ job.batch_id }}{% else %}/{% endif %}">返回</a>
+      <button class="button button-secondary {% if job.status != 'running' %}is-disabled{% endif %}" id="pause-button" type="button">
+        暂停
+      </button>
+      <button class="button button-secondary {% if job.status != 'paused' %}is-disabled{% endif %}" id="resume-button" type="button">
+        继续
+      </button>
+      <button class="button button-secondary {% if not job.cooldown_active %}is-disabled{% endif %}" id="skip-cooldown-button" type="button">
+        立即继续
+      </button>
+      <button class="button button-accent {% if not job.failed_rows or job.status == 'running' %}is-disabled{% endif %}" id="retry-button" type="button">
+        重试失败项
+      </button>
+      <a class="button button-primary {% if not job.output_path %}is-disabled{% endif %}" id="download-link" href="{% if job.output_path %}/download/{{ job.job_id }}{% else %}#{% endif %}">
+        下载结果
+      </a>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>结果</h2>
+      <p>前 5 行</p>
+    </div>
+    <div class="table-shell" id="output-preview-shell">
+      {% if job.output_preview_rows %}
+        <table id="output-preview-table">
+          <thead>
+            <tr>
+              {% for column in job.output_preview_rows[0].keys() %}
+                <th>{{ column }}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in job.output_preview_rows %}
+              <tr>
+                {% for value in row.values() %}
+                  <td>{{ value }}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="empty-state" id="output-preview-empty">结果生成后显示。</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>日志</h2>
+      <p>自动刷新</p>
+    </div>
+    <pre class="log-box" id="log-output">{% if job.logs %}{{ job.logs | join('\n') }}{% else %}等待日志...{% endif %}</pre>
+  </section>
+
+  <script>
+    const jobId = "{{ job.job_id }}";
+    let poller = null;
+
+    function renderPreview(rows) {
+      const shell = document.getElementById("output-preview-shell");
+      if (!rows || rows.length === 0) {
+        shell.innerHTML = '<p class="empty-state" id="output-preview-empty">结果生成后显示。</p>';
+        return;
+      }
+
+      const columns = Object.keys(rows[0]);
+      const header = columns.map((column) => `<th>${column}</th>`).join("");
+      const body = rows
+        .map((row) => {
+          const cells = columns.map((column) => `<td>${row[column] ?? ""}</td>`).join("");
+          return `<tr>${cells}</tr>`;
+        })
+        .join("");
+
+      shell.innerHTML = `<table id="output-preview-table"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
+    async function refreshJob() {
+      const response = await fetch(`/api/jobs/${jobId}`);
+      if (!response.ok) return;
+
+      const job = await response.json();
+      const total = Math.max(job.total_rows || job.row_count || 0, 1);
+      const percent = Math.min(100, Math.round((job.processed_rows / total) * 100));
+
+      document.getElementById("job-status").textContent = job.status;
+      document.getElementById("metric-total").textContent = job.total_rows || job.row_count || 0;
+      document.getElementById("metric-processed").textContent = job.processed_rows;
+      document.getElementById("metric-success").textContent = job.succeeded_rows;
+      document.getElementById("metric-failed").textContent = job.failed_rows;
+      document.getElementById("metric-skipped").textContent = job.skipped_rows;
+      document.getElementById("progress-message").textContent = job.current_message || "等待中";
+      document.getElementById("progress-url").textContent = job.current_url || "";
+      document.getElementById("progress-fill").style.width = `${percent}%`;
+      document.getElementById("log-output").textContent = (job.logs || []).join("\n") || "等待日志...";
+
+      const errorBox = document.getElementById("error-box");
+      const errorText = document.getElementById("error-text");
+      if (job.error_message) {
+        errorText.textContent = job.error_message;
+        errorBox.classList.remove("is-hidden");
+      } else {
+        errorBox.classList.add("is-hidden");
+      }
+
+      const downloadLink = document.getElementById("download-link");
+      if (job.output_path) {
+        downloadLink.href = `/download/${jobId}`;
+        downloadLink.classList.remove("is-disabled");
+      } else {
+        downloadLink.href = "#";
+        downloadLink.classList.add("is-disabled");
+      }
+
+      const pauseButton = document.getElementById("pause-button");
+      const resumeButton = document.getElementById("resume-button");
+      const skipCooldownButton = document.getElementById("skip-cooldown-button");
+      const retryButton = document.getElementById("retry-button");
+
+      pauseButton.classList.toggle("is-disabled", job.status !== "running");
+      resumeButton.classList.toggle("is-disabled", job.status !== "paused");
+      skipCooldownButton.classList.toggle("is-disabled", !job.cooldown_active);
+      retryButton.classList.toggle("is-disabled", job.status === "running" || !job.failed_rows);
+
+      renderPreview(job.output_preview_rows || []);
+
+      if (job.status === "completed" || job.status === "failed" || job.status === "paused") {
+        stopPolling();
+      }
+    }
+
+    async function postAction(path) {
+      const response = await fetch(path, { method: "POST" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        const message = payload.detail || "操作失败";
+        alert(message);
+        return;
+      }
+      startPolling();
+      refreshJob();
+    }
+
+    function startPolling() {
+      stopPolling();
+      poller = setInterval(refreshJob, 2000);
+    }
+
+    function stopPolling() {
+      if (poller) {
+        clearInterval(poller);
+        poller = null;
+      }
+    }
+
+    document.getElementById("pause-button").addEventListener("click", () => {
+      if (!document.getElementById("pause-button").classList.contains("is-disabled")) {
+        postAction(`/jobs/${jobId}/pause`);
+      }
+    });
+
+    document.getElementById("resume-button").addEventListener("click", () => {
+      if (!document.getElementById("resume-button").classList.contains("is-disabled")) {
+        postAction(`/jobs/${jobId}/resume`);
+      }
+    });
+
+    document.getElementById("skip-cooldown-button").addEventListener("click", () => {
+      if (!document.getElementById("skip-cooldown-button").classList.contains("is-disabled")) {
+        postAction(`/jobs/${jobId}/skip-cooldown`);
+      }
+    });
+
+    document.getElementById("retry-button").addEventListener("click", () => {
+      if (!document.getElementById("retry-button").classList.contains("is-disabled")) {
+        postAction(`/jobs/${jobId}/retry-failed`);
+      }
+    });
+
+    startPolling();
+    refreshJob();
+  </script>
+{% endblock %}

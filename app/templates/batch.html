@@ -1,0 +1,253 @@
+{% extends "base.html" %}
+
+{% block title %}批次 | 抖音文案提取{% endblock %}
+
+{% block content %}
+  <section class="card">
+    <div class="section-head">
+      <h2>批次</h2>
+      <p class="mono" id="batch-id">{{ batch.batch_id }}</p>
+    </div>
+
+    <div class="pill-row">
+      <span class="pill" id="batch-status">{{ batch.status }}</span>
+      <span class="pill pill-muted">{{ batch.total_files }} 个文件</span>
+      <span class="pill pill-muted">链接列 {{ batch.url_column or "-" }}</span>
+      <span class="pill pill-muted">文本列 {{ batch.transcript_column or "-" }}</span>
+      <span class="pill pill-muted">下载并发 {{ batch.download_workers }}</span>
+      <span class="pill pill-muted">ASR 并发 {{ batch.asr_workers }}</span>
+      <span class="pill pill-muted">批间等待 {{ batch.batch_delay_seconds }}s</span>
+      <span class="pill pill-muted">风控阈值 {{ batch.anti_crawl_streak_threshold }} 条</span>
+      <span class="pill pill-muted">风控冷却 {{ (batch.anti_crawl_cooldown_seconds // 60) }} 分钟</span>
+      <span class="pill pill-muted">主动冷却 {{ batch.proactive_cooldown_batch_threshold }} 批</span>
+      <span class="pill pill-muted">主动冷却时长 {{ (batch.proactive_cooldown_seconds // 60) }} 分钟</span>
+      <span class="pill pill-muted">{{ (batch.model_names or []) | join(" | ") }}</span>
+    </div>
+
+    <div class="metric-grid">
+      <div class="metric-card">
+        <span>文件总数</span>
+        <strong id="metric-total-files">{{ batch.total_files }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>已完成</span>
+        <strong id="metric-completed-files">{{ batch.completed_files }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>运行中</span>
+        <strong id="metric-running-files">{{ batch.running_files }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>失败</span>
+        <strong id="metric-failed-files">{{ batch.failed_files }}</strong>
+      </div>
+      <div class="metric-card">
+        <span>暂停</span>
+        <strong id="metric-paused-files">{{ batch.paused_files }}</strong>
+      </div>
+    </div>
+
+    <div class="progress-panel">
+      <div class="progress-meta">
+        <span id="batch-progress-message">{{ batch.current_message or "等待中" }}</span>
+        <span id="batch-progress-detail" class="mono">
+          {% if batch.current_file_index %}{{ batch.current_file_index }}/{{ batch.total_files }}{% endif %}
+        </span>
+      </div>
+      <div class="progress-track">
+        {% set total = batch.total_rows or 1 %}
+        {% set percent = (batch.processed_rows / total * 100) if total else 0 %}
+        <div class="progress-fill" id="batch-progress-fill" style="width: {{ percent }}%;"></div>
+      </div>
+    </div>
+
+    <div id="batch-error-box" class="card-inline card-error {% if not batch.error_message %}is-hidden{% endif %}">
+      <strong>失败</strong>
+      <p id="batch-error-text">{{ batch.error_message }}</p>
+    </div>
+
+    <div class="action-row">
+      <a class="button button-secondary" href="/">返回</a>
+      <button class="button button-secondary {% if batch.status != 'running' %}is-disabled{% endif %}" id="pause-batch-button" type="button">
+        暂停批次
+      </button>
+      <button class="button button-secondary {% if batch.status != 'paused' %}is-disabled{% endif %}" id="resume-batch-button" type="button">
+        继续批次
+      </button>
+      <button class="button button-secondary {% if not batch.cooldown_active %}is-disabled{% endif %}" id="skip-batch-cooldown-button" type="button">
+        立即继续
+      </button>
+      <a
+        class="button button-primary {% if not (batch.jobs | selectattr('output_path') | list) %}is-disabled{% endif %}"
+        id="download-batch-link"
+        href="{% if batch.jobs | selectattr('output_path') | list %}/download/batches/{{ batch.batch_id }}{% else %}#{% endif %}"
+      >
+        打包下载
+      </a>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>文件进度</h2>
+      <p>结果会持续更新，可随时下载当前进度文件。</p>
+    </div>
+    <div class="table-shell">
+      <table id="batch-job-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>文件</th>
+            <th>状态</th>
+            <th>进度</th>
+            <th>成功</th>
+            <th>失败</th>
+            <th>跳过</th>
+            <th>当前消息</th>
+            <th>下载</th>
+            <th>详情</th>
+          </tr>
+        </thead>
+        <tbody id="batch-job-body">
+          {% for job in batch.jobs %}
+            <tr>
+              <td>{{ job.sequence }}</td>
+              <td>{{ job.original_filename }}</td>
+              <td>{{ job.status }}</td>
+              <td>{{ job.processed_rows }}/{{ job.total_rows or job.row_count }}</td>
+              <td>{{ job.succeeded_rows }}</td>
+              <td>{{ job.failed_rows }}</td>
+              <td>{{ job.skipped_rows }}</td>
+              <td>{{ job.current_message }}</td>
+              <td>
+                {% if job.output_path %}
+                  <a class="button button-primary" href="/download/{{ job.job_id }}">下载</a>
+                {% else %}
+                  <span class="pill pill-muted">未生成</span>
+                {% endif %}
+              </td>
+              <td><a class="button button-secondary" href="/jobs/{{ job.job_id }}">查看</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    const batchId = "{{ batch.batch_id }}";
+    let poller = null;
+
+    function renderJobs(jobs) {
+      const tbody = document.getElementById("batch-job-body");
+      tbody.innerHTML = jobs.map((job) => {
+        const total = job.total_rows || job.row_count || 0;
+        const download = job.output_path
+          ? `<a class="button button-primary" href="/download/${job.job_id}">下载</a>`
+          : '<span class="pill pill-muted">未生成</span>';
+        return `
+          <tr>
+            <td>${job.sequence}</td>
+            <td>${job.original_filename}</td>
+            <td>${job.status}</td>
+            <td>${job.processed_rows}/${total}</td>
+            <td>${job.succeeded_rows}</td>
+            <td>${job.failed_rows}</td>
+            <td>${job.skipped_rows}</td>
+            <td>${job.current_message || ""}</td>
+            <td>${download}</td>
+            <td><a class="button button-secondary" href="/jobs/${job.job_id}">查看</a></td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    async function refreshBatch() {
+      const response = await fetch(`/api/batches/${batchId}`);
+      if (!response.ok) return;
+
+      const batch = await response.json();
+      const totalRows = Math.max(batch.total_rows || 0, 1);
+      const percent = Math.min(100, Math.round((batch.processed_rows / totalRows) * 100));
+
+      document.getElementById("batch-status").textContent = batch.status;
+      document.getElementById("metric-total-files").textContent = batch.total_files;
+      document.getElementById("metric-completed-files").textContent = batch.completed_files;
+      document.getElementById("metric-running-files").textContent = batch.running_files;
+      document.getElementById("metric-failed-files").textContent = batch.failed_files;
+      document.getElementById("metric-paused-files").textContent = batch.paused_files;
+      document.getElementById("batch-progress-message").textContent = batch.current_message || "等待中";
+      document.getElementById("batch-progress-detail").textContent = batch.current_file_index
+        ? `${batch.current_file_index}/${batch.total_files}`
+        : "";
+      document.getElementById("batch-progress-fill").style.width = `${percent}%`;
+
+      const errorBox = document.getElementById("batch-error-box");
+      const errorText = document.getElementById("batch-error-text");
+      if (batch.error_message) {
+        errorText.textContent = batch.error_message;
+        errorBox.classList.remove("is-hidden");
+      } else {
+        errorBox.classList.add("is-hidden");
+      }
+
+      document.getElementById("pause-batch-button").classList.toggle("is-disabled", batch.status !== "running");
+      document.getElementById("resume-batch-button").classList.toggle("is-disabled", batch.status !== "paused");
+      document.getElementById("skip-batch-cooldown-button").classList.toggle("is-disabled", !batch.cooldown_active);
+      const downloadBatchLink = document.getElementById("download-batch-link");
+      const hasOutputs = (batch.jobs || []).some((job) => !!job.output_path);
+      downloadBatchLink.classList.toggle("is-disabled", !hasOutputs);
+      downloadBatchLink.href = hasOutputs ? `/download/batches/${batchId}` : "#";
+
+      renderJobs(batch.jobs || []);
+
+      if (batch.status === "completed" || batch.status === "failed") {
+        stopPolling();
+      }
+    }
+
+    async function postAction(path) {
+      const response = await fetch(path, { method: "POST" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        alert(payload.detail || "操作失败");
+        return;
+      }
+      startPolling();
+      refreshBatch();
+    }
+
+    function startPolling() {
+      stopPolling();
+      poller = setInterval(refreshBatch, 2000);
+    }
+
+    function stopPolling() {
+      if (poller) {
+        clearInterval(poller);
+        poller = null;
+      }
+    }
+
+    document.getElementById("pause-batch-button").addEventListener("click", () => {
+      if (!document.getElementById("pause-batch-button").classList.contains("is-disabled")) {
+        postAction(`/batches/${batchId}/pause`);
+      }
+    });
+
+    document.getElementById("resume-batch-button").addEventListener("click", () => {
+      if (!document.getElementById("resume-batch-button").classList.contains("is-disabled")) {
+        postAction(`/batches/${batchId}/resume`);
+      }
+    });
+
+    document.getElementById("skip-batch-cooldown-button").addEventListener("click", () => {
+      if (!document.getElementById("skip-batch-cooldown-button").classList.contains("is-disabled")) {
+        postAction(`/batches/${batchId}/skip-cooldown`);
+      }
+    });
+
+    startPolling();
+    refreshBatch();
+  </script>
+{% endblock %}

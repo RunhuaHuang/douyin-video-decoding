@@ -1,0 +1,50 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+URL="http://127.0.0.1:8000"
+HEALTH_URL="$URL/health"
+SERVER_PID=""
+
+cd "$ROOT_DIR"
+
+if command -v curl >/dev/null 2>&1; then
+  if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+    open "$URL"
+    echo "服务已在运行，已打开浏览器：$URL"
+    exit 0
+  fi
+fi
+
+cleanup() {
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    kill "$SERVER_PID" >/dev/null 2>&1 || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+}
+
+trap cleanup INT TERM EXIT
+
+uv run douyin-csv-webui &
+SERVER_PID="$!"
+
+for _ in {1..60}; do
+  if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    wait "$SERVER_PID"
+    exit $?
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
+      open "$URL"
+      wait "$SERVER_PID"
+      exit $?
+    fi
+  fi
+
+  sleep 1
+done
+
+echo "服务启动超过 60 秒仍未就绪，请检查终端日志。" >&2
+wait "$SERVER_PID"

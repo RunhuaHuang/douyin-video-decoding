@@ -168,6 +168,53 @@ def test_download_video_uses_browser_fallback_after_direct_failures(tmp_path):
     assert resolver.download_calls == 1
 
 
+def test_parse_share_text_rejects_direct_note_as_non_video():
+    service = DouyinService(
+        browser_fallback_enabled=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    try:
+        service.parse_share_text("https://www.douyin.com/note/7368733740719295779")
+    except RuntimeError as exc:
+        assert str(exc) == "链接类型为图文 note，非视频内容"
+    else:
+        raise AssertionError("expected direct note url to be treated as non-video")
+    finally:
+        service.close()
+
+
+def test_parse_share_text_rejects_short_link_that_resolves_to_note():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "v.douyin.com" in url:
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://www.douyin.com/note/7368733740719295779"},
+            )
+        return httpx.Response(200, request=request, text="<html>note</html>")
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
+        browser_fallback_enabled=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    try:
+        service.parse_share_text("https://v.douyin.com/example/")
+    except RuntimeError as exc:
+        assert str(exc) == "链接类型为图文 note，非视频内容"
+    else:
+        raise AssertionError("expected note redirect to be treated as non-video")
+    finally:
+        service.close()
+
+
 def test_parse_share_text_uses_browser_when_interfaces_fail():
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)

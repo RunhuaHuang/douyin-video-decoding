@@ -55,7 +55,7 @@
       {% if batch.resumable_files %}
         <div class="card-inline card-error">
           <strong>检测到已有进度</strong>
-          <p>{{ batch.resumable_files }} 个文件存在同名 `*.processed.csv`，可直接继续处理，已完成的“成功 / 已删除”行会自动跳过。</p>
+          <p>{{ batch.resumable_files }} 个文件存在同名 `*.processed.csv`，可直接继续处理，已完成的“成功 / 已删除 / 非视频”行会自动跳过。</p>
         </div>
       {% endif %}
 

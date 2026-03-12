@@ -166,6 +166,11 @@ class InvalidLinkDeleteHeuristicDouyinService(FakeDouyinService):
         raise RuntimeError("未在单元格中找到有效的抖音链接")
 
 
+class NonVideoNoteDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        raise RuntimeError("链接类型为图文 note，非视频内容")
+
+
 class RecoverAfterAntiCrawlDouyinService(FakeDouyinService):
     def __init__(self) -> None:
         self.attempts_by_url = {}
@@ -818,6 +823,31 @@ def test_record_row_control_signal_ignores_deleted_strong_suspicion():
     assert run_state.pending_cooldown is None
 
 
+def test_record_row_control_signal_ignores_non_deleted_strong_suspicion():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
+        outcome=RowOutcome(
+            status="失败",
+            attempts=2,
+            anti_crawl_strong_suspected=True,
+            anti_crawl_signal_descriptions=("强冷却信号：验证码挑战页",),
+        ),
+    )
+
+    assert run_state.suspicious_tasks == []
+    assert run_state.suspicious_deleted_tasks == []
+    assert run_state.pending_cooldown is None
+
+
 def test_pipeline_cools_down_after_mixed_suspected_parse_failures(tmp_path, monkeypatch):
     csv_path = tmp_path / "mixed_anti_crawl.csv"
     pd.DataFrame(
@@ -1002,7 +1032,7 @@ def test_pipeline_does_not_cool_down_for_retry_stage_suspected_deletes(tmp_path,
     assert not any("恢复为“待重试”" in line for line in job.logs)
 
 
-def test_pipeline_ignores_challenge_signals_for_confident_deleted_results(tmp_path, monkeypatch):
+def test_pipeline_logs_but_does_not_cool_down_for_challenge_signals(tmp_path, monkeypatch):
     csv_path = tmp_path / "challenge_deleted.csv"
     pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
         csv_path,
@@ -1282,6 +1312,57 @@ def test_pipeline_marks_deleted_rows_without_retry(tmp_path, monkeypatch):
     assert result.loc[0, "处理状态"] == "已删除"
     assert result.loc[0, "视频文本"] == "已删除"
     assert result.loc[0, "尝试次数"] == "1"
+
+
+def test_pipeline_marks_note_rows_as_non_video_without_retry(tmp_path, monkeypatch):
+    csv_path = tmp_path / "note.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/note/7368733740719295779"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="note.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=NonVideoNoteDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    assert result.loc[0, "处理状态"] == "非视频"
+    assert result.loc[0, "视频文本"] == ""
+    assert result.loc[0, "尝试次数"] == "1"
+    assert result.loc[0, "失败原因"] == "链接类型为图文 note，非视频内容"
 
 
 def test_pipeline_retries_audio_extraction_no_audio_errors_twice(tmp_path, monkeypatch):

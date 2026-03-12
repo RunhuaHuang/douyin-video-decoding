@@ -97,6 +97,8 @@ class DownloadResult:
 
 
 class DouyinService:
+    NON_VIDEO_NOTE_ERROR = "链接类型为图文 note，非视频内容"
+
     def __init__(
         self,
         timeout: float = DOUYIN_REQUEST_TIMEOUT_SECONDS,
@@ -156,6 +158,8 @@ class DouyinService:
         share_url = self.extract_first_url(share_text)
         if not share_url:
             raise RuntimeError("未在单元格中找到有效的抖音链接")
+        if self.is_note_url(share_url):
+            raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
 
         self._sync_client_cookies_from_browser()
         initial_page_was_challenge = False
@@ -163,8 +167,12 @@ class DouyinService:
             response = self._get(share_url, headers=MOBILE_PARSE_HEADERS)
             response.raise_for_status()
             final_url = str(response.url)
+            if self.is_note_url(final_url):
+                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
             initial_page_was_challenge = self._looks_like_challenge_page(response.text)
         except Exception as exc:
+            if self.NON_VIDEO_NOTE_ERROR in str(exc):
+                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR) from exc
             browser_video, browser_error = self._try_parse_with_browser(share_url)
             if browser_video is not None:
                 return browser_video
@@ -300,6 +308,10 @@ class DouyinService:
             if match:
                 return match.group(1)
         return None
+
+    @staticmethod
+    def is_note_url(url: str) -> bool:
+        return bool(re.search(r"/note/\d+", url or ""))
 
     def _parse_from_share_page(self, video_id: str, *, share_url: str, page_url: str) -> ParsedVideo:
         share_page_url = f"https://www.iesdouyin.com/share/video/{video_id}"

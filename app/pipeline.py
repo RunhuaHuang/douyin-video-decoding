@@ -44,13 +44,15 @@ from .transcription_service import TranscriptionService
 
 
 SUCCESS_STATUSES = {"成功", "部分成功"}
-SKIP_STATUSES = {"跳过", "已删除"}
+NON_VIDEO_STATUS = "非视频"
+SKIP_STATUSES = {"跳过", "已删除", NON_VIDEO_STATUS}
 RETRY_PENDING_STATUS = "待重试"
 FAILED_STATUSES = {"失败", RETRY_PENDING_STATUS}
 TERMINAL_STATUSES = SUCCESS_STATUSES | SKIP_STATUSES
 PREVIEW_ONLY_DELETE_ERROR = "浏览器兜底命中通用页，仅捕获到预览片段"
 INVALID_LINK_DELETE_ATTEMPTS = 2
 INVALID_LINK_ERROR = "未在单元格中找到有效的抖音链接"
+NON_VIDEO_ERROR = DouyinService.NON_VIDEO_NOTE_ERROR
 PREVIEW_ONLY_RETRY_ATTEMPTS = 3
 NO_AUDIO_RETRY_ATTEMPTS = 3
 NO_AUDIO_ERROR = "视频没有音轨"
@@ -705,6 +707,19 @@ class JobProcessor:
                 log_messages=tuple(log_messages),
             )
         except RowProcessingError as exc:
+            if self._is_non_video_parse_error(exc):
+                return RowExecutionResult(
+                    plan=plan,
+                    outcome=RowOutcome(
+                        status=NON_VIDEO_STATUS,
+                        attempts=plan.attempt_number,
+                        error_message=NON_VIDEO_ERROR,
+                    ),
+                    log_messages=(
+                        f"第 {plan.task.csv_row_number} 行识别为图文 note，按“{NON_VIDEO_STATUS}”跳过",
+                    ),
+                    cleanup_dir=row_dir,
+                )
             delete_reason = self._deleted_reason_for_error(exc, plan.attempt_number)
             if delete_reason:
                 self._consume_attempt_challenge_signal_descriptions(douyin)
@@ -972,11 +987,9 @@ class JobProcessor:
 
     @staticmethod
     def _should_trigger_anti_crawl_cooldown(outcome: RowOutcome) -> bool:
-        # Retry queues are biased toward hard links, so weak signals only count on
-        # the first attempt. Explicit challenge signals stay active across retries.
-        return outcome.anti_crawl_strong_suspected or (
-            outcome.anti_crawl_suspected and outcome.attempts == 1
-        )
+        # Only weak signals participate in cooldown. Strong signals remain useful
+        # for logs, but they are too noisy in real runs to drive the stop logic.
+        return outcome.anti_crawl_suspected and outcome.attempts == 1
 
     def _finalize_batch(
         self,
@@ -1416,6 +1429,16 @@ class JobProcessor:
                 error_message=" | ".join(model_failures),
             )
         except RowProcessingError as exc:
+            if self._is_non_video_parse_error(exc):
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行识别为图文 note，按“{NON_VIDEO_STATUS}”跳过",
+                )
+                return RowOutcome(
+                    status=NON_VIDEO_STATUS,
+                    attempts=attempt_number,
+                    error_message=NON_VIDEO_ERROR,
+                )
             delete_reason = self._deleted_reason_for_error(exc, attempt_number)
             if delete_reason:
                 self._consume_attempt_challenge_signal_descriptions(douyin)
@@ -1690,6 +1713,10 @@ class JobProcessor:
     @staticmethod
     def _is_invalid_link_parse_error(exc: RowProcessingError) -> bool:
         return exc.stage == "解析" and INVALID_LINK_ERROR in exc.detail
+
+    @staticmethod
+    def _is_non_video_parse_error(exc: RowProcessingError) -> bool:
+        return exc.stage == "解析" and NON_VIDEO_ERROR in exc.detail
 
     def _should_mark_deleted_from_invalid_link(self, exc: RowProcessingError, attempt_number: int) -> bool:
         return self._is_invalid_link_parse_error(exc) and attempt_number >= INVALID_LINK_DELETE_ATTEMPTS

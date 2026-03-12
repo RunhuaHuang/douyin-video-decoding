@@ -82,16 +82,7 @@ class PlaywrightFallback:
         self._context = None
 
     def close(self) -> None:
-        if self._context is not None:
-            self._persist_storage_state()
-            self._context.close()
-            self._context = None
-        if self._browser is not None:
-            self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            self._playwright.stop()
-            self._playwright = None
+        self._reset_runtime()
 
     def capture_video(self, share_url: str) -> BrowserCapture:
         page = self._ensure_context().new_page()
@@ -167,7 +158,7 @@ class PlaywrightFallback:
             except Exception:
                 page_text = ""
             if self._looks_like_challenge_page(title, page_text):
-                self._note_challenge()
+                self._note_challenge("验证码挑战页")
             else:
                 self._note_success()
 
@@ -434,8 +425,10 @@ class PlaywrightFallback:
                     self._persist_storage_state()
                     return url, position
 
-                if status in {403, 429}:
-                    self._note_challenge()
+                if status == 403:
+                    self._note_challenge("浏览器下载 HTTP 403")
+                elif status == 429:
+                    self._note_challenge("浏览器下载 HTTP 429")
                 errors.append(f"HTTP {status}")
             except Exception as exc:
                 errors.append(self._format_browser_error(exc))
@@ -537,13 +530,14 @@ class PlaywrightFallback:
             monotonic_fn=time.monotonic,
         )
 
-    def _note_challenge(self) -> None:
+    def _note_challenge(self, reason: str = "") -> None:
         if self.request_coordinator is None:
             return
         self.request_coordinator.note_challenge(
             base_cooldown_seconds=DOUYIN_CHALLENGE_BASE_COOLDOWN_SECONDS,
             max_cooldown_seconds=DOUYIN_CHALLENGE_MAX_COOLDOWN_SECONDS,
             monotonic_fn=time.monotonic,
+            reason=reason,
         )
 
     def _note_success(self) -> None:

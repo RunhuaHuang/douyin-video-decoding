@@ -5,7 +5,7 @@ import pandas as pd
 
 from app.csv_service import inspect_csv
 from app.job_manager import JobManager
-from app.pipeline import JobProcessor
+from app.pipeline import JobProcessor, RowOutcome, RowTask, RunControlState
 from app.transcription_service import TranscriptionService
 
 
@@ -174,6 +174,67 @@ class RecoverAfterAntiCrawlDouyinService(FakeDouyinService):
         attempts = self.attempts_by_url.get(share_text, 0) + 1
         self.attempts_by_url[share_text] = attempts
         if attempts == 1:
+            video = FakeVideo(title="在抖音记录美好生活20260310 - 抖音", download_url="")
+            video.resolved_by = "浏览器兜底"
+            video.is_deleted = True
+            video.download_urls = ()
+            return video
+        return super().parse_share_text(share_text)
+
+
+class RecoverAfterMixedAntiCrawlParseFailureDouyinService(FakeDouyinService):
+    def __init__(self) -> None:
+        self.attempts_by_url = {}
+
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        attempts = self.attempts_by_url.get(share_text, 0) + 1
+        self.attempts_by_url[share_text] = attempts
+        if attempts == 1:
+            if share_text.endswith("/1") or share_text.endswith("/3"):
+                raise RuntimeError(
+                    "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
+                    "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+                    "detail API: Expecting value: line 1 column 1 (char 0) | "
+                    "浏览器兜底: 浏览器兜底没有捕获到视频地址"
+                )
+            raise httpx.ReadTimeout("timed out")
+        return super().parse_share_text(share_text)
+
+
+class PersistentDeletedAfterCooldownDouyinService(FakeDouyinService):
+    def __init__(self) -> None:
+        self.attempts_by_url = {}
+
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        attempts = self.attempts_by_url.get(share_text, 0) + 1
+        self.attempts_by_url[share_text] = attempts
+        if attempts <= 2:
+            video = FakeVideo(title="在抖音记录美好生活20260310 - 抖音", download_url="")
+            video.resolved_by = "浏览器兜底"
+            video.is_deleted = True
+            video.download_urls = ()
+            return video
+        return super().parse_share_text(share_text)
+
+
+class ChallengeDeletedAfterCooldownDouyinService(FakeDouyinService):
+    def __init__(self) -> None:
+        self.attempts_by_url = {}
+        self.challenge_seen = False
+
+    def reset_attempt_signals(self) -> None:
+        self.challenge_seen = False
+
+    def consume_attempt_challenge_signal(self) -> bool:
+        seen = self.challenge_seen
+        self.challenge_seen = False
+        return seen
+
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        attempts = self.attempts_by_url.get(share_text, 0) + 1
+        self.attempts_by_url[share_text] = attempts
+        if attempts <= 2:
+            self.challenge_seen = True
             video = FakeVideo(title="在抖音记录美好生活20260310 - 抖音", download_url="")
             video.resolved_by = "浏览器兜底"
             video.is_deleted = True
@@ -402,6 +463,46 @@ def test_transcription_service_aliases_sensevoice_model():
     )
 
 
+def test_transcription_service_cleans_up_sensevoice_runtime_after_success(tmp_path, monkeypatch):
+    service = TranscriptionService()
+    cleanups = []
+
+    monkeypatch.setattr(service, "_get_sensevoice_model", lambda model_name: ("model", "mps"))
+    monkeypatch.setattr(service, "_generate_sensevoice_text", lambda model, audio_path, language: "ok")
+    monkeypatch.setattr(service, "_cleanup_sensevoice_runtime", lambda device: cleanups.append(device))
+
+    text = service._transcribe_sensevoice(tmp_path / "audio.wav", "FunAudioLLM/SenseVoiceSmall", "zh")
+
+    assert text == "ok"
+    assert cleanups == ["mps"]
+
+
+def test_transcription_service_cleans_up_mps_and_cpu_on_fallback(tmp_path, monkeypatch):
+    service = TranscriptionService()
+    cleanups = []
+    seen_devices = []
+
+    def fake_get_model(model_name: str):
+        if not seen_devices:
+            seen_devices.append("mps")
+            return "mps-model", "mps"
+        return "cpu-model", "cpu"
+
+    def fake_generate(model, audio_path, language):
+        if model == "mps-model":
+            raise RuntimeError("mps failed")
+        return "cpu-ok"
+
+    monkeypatch.setattr(service, "_get_sensevoice_model", fake_get_model)
+    monkeypatch.setattr(service, "_generate_sensevoice_text", fake_generate)
+    monkeypatch.setattr(service, "_cleanup_sensevoice_runtime", lambda device: cleanups.append(device))
+
+    text = service._transcribe_sensevoice(tmp_path / "audio.wav", "FunAudioLLM/SenseVoiceSmall", "zh")
+
+    assert text == "cpu-ok"
+    assert cleanups == ["mps", "cpu"]
+
+
 def test_pipeline_retries_and_then_succeeds(tmp_path, monkeypatch):
     csv_path = tmp_path / "retry_success.csv"
     pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
@@ -562,7 +663,7 @@ def test_pipeline_keeps_preview_only_parse_failures_retryable_until_max_attempts
     assert "浏览器兜底命中通用页，仅捕获到预览片段" in result.loc[0, "失败原因"]
 
 
-def test_pipeline_cools_down_after_suspected_anti_crawl_streak_and_restores_false_deletes(tmp_path, monkeypatch):
+def test_pipeline_keeps_browser_deleted_results_terminal_without_cooldown(tmp_path, monkeypatch):
     csv_path = tmp_path / "anti_crawl.csv"
     pd.DataFrame(
         [
@@ -621,12 +722,165 @@ def test_pipeline_cools_down_after_suspected_anti_crawl_streak_and_restores_fals
     result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
 
     assert job.status == "completed"
+    assert sleeps == []
+    assert all(result["处理状态"] == "已删除")
+    assert all(result["视频文本"] == "已删除")
+    assert all(result["尝试次数"] == "1")
+    assert not any("自动冷却" in line for line in job.logs)
+    assert not any("冷却信号：" in line for line in job.logs)
+    assert not any("恢复为“待重试”" in line for line in job.logs)
+
+
+def test_record_row_control_signal_keeps_suspicion_until_explicit_success():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=3,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
+        outcome=RowOutcome(
+            status="失败",
+            attempts=1,
+            anti_crawl_suspected=True,
+            anti_crawl_signal_descriptions=("弱冷却信号：分享页/接口异常且浏览器未捕获视频地址",),
+        ),
+    )
+    assert [task.csv_row_number for task in run_state.suspicious_tasks] == [2]
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=1, position=2, csv_row_number=3, url_value="u2"),
+        outcome=RowOutcome(status="失败", attempts=1, error_message="解析失败: 读取超时"),
+    )
+    assert [task.csv_row_number for task in run_state.suspicious_tasks] == [2]
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=2, position=3, csv_row_number=4, url_value="u3"),
+        outcome=RowOutcome(status="成功", attempts=1),
+    )
+    assert run_state.suspicious_tasks == []
+
+
+def test_record_row_control_signal_ignores_retry_stage_weak_suspicion():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
+        outcome=RowOutcome(
+            status="已删除",
+            attempts=2,
+            anti_crawl_suspected=True,
+            anti_crawl_signal_descriptions=("弱冷却信号：浏览器兜底删除页标题（在抖音记录美好生活）",),
+        ),
+    )
+
+    assert run_state.suspicious_tasks == []
+    assert run_state.suspicious_deleted_tasks == []
+    assert run_state.pending_cooldown is None
+
+
+def test_record_row_control_signal_ignores_deleted_strong_suspicion():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
+        outcome=RowOutcome(
+            status="已删除",
+            attempts=2,
+            anti_crawl_suspected=True,
+            anti_crawl_strong_suspected=True,
+            anti_crawl_signal_descriptions=("强冷却信号：HTTP 403",),
+        ),
+    )
+
+    assert run_state.suspicious_tasks == []
+    assert run_state.suspicious_deleted_tasks == []
+    assert run_state.pending_cooldown is None
+
+
+def test_pipeline_cools_down_after_mixed_suspected_parse_failures(tmp_path, monkeypatch):
+    csv_path = tmp_path / "mixed_anti_crawl.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+            {"url": "https://www.douyin.com/video/3"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="mixed_anti_crawl.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        download_workers=1,
+        asr_workers=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=2,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=RecoverAfterMixedAntiCrawlParseFailureDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        retry_delay_seconds=0,
+        batch_size=3,
+        anti_crawl_streak_threshold=2,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
     assert sum(sleeps) == 60
     assert all(result["处理状态"] == "成功")
-    assert all(result["视频文本"].str.startswith("transcript:audio:mlx-community/test-model"))
-    assert all(result["尝试次数"] == "2")
     assert any("自动冷却" in line for line in job.logs)
-    assert any("恢复为“待重试”" in line for line in job.logs)
+    assert any("已加入重试队列" in line and "弱冷却信号：" in line for line in job.logs)
 
 
 def test_pipeline_marks_deleted_after_repeated_invalid_link_failures(tmp_path, monkeypatch):
@@ -680,6 +934,137 @@ def test_pipeline_marks_deleted_after_repeated_invalid_link_failures(tmp_path, m
     assert sleeps == []
     assert result.loc[0, "处理状态"] == "已删除"
     assert result.loc[0, "视频文本"] == "已删除"
+
+
+def test_pipeline_does_not_cool_down_for_retry_stage_suspected_deletes(tmp_path, monkeypatch):
+    csv_path = tmp_path / "persistent_deleted.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="persistent_deleted.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        download_workers=1,
+        asr_workers=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=PersistentDeletedAfterCooldownDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        retry_delay_seconds=0,
+        batch_size=1,
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert sleeps == []
+    assert result.loc[0, "处理状态"] == "已删除"
+    assert result.loc[0, "视频文本"] == "已删除"
+    assert result.loc[0, "尝试次数"] == "1"
+    assert not any("自动冷却" in line for line in job.logs)
+    assert not any("冷却信号：" in line for line in job.logs)
+    assert not any("恢复为“待重试”" in line for line in job.logs)
+
+
+def test_pipeline_ignores_challenge_signals_for_confident_deleted_results(tmp_path, monkeypatch):
+    csv_path = tmp_path / "challenge_deleted.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="challenge_deleted.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        download_workers=1,
+        asr_workers=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=ChallengeDeletedAfterCooldownDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        retry_delay_seconds=0,
+        batch_size=1,
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert sleeps == []
+    assert result.loc[0, "处理状态"] == "已删除"
+    assert result.loc[0, "视频文本"] == "已删除"
+    assert result.loc[0, "尝试次数"] == "1"
+    assert not any("自动冷却" in line for line in job.logs)
+    assert not any("冷却信号：" in line for line in job.logs)
 
 
 def test_pipeline_proactively_cools_down_after_healthy_batch_streak(tmp_path, monkeypatch):
@@ -803,8 +1188,8 @@ def test_pipeline_allows_manual_skip_during_cooldown(tmp_path, monkeypatch):
 
     job = manager.require(session.job_id)
     assert job.status == "completed"
-    assert sleeps == [60]
-    assert any("已手动跳过当前冷却" in line for line in job.logs)
+    assert sleeps == []
+    assert not any("已手动跳过当前冷却" in line for line in job.logs)
 
 
 def test_pipeline_marks_job_failed_when_service_init_raises(tmp_path, monkeypatch):

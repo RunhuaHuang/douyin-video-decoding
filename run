@@ -9,14 +9,6 @@ SERVER_PID=""
 
 cd "$ROOT_DIR"
 
-if command -v curl >/dev/null 2>&1; then
-  if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
-    open "$URL"
-    echo "服务已在运行，已打开浏览器：$URL"
-    exit 0
-  fi
-fi
-
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -25,6 +17,26 @@ cleanup() {
 }
 
 trap cleanup INT TERM EXIT
+
+stop_existing_server() {
+  local existing_pids=()
+  while IFS= read -r pid; do
+    if [[ -n "$pid" ]]; then
+      existing_pids+=("$pid")
+    fi
+  done < <(pgrep -f "douyin-csv-webui" || true)
+
+  if (( ${#existing_pids[@]} == 0 )); then
+    return
+  fi
+
+  echo "检测到已有 WebUI 进程，正在停止旧服务..."
+  kill "${existing_pids[@]}" 2>/dev/null || true
+  sleep 1
+}
+
+stop_existing_server
+"$ROOT_DIR/login"
 
 uv run douyin-csv-webui &
 SERVER_PID="$!"

@@ -1,3 +1,4 @@
+import gc
 import importlib
 import inspect
 from dataclasses import dataclass
@@ -134,17 +135,23 @@ class TranscriptionService:
     def _transcribe_sensevoice(self, audio_path: Path, model_name: str, language: str) -> str:
         model, device = self._get_sensevoice_model(model_name)
         try:
-            return self._generate_sensevoice_text(model, audio_path, language)
+            return self._run_sensevoice_generate(model, audio_path, language, device)
         except Exception as exc:
             if device == "mps":
                 self._sensevoice_mps_disabled = True
                 self._sensevoice_cache.pop((model_name, "mps"), None)
                 try:
-                    cpu_model, _ = self._get_sensevoice_model(model_name)
-                    return self._generate_sensevoice_text(cpu_model, audio_path, language)
+                    cpu_model, cpu_device = self._get_sensevoice_model(model_name)
+                    return self._run_sensevoice_generate(cpu_model, audio_path, language, cpu_device)
                 except Exception as retry_exc:
                     raise RuntimeError(f"SenseVoice 转写失败，MPS 和 CPU 回退都不可用: {retry_exc}") from retry_exc
             raise RuntimeError(f"SenseVoice 转写失败: {exc}") from exc
+
+    def _run_sensevoice_generate(self, model: object, audio_path: Path, language: str, device: str) -> str:
+        try:
+            return self._generate_sensevoice_text(model, audio_path, language)
+        finally:
+            self._cleanup_sensevoice_runtime(device)
 
     def _get_sensevoice_model(self, model_name: str) -> Tuple[object, str]:
         last_error = None
@@ -199,6 +206,25 @@ class TranscriptionService:
         raw_text = self._extract_text(result)
         text = postprocess(raw_text) if raw_text else ""
         return str(text).strip()
+
+    @staticmethod
+    def _cleanup_sensevoice_runtime(device: str) -> None:
+        gc.collect()
+        if device != "mps":
+            return
+
+        try:
+            torch = importlib.import_module("torch")
+        except Exception:
+            return
+
+        try:
+            mps_module = getattr(torch, "mps", None)
+            empty_cache = getattr(mps_module, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+        except Exception:
+            return
 
     @staticmethod
     def _extract_text(result: object) -> str:

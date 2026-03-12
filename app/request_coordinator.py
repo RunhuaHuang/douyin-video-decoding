@@ -8,6 +8,8 @@ class RequestCoordinator:
         self._next_request_at = 0.0
         self._cooldown_until = 0.0
         self._challenge_streak = 0
+        self._challenge_observed = False
+        self._challenge_reasons: list[str] = []
 
     def wait(
         self,
@@ -37,10 +39,15 @@ class RequestCoordinator:
         base_cooldown_seconds: float,
         max_cooldown_seconds: float,
         monotonic_fn: Callable[[], float],
+        reason: str = "",
     ) -> float:
         with self._lock:
             now = monotonic_fn()
             self._challenge_streak = min(self._challenge_streak + 1, 6)
+            self._challenge_observed = True
+            normalized_reason = str(reason or "").strip()
+            if normalized_reason and normalized_reason not in self._challenge_reasons:
+                self._challenge_reasons.append(normalized_reason)
             cooldown_seconds = min(
                 max(base_cooldown_seconds, 0.0) * (2 ** (self._challenge_streak - 1)),
                 max(max_cooldown_seconds, 0.0),
@@ -52,3 +59,18 @@ class RequestCoordinator:
     def note_success(self) -> None:
         with self._lock:
             self._challenge_streak = 0
+
+    def reset_attempt_signal(self) -> None:
+        with self._lock:
+            self._challenge_observed = False
+            self._challenge_reasons.clear()
+
+    def consume_attempt_signal_reasons(self) -> tuple[str, ...]:
+        with self._lock:
+            reasons = tuple(self._challenge_reasons)
+            self._challenge_observed = False
+            self._challenge_reasons.clear()
+            return reasons
+
+    def consume_attempt_signal(self) -> bool:
+        return bool(self.consume_attempt_signal_reasons())

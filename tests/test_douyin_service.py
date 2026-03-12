@@ -10,6 +10,7 @@ class FakeBrowserResolver:
     def __init__(self) -> None:
         self.capture_calls = 0
         self.download_calls = 0
+        self.close_calls = 0
 
     def capture_video(self, share_url: str) -> BrowserCapture:
         self.capture_calls += 1
@@ -46,7 +47,7 @@ class FakeBrowserResolver:
         return []
 
     def close(self) -> None:
-        return None
+        self.close_calls += 1
 
 
 def test_parse_item_info_collects_multiple_download_urls():
@@ -407,6 +408,38 @@ def test_parse_with_browser_marks_deleted_only_without_media():
     assert parsed is not None
     assert parsed.is_deleted is True
     assert parsed.download_urls == ()
+
+
+def test_parse_with_browser_recycles_resolver_after_each_use():
+    resolver = FakeBrowserResolver()
+    service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
+    try:
+        parsed = service._parse_with_browser("https://www.douyin.com/video/7336856430550601010")
+        assert parsed is not None
+        assert resolver.close_calls == 1
+    finally:
+        service.close()
+
+
+def test_download_via_browser_recycles_resolver_after_each_use(tmp_path):
+    resolver = FakeBrowserResolver()
+    service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
+    video = ParsedVideo(
+        video_id="7411111111111111111",
+        title="demo",
+        author="tester",
+        download_urls=("https://browser.example.com/video.mp4",),
+        share_url="https://www.douyin.com/video/7411111111111111111",
+        page_url="https://www.douyin.com/video/7411111111111111111",
+        resolved_by="浏览器兜底",
+    )
+
+    try:
+        result = service._download_via_browser(video, tmp_path / "video.mp4", tmp_path / "audio.m4a")
+        assert result is not None
+        assert resolver.close_calls == 1
+    finally:
+        service.close()
 
 
 def test_resolve_browser_preview_result_keeps_retryable_when_initial_page_is_challenge():

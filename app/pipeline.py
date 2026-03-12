@@ -54,6 +54,9 @@ INVALID_LINK_ERROR = "未在单元格中找到有效的抖音链接"
 PREVIEW_ONLY_RETRY_ATTEMPTS = 3
 NO_AUDIO_RETRY_ATTEMPTS = 3
 NO_AUDIO_ERROR = "视频没有音轨"
+WEAK_SIGNAL_DELETED_PAGE = "浏览器兜底删除页标题（在抖音记录美好生活）"
+WEAK_SIGNAL_PARSE_FALLBACK = "分享页/接口异常且浏览器未捕获视频地址"
+STRONG_SIGNAL_CHALLENGE_FALLBACK = "challenge/验证码信号"
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,8 @@ class RowOutcome:
     error_message: str = ""
     retryable: bool = False
     anti_crawl_suspected: bool = False
+    anti_crawl_strong_suspected: bool = False
+    anti_crawl_signal_descriptions: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,8 +112,10 @@ class RowExecutionResult:
 class CooldownRequest:
     seconds: int
     reason: str
+    threshold: int = 0
     affected_tasks: List[RowTask] = field(default_factory=list)
-    clear_deleted_rows: bool = False
+    restore_deleted_tasks: List[RowTask] = field(default_factory=list)
+    signal_descriptions: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -118,6 +125,8 @@ class RunControlState:
     proactive_cooldown_batch_threshold: int
     proactive_cooldown_seconds: int
     suspicious_tasks: List[RowTask] = field(default_factory=list)
+    suspicious_deleted_tasks: List[RowTask] = field(default_factory=list)
+    suspicious_signal_descriptions: List[str] = field(default_factory=list)
     pending_cooldown: Optional[CooldownRequest] = None
     healthy_batch_streak: int = 0
     current_batch_had_issue: bool = False
@@ -648,6 +657,7 @@ class JobProcessor:
         audio_path = row_dir / "audio.wav"
 
         try:
+            self._reset_attempt_anti_crawl_signals(douyin)
             self.manager.update_progress(
                 job_id,
                 current_row=plan.task.csv_row_number,
@@ -663,7 +673,7 @@ class JobProcessor:
             ]
 
             if video.is_deleted:
-                anti_crawl_suspected = self._is_suspected_anti_crawl_deleted_video(video)
+                self._consume_attempt_challenge_signal_descriptions(douyin)
                 log_messages.append(
                     f"第 {plan.task.csv_row_number} 行已删除，已写入“{DELETED_TRANSCRIPT_TEXT}”"
                 )
@@ -672,7 +682,6 @@ class JobProcessor:
                     outcome=RowOutcome(
                         status="已删除",
                         attempts=plan.attempt_number,
-                        anti_crawl_suspected=anti_crawl_suspected,
                     ),
                     transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
                     log_messages=tuple(log_messages),
@@ -686,6 +695,7 @@ class JobProcessor:
             if download_result.audio_source_url:
                 log_messages.append(f"第 {plan.task.csv_row_number} 行已捕获补充音频流")
 
+            self._consume_attempt_challenge_signal_descriptions(douyin)
             return PreparedRow(
                 plan=plan,
                 row_dir=row_dir,
@@ -697,6 +707,7 @@ class JobProcessor:
         except RowProcessingError as exc:
             delete_reason = self._deleted_reason_for_error(exc, plan.attempt_number)
             if delete_reason:
+                self._consume_attempt_challenge_signal_descriptions(douyin)
                 return RowExecutionResult(
                     plan=plan,
                     outcome=RowOutcome(status="已删除", attempts=plan.attempt_number),
@@ -707,6 +718,8 @@ class JobProcessor:
                     cleanup_dir=row_dir,
                 )
             retryable = self._is_retryable(exc, plan.attempt_number)
+            weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
+            strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
             status = RETRY_PENDING_STATUS if retryable else "失败"
             return RowExecutionResult(
                 plan=plan,
@@ -715,6 +728,9 @@ class JobProcessor:
                     attempts=plan.attempt_number,
                     error_message=str(exc),
                     retryable=retryable,
+                    anti_crawl_suspected=bool(weak_signal_descriptions),
+                    anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                    anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
                 ),
                 cleanup_dir=row_dir,
             )
@@ -824,21 +840,22 @@ class JobProcessor:
         for message in result.log_messages:
             self.manager.append_log(job_id, message)
 
+        signal_suffix = self._format_outcome_signal_suffix(result.outcome)
         if result.outcome.retryable:
             retry_queue.append(result.plan.task)
             self.manager.append_log(
                 job_id,
-                f"第 {result.plan.task.csv_row_number} 行已加入重试队列：{result.outcome.error_message}",
+                f"第 {result.plan.task.csv_row_number} 行已加入重试队列：{result.outcome.error_message}{signal_suffix}",
             )
         elif result.outcome.status == "失败":
             self.manager.append_log(
                 job_id,
-                f"第 {result.plan.task.csv_row_number} 行最终失败：{result.outcome.error_message}",
+                f"第 {result.plan.task.csv_row_number} 行最终失败：{result.outcome.error_message}{signal_suffix}",
             )
         elif result.outcome.status == "部分成功":
             self.manager.append_log(
                 job_id,
-                f"第 {result.plan.task.csv_row_number} 行部分完成：{result.outcome.error_message}",
+                f"第 {result.plan.task.csv_row_number} 行部分完成：{result.outcome.error_message}{signal_suffix}",
             )
 
         self._record_row_control_signal(
@@ -904,30 +921,62 @@ class JobProcessor:
         task: RowTask,
         outcome: RowOutcome,
     ) -> None:
-        if outcome.anti_crawl_suspected:
+        if outcome.status == "已删除":
+            return
+
+        if self._should_trigger_anti_crawl_cooldown(outcome):
             run_state.current_batch_had_issue = True
+            should_restore_deleted = outcome.status == "已删除"
             if run_state.pending_cooldown is not None:
                 self._append_unique_task(run_state.pending_cooldown.affected_tasks, task)
+                if should_restore_deleted:
+                    self._append_unique_task(run_state.pending_cooldown.restore_deleted_tasks, task)
+                for description in outcome.anti_crawl_signal_descriptions:
+                    self._append_unique_text(run_state.pending_cooldown.signal_descriptions, description)
+                run_state.pending_cooldown.reason = self._build_anti_crawl_cooldown_reason(
+                    count=len(run_state.pending_cooldown.affected_tasks),
+                    seconds=run_state.pending_cooldown.seconds,
+                    signal_descriptions=run_state.pending_cooldown.signal_descriptions,
+                    threshold=run_state.pending_cooldown.threshold,
+                )
                 return
 
             self._append_unique_task(run_state.suspicious_tasks, task)
+            if should_restore_deleted:
+                self._append_unique_task(run_state.suspicious_deleted_tasks, task)
+            for description in outcome.anti_crawl_signal_descriptions:
+                self._append_unique_text(run_state.suspicious_signal_descriptions, description)
             if len(run_state.suspicious_tasks) >= run_state.anti_crawl_streak_threshold:
                 run_state.pending_cooldown = CooldownRequest(
                     seconds=run_state.anti_crawl_cooldown_seconds,
-                    reason=(
-                        f"连续出现 {len(run_state.suspicious_tasks)} 条疑似风控通用页，"
-                        f"自动冷却 {self._format_duration(run_state.anti_crawl_cooldown_seconds)} 后继续"
+                    reason=self._build_anti_crawl_cooldown_reason(
+                        count=len(run_state.suspicious_tasks),
+                        seconds=run_state.anti_crawl_cooldown_seconds,
+                        signal_descriptions=run_state.suspicious_signal_descriptions,
+                        threshold=run_state.anti_crawl_streak_threshold,
                     ),
+                    threshold=run_state.anti_crawl_streak_threshold,
                     affected_tasks=list(run_state.suspicious_tasks),
-                    clear_deleted_rows=True,
+                    restore_deleted_tasks=list(run_state.suspicious_deleted_tasks),
+                    signal_descriptions=list(run_state.suspicious_signal_descriptions),
                 )
             return
 
-        if run_state.pending_cooldown is None:
+        if outcome.status == "成功" and run_state.pending_cooldown is None:
             run_state.suspicious_tasks.clear()
+            run_state.suspicious_deleted_tasks.clear()
+            run_state.suspicious_signal_descriptions.clear()
 
         if outcome.status in {RETRY_PENDING_STATUS, "失败", "部分成功"}:
             run_state.current_batch_had_issue = True
+
+    @staticmethod
+    def _should_trigger_anti_crawl_cooldown(outcome: RowOutcome) -> bool:
+        # Retry queues are biased toward hard links, so weak signals only count on
+        # the first attempt. Explicit challenge signals stay active across retries.
+        return outcome.anti_crawl_strong_suspected or (
+            outcome.anti_crawl_suspected and outcome.attempts == 1
+        )
 
     def _finalize_batch(
         self,
@@ -995,15 +1044,14 @@ class JobProcessor:
         if request is None:
             return
 
-        if request.clear_deleted_rows:
-            for task in request.affected_tasks:
-                self._restore_false_deleted_row(
-                    job_id=job_id,
-                    dataframe=dataframe,
-                    row_task=task,
-                    output_columns=output_columns,
-                    retry_queue=retry_queue,
-                )
+        for task in request.restore_deleted_tasks:
+            self._restore_false_deleted_row(
+                job_id=job_id,
+                dataframe=dataframe,
+                row_task=task,
+                output_columns=output_columns,
+                retry_queue=retry_queue,
+            )
 
         self.manager.append_log(job_id, request.reason)
         self._persist_snapshot(job_id, dataframe, output_path)
@@ -1012,6 +1060,8 @@ class JobProcessor:
 
         run_state.pending_cooldown = None
         run_state.suspicious_tasks.clear()
+        run_state.suspicious_deleted_tasks.clear()
+        run_state.suspicious_signal_descriptions.clear()
         run_state.current_batch_had_issue = False
         run_state.healthy_batch_streak = 0
 
@@ -1087,6 +1137,48 @@ class JobProcessor:
         tasks.append(task)
 
     @staticmethod
+    def _append_unique_text(items: List[str], value: str) -> None:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in items:
+            return
+        items.append(normalized)
+
+    @staticmethod
+    def _format_signal_description(level: str, signal: str) -> str:
+        return f"{level}冷却信号：{signal}"
+
+    @staticmethod
+    def _format_outcome_signal_suffix(outcome: RowOutcome) -> str:
+        if not outcome.anti_crawl_signal_descriptions:
+            return ""
+        return " | " + "；".join(outcome.anti_crawl_signal_descriptions)
+
+    def _build_anti_crawl_cooldown_reason(
+        self,
+        *,
+        count: int,
+        seconds: int,
+        signal_descriptions: Sequence[str],
+        threshold: int,
+    ) -> str:
+        prefix = f"已达到冷却阈值 {threshold} 条"
+        if count > threshold:
+            prefix += f"，冷却前累计到 {count} 条冷却信号"
+        else:
+            prefix += f"，当前累计 {count} 条冷却信号"
+
+        if signal_descriptions:
+            signal_text = "；".join(signal_descriptions)
+            return (
+                f"{prefix}（{signal_text}），"
+                f"自动冷却 {self._format_duration(seconds)} 后继续"
+            )
+        return (
+            f"{prefix}，"
+            f"自动冷却 {self._format_duration(seconds)} 后继续"
+        )
+
+    @staticmethod
     def _format_duration(seconds: int) -> str:
         total_seconds = max(0, int(seconds))
         hours, remainder = divmod(total_seconds, 3600)
@@ -1107,6 +1199,67 @@ class JobProcessor:
             and video.resolved_by == "浏览器兜底"
             and (video.title or "").strip().startswith("在抖音记录美好生活")
         )
+
+    @staticmethod
+    def _is_suspected_anti_crawl_parse_failure(exc: RowProcessingError) -> bool:
+        if exc.stage != "解析":
+            return False
+
+        detail = exc.detail or ""
+        return (
+            "分享页中未找到 _ROUTER_DATA" in detail
+            and (
+                "iteminfo API: Expecting value: line 1 column 1 (char 0)" in detail
+                or "detail API: Expecting value: line 1 column 1 (char 0)" in detail
+            )
+            and "浏览器兜底没有捕获到视频地址" in detail
+        )
+
+    def _weak_signal_descriptions_for_video(self, video: ParsedVideo) -> Tuple[str, ...]:
+        if not self._is_suspected_anti_crawl_deleted_video(video):
+            return ()
+        return (self._format_signal_description("弱", WEAK_SIGNAL_DELETED_PAGE),)
+
+    def _weak_signal_descriptions_for_error(self, exc: RowProcessingError) -> Tuple[str, ...]:
+        if not self._is_suspected_anti_crawl_parse_failure(exc):
+            return ()
+        return (self._format_signal_description("弱", WEAK_SIGNAL_PARSE_FALLBACK),)
+
+    @staticmethod
+    def _reset_attempt_anti_crawl_signals(douyin: DouyinService) -> None:
+        reset = getattr(douyin, "reset_attempt_signals", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception:
+                return
+
+    def _consume_attempt_challenge_signal(self, douyin: DouyinService) -> bool:
+        return bool(self._consume_attempt_challenge_signal_descriptions(douyin))
+
+    def _consume_attempt_challenge_signal_descriptions(self, douyin: DouyinService) -> Tuple[str, ...]:
+        consume_reasons = getattr(douyin, "consume_attempt_challenge_signal_reasons", None)
+        if callable(consume_reasons):
+            try:
+                reasons = tuple(str(reason or "").strip() for reason in consume_reasons())
+            except Exception:
+                reasons = ()
+            filtered = [reason for reason in reasons if reason]
+            if filtered:
+                return tuple(
+                    self._format_signal_description("强", reason)
+                    for reason in filtered
+                )
+
+        consume = getattr(douyin, "consume_attempt_challenge_signal", None)
+        if callable(consume):
+            try:
+                observed = bool(consume())
+            except Exception:
+                observed = False
+            if observed:
+                return (self._format_signal_description("强", STRONG_SIGNAL_CHALLENGE_FALLBACK),)
+        return ()
 
     @staticmethod
     def _should_parallelize_batch(tasks: Sequence[RowTask], download_workers: int, asr_workers: int) -> bool:
@@ -1155,16 +1308,17 @@ class JobProcessor:
             attempts=outcome.attempts,
         )
 
+        signal_suffix = self._format_outcome_signal_suffix(outcome)
         if outcome.retryable:
             retry_queue.append(task)
             self.manager.append_log(
                 job_id,
-                f"第 {task.csv_row_number} 行已加入重试队列：{outcome.error_message}",
+                f"第 {task.csv_row_number} 行已加入重试队列：{outcome.error_message}{signal_suffix}",
             )
         elif outcome.status == "失败":
-            self.manager.append_log(job_id, f"第 {task.csv_row_number} 行最终失败：{outcome.error_message}")
+            self.manager.append_log(job_id, f"第 {task.csv_row_number} 行最终失败：{outcome.error_message}{signal_suffix}")
         elif outcome.status == "部分成功":
-            self.manager.append_log(job_id, f"第 {task.csv_row_number} 行部分完成：{outcome.error_message}")
+            self.manager.append_log(job_id, f"第 {task.csv_row_number} 行部分完成：{outcome.error_message}{signal_suffix}")
 
         self._record_row_control_signal(
             run_state=run_state,
@@ -1206,6 +1360,7 @@ class JobProcessor:
         audio_path = row_dir / "audio.wav"
 
         try:
+            self._reset_attempt_anti_crawl_signals(douyin)
             self._reset_attempt_files(row_dir, video_path, browser_audio_path, audio_path)
             video = self._parse_video(douyin, task.url_value)
             self.manager.append_log(
@@ -1214,15 +1369,17 @@ class JobProcessor:
             )
 
             if video.is_deleted:
-                anti_crawl_suspected = self._is_suspected_anti_crawl_deleted_video(video)
+                self._consume_attempt_challenge_signal_descriptions(douyin)
                 for column_name in output_columns.values():
                     if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
                         dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
-                self.manager.append_log(job_id, f"第 {task.csv_row_number} 行已删除，已写入“{DELETED_TRANSCRIPT_TEXT}”")
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行已删除，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                )
                 return RowOutcome(
                     status="已删除",
                     attempts=attempt_number,
-                    anti_crawl_suspected=anti_crawl_suspected,
                 )
 
             download_result = self._download_video(douyin, video, video_path, browser_audio_path)
@@ -1247,10 +1404,12 @@ class JobProcessor:
                 transcriber=transcriber,
             )
             if not model_failures:
+                self._consume_attempt_challenge_signal_descriptions(douyin)
                 return RowOutcome(status="成功", attempts=attempt_number)
 
             remaining_models = self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite)
             status = "部分成功" if remaining_models and len(remaining_models) < len(output_columns) else "失败"
+            self._consume_attempt_challenge_signal_descriptions(douyin)
             return RowOutcome(
                 status=status,
                 attempts=attempt_number,
@@ -1259,6 +1418,7 @@ class JobProcessor:
         except RowProcessingError as exc:
             delete_reason = self._deleted_reason_for_error(exc, attempt_number)
             if delete_reason:
+                self._consume_attempt_challenge_signal_descriptions(douyin)
                 for column_name in output_columns.values():
                     if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
                         dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
@@ -1268,12 +1428,17 @@ class JobProcessor:
                 )
                 return RowOutcome(status="已删除", attempts=attempt_number)
             retryable = self._is_retryable(exc, attempt_number)
+            weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
+            strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
             status = RETRY_PENDING_STATUS if retryable else "失败"
             return RowOutcome(
                 status=status,
                 attempts=attempt_number,
                 error_message=str(exc),
                 retryable=retryable,
+                anti_crawl_suspected=bool(weak_signal_descriptions),
+                anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
             )
         finally:
             shutil.rmtree(row_dir, ignore_errors=True)

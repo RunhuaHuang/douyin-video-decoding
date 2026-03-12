@@ -59,3 +59,20 @@ def test_request_coordinator_applies_and_clears_challenge_cooldown():
 
     assert cooldown == 30.0
     assert sleeps == [30.0]
+
+
+def test_request_coordinator_tracks_attempt_challenge_signal_until_consumed():
+    coordinator = RequestCoordinator()
+
+    coordinator.reset_attempt_signal()
+    cooldown = coordinator.note_challenge(
+        base_cooldown_seconds=30.0,
+        max_cooldown_seconds=300.0,
+        monotonic_fn=lambda: 10.0,
+        reason="HTTP 403",
+    )
+    coordinator.note_success()
+
+    assert cooldown == 30.0
+    assert coordinator.consume_attempt_signal_reasons() == ("HTTP 403",)
+    assert coordinator.consume_attempt_signal() is False

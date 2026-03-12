@@ -10,6 +10,7 @@ class FakeBrowserResolver:
     def __init__(self) -> None:
         self.capture_calls = 0
         self.download_calls = 0
+        self.close_calls = 0
 
     def capture_video(self, share_url: str) -> BrowserCapture:
         self.capture_calls += 1
@@ -46,7 +47,7 @@ class FakeBrowserResolver:
         return []
 
     def close(self) -> None:
-        return None
+        self.close_calls += 1
 
 
 def test_parse_item_info_collects_multiple_download_urls():
@@ -165,6 +166,53 @@ def test_download_video_uses_browser_fallback_after_direct_failures(tmp_path):
     assert result.strategy == "浏览器兜底"
     assert result.audio_source_url.endswith("audio.m4a")
     assert resolver.download_calls == 1
+
+
+def test_parse_share_text_rejects_direct_note_as_non_video():
+    service = DouyinService(
+        browser_fallback_enabled=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    try:
+        service.parse_share_text("https://www.douyin.com/note/7368733740719295779")
+    except RuntimeError as exc:
+        assert str(exc) == "链接类型为图文 note，非视频内容"
+    else:
+        raise AssertionError("expected direct note url to be treated as non-video")
+    finally:
+        service.close()
+
+
+def test_parse_share_text_rejects_short_link_that_resolves_to_note():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "v.douyin.com" in url:
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://www.douyin.com/note/7368733740719295779"},
+            )
+        return httpx.Response(200, request=request, text="<html>note</html>")
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
+        browser_fallback_enabled=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    try:
+        service.parse_share_text("https://v.douyin.com/example/")
+    except RuntimeError as exc:
+        assert str(exc) == "链接类型为图文 note，非视频内容"
+    else:
+        raise AssertionError("expected note redirect to be treated as non-video")
+    finally:
+        service.close()
 
 
 def test_parse_share_text_uses_browser_when_interfaces_fail():
@@ -407,6 +455,38 @@ def test_parse_with_browser_marks_deleted_only_without_media():
     assert parsed is not None
     assert parsed.is_deleted is True
     assert parsed.download_urls == ()
+
+
+def test_parse_with_browser_recycles_resolver_after_each_use():
+    resolver = FakeBrowserResolver()
+    service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
+    try:
+        parsed = service._parse_with_browser("https://www.douyin.com/video/7336856430550601010")
+        assert parsed is not None
+        assert resolver.close_calls == 1
+    finally:
+        service.close()
+
+
+def test_download_via_browser_recycles_resolver_after_each_use(tmp_path):
+    resolver = FakeBrowserResolver()
+    service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
+    video = ParsedVideo(
+        video_id="7411111111111111111",
+        title="demo",
+        author="tester",
+        download_urls=("https://browser.example.com/video.mp4",),
+        share_url="https://www.douyin.com/video/7411111111111111111",
+        page_url="https://www.douyin.com/video/7411111111111111111",
+        resolved_by="浏览器兜底",
+    )
+
+    try:
+        result = service._download_via_browser(video, tmp_path / "video.mp4", tmp_path / "audio.m4a")
+        assert result is not None
+        assert resolver.close_calls == 1
+    finally:
+        service.close()
 
 
 def test_resolve_browser_preview_result_keeps_retryable_when_initial_page_is_challenge():

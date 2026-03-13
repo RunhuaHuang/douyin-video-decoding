@@ -174,6 +174,8 @@ class DouyinService:
             if self.NON_VIDEO_NOTE_ERROR in str(exc):
                 raise RuntimeError(self.NON_VIDEO_NOTE_ERROR) from exc
             browser_video, browser_error = self._try_parse_with_browser(share_url)
+            if browser_error == self.NON_VIDEO_NOTE_ERROR:
+                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR) from exc
             if browser_video is not None:
                 return browser_video
             details = [f"短链解析失败: {exc}"]
@@ -185,6 +187,8 @@ class DouyinService:
 
         if not video_id:
             browser_video, browser_error = self._try_parse_with_browser(share_url)
+            if browser_error == self.NON_VIDEO_NOTE_ERROR:
+                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
             browser_video = self._resolve_browser_preview_result(
                 browser_video,
                 initial_page_was_challenge=initial_page_was_challenge,
@@ -214,6 +218,8 @@ class DouyinService:
                 errors.append(f"{parser_name}: {exc}")
 
         browser_video, browser_error = self._try_parse_with_browser(share_url)
+        if browser_error == self.NON_VIDEO_NOTE_ERROR:
+            raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
         browser_video = self._resolve_browser_preview_result(
             browser_video,
             initial_page_was_challenge=initial_page_was_challenge,
@@ -420,6 +426,8 @@ class DouyinService:
 
         try:
             capture = resolver.capture_video(share_url)
+            if self.is_note_url(capture.page_url):
+                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
             self._sync_client_cookies_from_browser()
             browser_urls = tuple(self._candidate_download_urls(capture.media_urls))
             if self._looks_like_deleted_title(capture.title):

@@ -54,6 +54,13 @@ class JobRecord:
     pause_requested: bool = False
     cooldown_active: bool = False
     skip_cooldown_requested: bool = False
+    current_cookie_account_id: str = ""
+    current_cookie_label: str = ""
+    cookie_batches_since_switch: int = 0
+    cookie_total_batches_processed: int = 0
+    cookie_switch_requested: bool = False
+    cookie_last_switch_reason: str = ""
+    cookie_service_generation: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -96,6 +103,13 @@ class BatchRecord:
     pause_requested: bool = False
     cooldown_active: bool = False
     skip_cooldown_requested: bool = False
+    current_cookie_account_id: str = ""
+    current_cookie_label: str = ""
+    cookie_batches_since_switch: int = 0
+    cookie_total_batches_processed: int = 0
+    cookie_switch_requested: bool = False
+    cookie_last_switch_reason: str = ""
+    cookie_service_generation: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

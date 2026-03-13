@@ -182,6 +182,10 @@ a {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.status-grid-home {
+  grid-template-columns: 0.55fr 1fr 1fr 1.7fr;
+}
+
 .metric-grid {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   margin-top: 18px;
@@ -193,6 +197,7 @@ a {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--panel-strong);
+  min-width: 0;
 }
 
 .status-item strong,
@@ -201,6 +206,16 @@ a {
   margin-top: 10px;
   font-size: 0.96rem;
   line-height: 1.45;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.long-value {
+  font-size: 0.68rem;
+  line-height: 1.42;
+  letter-spacing: -0.02em;
+  word-break: break-word;
+  white-space: normal;
 }
 
 .status-label,
@@ -278,6 +293,89 @@ a {
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.6;
+}
+
+.file-upload-field {
+  gap: 0;
+}
+
+.file-picker {
+  position: relative;
+  overflow: hidden;
+  border: 1px dashed rgba(13, 148, 136, 0.28);
+  border-radius: 22px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(240, 253, 250, 0.9)),
+    radial-gradient(circle at top right, rgba(249, 115, 22, 0.1), transparent 12rem);
+  transition:
+    border-color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s ease;
+}
+
+.file-picker:hover,
+.file-picker:focus-within {
+  border-color: rgba(30, 64, 175, 0.28);
+  box-shadow: 0 18px 40px rgba(30, 64, 175, 0.08);
+  transform: translateY(-1px);
+}
+
+.file-input-native {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  opacity: 0;
+  pointer-events: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.file-picker-copy {
+  display: grid;
+  gap: 8px;
+  min-height: 102px;
+  padding: 18px 22px;
+  align-content: center;
+}
+
+.file-picker-button {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.12), rgba(30, 64, 175, 0.1));
+  color: var(--primary-strong);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.file-picker-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.file-picker-copy strong {
+  font-size: 0.92rem;
+  line-height: 1.35;
+}
+
+.file-picker-meta span {
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .preset-box {
@@ -408,6 +506,32 @@ a {
   background: #16635c;
 }
 
+.button-ghost {
+  color: var(--text);
+  border-color: rgba(30, 64, 175, 0.16);
+  background: rgba(30, 64, 175, 0.08);
+}
+
+.button-ghost:hover {
+  background: rgba(30, 64, 175, 0.14);
+}
+
+.button-compact {
+  min-width: 0 !important;
+  width: auto !important;
+  padding: 6px 9px !important;
+  border-radius: 10px !important;
+  font-size: 0.66rem !important;
+  font-weight: 700;
+  box-shadow: none;
+  letter-spacing: 0.01em;
+}
+
+.button-compact:hover {
+  transform: none;
+  box-shadow: none;
+}
+
 .button.is-disabled {
   pointer-events: none;
   opacity: 0.45;
@@ -475,6 +599,10 @@ table {
   border-collapse: collapse;
 }
 
+.account-table {
+  table-layout: fixed;
+}
+
 th,
 td {
   padding: 12px 14px;
@@ -494,6 +622,87 @@ th {
   font-size: 0.74rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.account-table .col-label,
+.account-table .account-label-cell {
+  width: 8.5rem;
+}
+
+.account-table .col-status,
+.account-table .account-status-cell {
+  width: 5.2rem;
+  white-space: nowrap;
+}
+
+.account-table .col-file,
+.account-table .account-file-cell {
+  width: 6.9rem;
+}
+
+.account-table .col-signal,
+.account-table .account-signal-cell {
+  width: 6.7rem;
+  white-space: nowrap;
+}
+
+.account-table .col-actions,
+.account-table .account-actions-cell {
+  width: 10.2rem;
+}
+
+.account-status-cell {
+  font-weight: 700;
+}
+
+.account-file-name {
+  display: block;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-file-path {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-signal-cell {
+  text-align: center;
+  font-weight: 700;
+}
+
+.account-reason-cell {
+  color: var(--text);
+}
+
+.account-actions-cell {
+  vertical-align: middle;
+}
+
+.account-actions {
+  display: flex !important;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.account-actions .button {
+  width: auto !important;
+  min-width: 0 !important;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .empty-state {
@@ -545,6 +754,20 @@ th {
   .preset-notes p {
     display: grid;
     gap: 6px;
+  }
+
+  .file-picker-copy {
+    min-height: 102px;
+    padding: 18px;
+  }
+
+  .status-grid-home {
+    grid-template-columns: 1fr;
+  }
+
+  .account-actions {
+    width: 100%;
+    max-width: none;
   }
 
   .preset-notes strong {

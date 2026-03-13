@@ -22,6 +22,9 @@
       <span class="pill pill-muted">主动冷却 {{ batch.proactive_cooldown_batch_threshold }} 批</span>
       <span class="pill pill-muted">主动冷却时长 {{ (batch.proactive_cooldown_seconds // 60) }} 分钟</span>
       <span class="pill pill-muted">{{ (batch.model_names or []) | join(" | ") }}</span>
+      <span class="pill pill-muted" id="batch-cookie-current">当前 cookies {{ batch.current_cookie_label or "-" }}</span>
+      <span class="pill pill-muted" id="batch-cookie-next">下一个 {{ batch.cookie_pool.next_label or "-" }}</span>
+      <span class="pill pill-muted" id="batch-cookie-batches">距上次切换 {{ batch.cookie_batches_since_switch }} 批</span>
     </div>
 
     <div class="metric-grid">
@@ -77,6 +80,13 @@
       <button class="button button-secondary {% if not batch.cooldown_active %}is-disabled{% endif %}" id="skip-batch-cooldown-button" type="button">
         立即继续
       </button>
+      <button
+        class="button button-secondary {% if batch.cookie_pool.switchable_count <= 1 or batch.cookie_switch_requested %}is-disabled{% endif %}"
+        id="switch-batch-cookie-button"
+        type="button"
+      >
+        {% if batch.cookie_switch_requested %}切换已排队{% else %}强制切换 cookies{% endif %}
+      </button>
       <a
         class="button button-primary {% if not (batch.jobs | selectattr('output_path') | list) %}is-disabled{% endif %}"
         id="download-batch-link"
@@ -84,6 +94,77 @@
       >
         打包下载
       </a>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>Cookies 状态</h2>
+      <p>账号剔除和自动切换状态会在这里更新。</p>
+    </div>
+    <div class="table-shell">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th class="col-label nowrap">备注</th>
+            <th class="col-status nowrap">状态</th>
+            <th class="col-file nowrap">文件</th>
+            <th class="col-signal nowrap">强信号计数</th>
+            <th class="col-reason nowrap">最近原因</th>
+            <th class="col-actions nowrap">操作</th>
+          </tr>
+        </thead>
+        <tbody id="batch-cookie-account-body">
+          {% if batch.cookie_pool.accounts %}
+            {% for account in batch.cookie_pool.accounts %}
+              <tr>
+                <td class="account-label-cell">{{ account.label }}</td>
+                <td class="account-status-cell nowrap">
+                  {{ account.status_text }}
+                  {% if account.is_current %}(当前){% elif account.is_next %}(下一个){% endif %}
+                </td>
+                <td class="account-file-cell" title="{{ account.storage_state_path }}">
+                  <span class="account-file-name">{{ account.storage_state_name }}</span>
+                </td>
+                <td class="account-signal-cell nowrap">{{ account.challenge_strikes }}</td>
+                <td class="account-reason-cell" title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}">
+                  {{ account.warning_reason or account.invalid_reason or account.last_issue_reason or "-" }}
+                </td>
+                <td class="account-actions-cell">
+                  <div class="account-actions">
+                    <button
+                      class="button button-secondary button-compact account-action-button {% if account.invalid or account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="exclude"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      剔除
+                    </button>
+                    <button
+                      class="button button-accent button-compact account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="relogin"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      重新登录
+                    </button>
+                    <button
+                      class="button button-ghost button-compact account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="reset"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      清零
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "备注"</code>。</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
     </div>
   </section>
 
@@ -138,6 +219,64 @@
     const batchId = "{{ batch.batch_id }}";
     let poller = null;
 
+    function renderCookiePool(pool) {
+      const tbody = document.getElementById("batch-cookie-account-body");
+      const accounts = pool?.accounts || [];
+      if (accounts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "备注"</code>。</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = accounts.map((account) => {
+        const suffix = account.is_current ? "(当前)" : (account.is_next ? "(下一个)" : "");
+        const reason = account.warning_reason || account.invalid_reason || account.last_issue_reason || "-";
+        const excludeDisabled = account.invalid || account.relogin_in_progress ? "is-disabled" : "";
+        const reloginDisabled = account.relogin_in_progress ? "is-disabled" : "";
+        const resetDisabled = account.relogin_in_progress ? "is-disabled" : "";
+        return `
+          <tr>
+            <td class="account-label-cell">${account.label}</td>
+            <td class="account-status-cell nowrap">${account.status_text}${suffix ? ` ${suffix}` : ""}</td>
+            <td class="account-file-cell" title="${account.storage_state_path}">
+              <span class="account-file-name">${account.storage_state_name}</span>
+            </td>
+            <td class="account-signal-cell nowrap">${account.challenge_strikes}</td>
+            <td class="account-reason-cell" title="${reason}">${reason}</td>
+            <td class="account-actions-cell">
+              <div class="account-actions">
+                <button class="button button-secondary button-compact account-action-button ${excludeDisabled}" type="button" data-action="exclude" data-account-id="${account.account_id}">剔除</button>
+                <button class="button button-accent button-compact account-action-button ${reloginDisabled}" type="button" data-action="relogin" data-account-id="${account.account_id}">重新登录</button>
+                <button class="button button-ghost button-compact account-action-button account-reset-button ${resetDisabled}" type="button" data-action="reset" data-account-id="${account.account_id}">清零</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join("");
+      bindAccountActionButtons();
+    }
+
+    async function postAccountAction(accountId, action) {
+      const response = await fetch(`/accounts/${accountId}/${action}`, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        alert(payload.detail || "操作失败");
+        return;
+      }
+      if (payload.message) {
+        alert(payload.message);
+      }
+      refreshBatch();
+    }
+
+    function bindAccountActionButtons() {
+      document.querySelectorAll(".account-action-button").forEach((button) => {
+        button.onclick = () => {
+          if (button.classList.contains("is-disabled")) return;
+          postAccountAction(button.dataset.accountId, button.dataset.action);
+        };
+      });
+    }
+
     function renderJobs(jobs) {
       const tbody = document.getElementById("batch-job-body");
       tbody.innerHTML = jobs.map((job) => {
@@ -181,6 +320,9 @@
         ? `${batch.current_file_index}/${batch.total_files}`
         : "";
       document.getElementById("batch-progress-fill").style.width = `${percent}%`;
+      document.getElementById("batch-cookie-current").textContent = `当前 cookies ${batch.current_cookie_label || "-"}`;
+      document.getElementById("batch-cookie-next").textContent = `下一个 ${batch.cookie_pool?.next_label || "-"}`;
+      document.getElementById("batch-cookie-batches").textContent = `距上次切换 ${batch.cookie_batches_since_switch || 0} 批`;
 
       const errorBox = document.getElementById("batch-error-box");
       const errorText = document.getElementById("batch-error-text");
@@ -194,12 +336,19 @@
       document.getElementById("pause-batch-button").classList.toggle("is-disabled", batch.status !== "running");
       document.getElementById("resume-batch-button").classList.toggle("is-disabled", batch.status !== "paused");
       document.getElementById("skip-batch-cooldown-button").classList.toggle("is-disabled", !batch.cooldown_active);
+      const switchCookieButton = document.getElementById("switch-batch-cookie-button");
+      switchCookieButton.classList.toggle(
+        "is-disabled",
+        (batch.cookie_pool?.switchable_count || 0) <= 1 || !!batch.cookie_switch_requested
+      );
+      switchCookieButton.textContent = batch.cookie_switch_requested ? "切换已排队" : "强制切换 cookies";
       const downloadBatchLink = document.getElementById("download-batch-link");
       const hasOutputs = (batch.jobs || []).some((job) => !!job.output_path);
       downloadBatchLink.classList.toggle("is-disabled", !hasOutputs);
       downloadBatchLink.href = hasOutputs ? `/download/batches/${batchId}` : "#";
 
       renderJobs(batch.jobs || []);
+      renderCookiePool(batch.cookie_pool || {});
 
       if (batch.status === "completed" || batch.status === "failed") {
         stopPolling();
@@ -247,6 +396,13 @@
       }
     });
 
+    document.getElementById("switch-batch-cookie-button").addEventListener("click", () => {
+      if (!document.getElementById("switch-batch-cookie-button").classList.contains("is-disabled")) {
+        postAction(`/batches/${batchId}/switch-cookie`);
+      }
+    });
+
+    bindAccountActionButtons();
     startPolling();
     refreshBatch();
   </script>

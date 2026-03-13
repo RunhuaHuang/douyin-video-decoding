@@ -109,6 +109,9 @@ class JobManager:
     ) -> None:
         with self._lock:
             job = self.require(job_id)
+            current_cookie_account_id = job.current_cookie_account_id
+            current_cookie_label = job.current_cookie_label
+            cookie_service_generation = job.cookie_service_generation
             job.url_column = url_column
             job.transcript_column = transcript_column
             job.model_names_text = model_names_text
@@ -139,6 +142,13 @@ class JobManager:
             job.pause_requested = False
             job.cooldown_active = False
             job.skip_cooldown_requested = False
+            job.current_cookie_account_id = current_cookie_account_id
+            job.current_cookie_label = current_cookie_label
+            job.cookie_batches_since_switch = 0
+            job.cookie_total_batches_processed = 0
+            job.cookie_switch_requested = False
+            job.cookie_last_switch_reason = ""
+            job.cookie_service_generation = cookie_service_generation
 
     def configure_batch(
         self,
@@ -159,6 +169,9 @@ class JobManager:
     ) -> None:
         with self._lock:
             batch = self.require_batch(batch_id)
+            current_cookie_account_id = batch.current_cookie_account_id
+            current_cookie_label = batch.current_cookie_label
+            cookie_service_generation = batch.cookie_service_generation
             batch.url_column = url_column
             batch.transcript_column = transcript_column
             batch.model_names_text = model_names_text
@@ -181,6 +194,13 @@ class JobManager:
             batch.pause_requested = False
             batch.cooldown_active = False
             batch.skip_cooldown_requested = False
+            batch.current_cookie_account_id = current_cookie_account_id
+            batch.current_cookie_label = current_cookie_label
+            batch.cookie_batches_since_switch = 0
+            batch.cookie_total_batches_processed = 0
+            batch.cookie_switch_requested = False
+            batch.cookie_last_switch_reason = ""
+            batch.cookie_service_generation = cookie_service_generation
             for job_id in batch.job_ids:
                 self.configure_job(
                     job_id=job_id,
@@ -272,6 +292,33 @@ class JobManager:
                 job.current_url = current_url
             if current_message is not None:
                 job.current_message = current_message
+
+    def get_effective_cookie_runtime(self, job_id: str) -> Dict[str, object]:
+        with self._lock:
+            job = self.require(job_id)
+            source = self.require_batch(job.batch_id) if job.batch_id else job
+            return self._cookie_runtime_payload(source)
+
+    def get_batch_cookie_runtime(self, batch_id: str) -> Dict[str, object]:
+        with self._lock:
+            batch = self.require_batch(batch_id)
+            return self._cookie_runtime_payload(batch)
+
+    def update_job_cookie_runtime(self, job_id: str, **fields) -> None:
+        with self._lock:
+            job = self.require(job_id)
+            self._apply_cookie_runtime_fields(job, fields)
+
+    def update_batch_cookie_runtime(self, batch_id: str, **fields) -> None:
+        with self._lock:
+            batch = self.require_batch(batch_id)
+            self._apply_cookie_runtime_fields(batch, fields)
+
+    def request_cookie_switch(self, job_id: str) -> None:
+        self.update_job_cookie_runtime(job_id, cookie_switch_requested=True)
+
+    def request_batch_cookie_switch(self, batch_id: str) -> None:
+        self.update_batch_cookie_runtime(batch_id, cookie_switch_requested=True)
 
     def update_batch_progress(
         self,
@@ -449,3 +496,22 @@ class JobManager:
             batch.cooldown_active = False
             batch.skip_cooldown_requested = False
             batch.finished_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _apply_cookie_runtime_fields(record, fields: Dict[str, object]) -> None:
+        for key, value in fields.items():
+            if value is None:
+                continue
+            setattr(record, key, value)
+
+    @staticmethod
+    def _cookie_runtime_payload(record) -> Dict[str, object]:
+        return {
+            "current_cookie_account_id": record.current_cookie_account_id,
+            "current_cookie_label": record.current_cookie_label,
+            "cookie_batches_since_switch": record.cookie_batches_since_switch,
+            "cookie_total_batches_processed": record.cookie_total_batches_processed,
+            "cookie_switch_requested": record.cookie_switch_requested,
+            "cookie_last_switch_reason": record.cookie_last_switch_reason,
+            "cookie_service_generation": record.cookie_service_generation,
+        }

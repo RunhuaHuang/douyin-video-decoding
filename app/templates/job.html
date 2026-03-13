@@ -25,6 +25,9 @@
       <span class="pill pill-muted">主动冷却 {{ job.proactive_cooldown_batch_threshold }} 批</span>
       <span class="pill pill-muted">主动冷却时长 {{ (job.proactive_cooldown_seconds // 60) }} 分钟</span>
       <span class="pill pill-muted">{{ (job.model_names or []) | join(" | ") }}</span>
+      <span class="pill pill-muted" id="job-cookie-current">当前 cookies {{ job.current_cookie_label or "-" }}</span>
+      <span class="pill pill-muted" id="job-cookie-next">下一个 {{ job.cookie_pool.next_label or "-" }}</span>
+      <span class="pill pill-muted" id="job-cookie-batches">距上次切换 {{ job.cookie_batches_since_switch }} 批</span>
     </div>
 
     <div class="metric-grid">
@@ -78,12 +81,90 @@
       <button class="button button-secondary {% if not job.cooldown_active %}is-disabled{% endif %}" id="skip-cooldown-button" type="button">
         立即继续
       </button>
+      <button
+        class="button button-secondary {% if job.cookie_pool.switchable_count <= 1 or job.cookie_switch_requested %}is-disabled{% endif %}"
+        id="switch-cookie-button"
+        type="button"
+      >
+        {% if job.cookie_switch_requested %}切换已排队{% else %}强制切换 cookies{% endif %}
+      </button>
       <button class="button button-accent {% if not job.failed_rows or job.status == 'running' %}is-disabled{% endif %}" id="retry-button" type="button">
         重试失败项
       </button>
       <a class="button button-primary {% if not job.output_path %}is-disabled{% endif %}" id="download-link" href="{% if job.output_path %}/download/{{ job.job_id }}{% else %}#{% endif %}">
         下载结果
       </a>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>Cookies 状态</h2>
+      <p>失效或被剔除的账号会在这里持续显示。</p>
+    </div>
+    <div class="table-shell">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th class="col-label nowrap">备注</th>
+            <th class="col-status nowrap">状态</th>
+            <th class="col-file nowrap">文件</th>
+            <th class="col-signal nowrap">强信号计数</th>
+            <th class="col-reason nowrap">最近原因</th>
+            <th class="col-actions nowrap">操作</th>
+          </tr>
+        </thead>
+        <tbody id="cookie-account-body">
+          {% if job.cookie_pool.accounts %}
+            {% for account in job.cookie_pool.accounts %}
+              <tr>
+                <td class="account-label-cell">{{ account.label }}</td>
+                <td class="account-status-cell nowrap">
+                  {{ account.status_text }}
+                  {% if account.is_current %}(当前){% elif account.is_next %}(下一个){% endif %}
+                </td>
+                <td class="account-file-cell" title="{{ account.storage_state_path }}">
+                  <span class="account-file-name">{{ account.storage_state_name }}</span>
+                </td>
+                <td class="account-signal-cell nowrap">{{ account.challenge_strikes }}</td>
+                <td class="account-reason-cell" title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}">
+                  {{ account.warning_reason or account.invalid_reason or account.last_issue_reason or "-" }}
+                </td>
+                <td class="account-actions-cell">
+                  <div class="account-actions">
+                    <button
+                      class="button button-secondary button-compact account-action-button {% if account.invalid or account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="exclude"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      剔除
+                    </button>
+                    <button
+                      class="button button-accent button-compact account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="relogin"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      重新登录
+                    </button>
+                    <button
+                      class="button button-ghost button-compact account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="reset"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      清零
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "备注"</code>。</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
     </div>
   </section>
 
@@ -149,6 +230,64 @@
       shell.innerHTML = `<table id="output-preview-table"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
     }
 
+    function renderCookiePool(pool) {
+      const tbody = document.getElementById("cookie-account-body");
+      const accounts = pool?.accounts || [];
+      if (accounts.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "备注"</code>。</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = accounts.map((account) => {
+        const suffix = account.is_current ? "(当前)" : (account.is_next ? "(下一个)" : "");
+        const reason = account.warning_reason || account.invalid_reason || account.last_issue_reason || "-";
+        const excludeDisabled = account.invalid || account.relogin_in_progress ? "is-disabled" : "";
+        const reloginDisabled = account.relogin_in_progress ? "is-disabled" : "";
+        const resetDisabled = account.relogin_in_progress ? "is-disabled" : "";
+        return `
+          <tr>
+            <td class="account-label-cell">${account.label}</td>
+            <td class="account-status-cell nowrap">${account.status_text}${suffix ? ` ${suffix}` : ""}</td>
+            <td class="account-file-cell" title="${account.storage_state_path}">
+              <span class="account-file-name">${account.storage_state_name}</span>
+            </td>
+            <td class="account-signal-cell nowrap">${account.challenge_strikes}</td>
+            <td class="account-reason-cell" title="${reason}">${reason}</td>
+            <td class="account-actions-cell">
+              <div class="account-actions">
+                <button class="button button-secondary button-compact account-action-button ${excludeDisabled}" type="button" data-action="exclude" data-account-id="${account.account_id}">剔除</button>
+                <button class="button button-accent button-compact account-action-button ${reloginDisabled}" type="button" data-action="relogin" data-account-id="${account.account_id}">重新登录</button>
+                <button class="button button-ghost button-compact account-action-button account-reset-button ${resetDisabled}" type="button" data-action="reset" data-account-id="${account.account_id}">清零</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join("");
+      bindAccountActionButtons();
+    }
+
+    async function postAccountAction(accountId, action) {
+      const response = await fetch(`/accounts/${accountId}/${action}`, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        alert(payload.detail || "操作失败");
+        return;
+      }
+      if (payload.message) {
+        alert(payload.message);
+      }
+      refreshJob();
+    }
+
+    function bindAccountActionButtons() {
+      document.querySelectorAll(".account-action-button").forEach((button) => {
+        button.onclick = () => {
+          if (button.classList.contains("is-disabled")) return;
+          postAccountAction(button.dataset.accountId, button.dataset.action);
+        };
+      });
+    }
+
     async function refreshJob() {
       const response = await fetch(`/api/jobs/${jobId}`);
       if (!response.ok) return;
@@ -166,6 +305,9 @@
       document.getElementById("progress-message").textContent = job.current_message || "等待中";
       document.getElementById("progress-url").textContent = job.current_url || "";
       document.getElementById("progress-fill").style.width = `${percent}%`;
+      document.getElementById("job-cookie-current").textContent = `当前 cookies ${job.current_cookie_label || "-"}`;
+      document.getElementById("job-cookie-next").textContent = `下一个 ${job.cookie_pool?.next_label || "-"}`;
+      document.getElementById("job-cookie-batches").textContent = `距上次切换 ${job.cookie_batches_since_switch || 0} 批`;
       document.getElementById("log-output").textContent = (job.logs || []).join("\n") || "等待日志...";
 
       const errorBox = document.getElementById("error-box");
@@ -189,14 +331,21 @@
       const pauseButton = document.getElementById("pause-button");
       const resumeButton = document.getElementById("resume-button");
       const skipCooldownButton = document.getElementById("skip-cooldown-button");
+      const switchCookieButton = document.getElementById("switch-cookie-button");
       const retryButton = document.getElementById("retry-button");
 
       pauseButton.classList.toggle("is-disabled", job.status !== "running");
       resumeButton.classList.toggle("is-disabled", job.status !== "paused");
       skipCooldownButton.classList.toggle("is-disabled", !job.cooldown_active);
+      switchCookieButton.classList.toggle(
+        "is-disabled",
+        (job.cookie_pool?.switchable_count || 0) <= 1 || !!job.cookie_switch_requested
+      );
+      switchCookieButton.textContent = job.cookie_switch_requested ? "切换已排队" : "强制切换 cookies";
       retryButton.classList.toggle("is-disabled", job.status === "running" || !job.failed_rows);
 
       renderPreview(job.output_preview_rows || []);
+      renderCookiePool(job.cookie_pool || {});
 
       if (job.status === "completed" || job.status === "failed" || job.status === "paused") {
         stopPolling();
@@ -244,6 +393,14 @@
         postAction(`/jobs/${jobId}/skip-cooldown`);
       }
     });
+
+    document.getElementById("switch-cookie-button").addEventListener("click", () => {
+      if (!document.getElementById("switch-cookie-button").classList.contains("is-disabled")) {
+        postAction(`/jobs/${jobId}/switch-cookie`);
+      }
+    });
+
+    bindAccountActionButtons();
 
     document.getElementById("retry-button").addEventListener("click", () => {
       if (!document.getElementById("retry-button").classList.contains("is-disabled")) {

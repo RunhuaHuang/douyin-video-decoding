@@ -111,6 +111,26 @@ class AlwaysFailDouyinService(FakeDouyinService):
         raise RuntimeError("403 Forbidden")
 
 
+class DownloadForbiddenTwiceDouyinService(FakeDouyinService):
+    def download_video(
+        self,
+        video: FakeVideo,
+        output_path: Path,
+        audio_output_path: Path | None = None,
+    ) -> FakeDownloadResult:
+        raise RuntimeError("HTTP 403 Forbidden x2, 浏览器兜底失败: 浏览器兜底下载失败: HTTP 403 x2")
+
+
+class Download404NonVideoDouyinService(FakeDouyinService):
+    def download_video(
+        self,
+        video: FakeVideo,
+        output_path: Path,
+        audio_output_path: Path | None = None,
+    ) -> FakeDownloadResult:
+        raise RuntimeError("返回内容不是有效视频, HTTP 404 Not Found, 浏览器兜底失败: 浏览器兜底下载失败: 返回内容不是有效媒体, HTTP 404")
+
+
 class BrokenDouyinService:
     def __init__(self) -> None:
         raise ImportError("missing optional dependency")
@@ -1363,6 +1383,110 @@ def test_pipeline_marks_note_rows_as_non_video_without_retry(tmp_path, monkeypat
     assert result.loc[0, "视频文本"] == ""
     assert result.loc[0, "尝试次数"] == "1"
     assert result.loc[0, "失败原因"] == "链接类型为图文 note，非视频内容"
+
+
+def test_pipeline_marks_download_forbidden_rows_unavailable_after_second_attempt(tmp_path, monkeypatch):
+    csv_path = tmp_path / "download_forbidden.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/7416287864591256844"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="download_forbidden.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=DownloadForbiddenTwiceDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        retry_delay_seconds=0,
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    assert result.loc[0, "处理状态"] == "无法下载"
+    assert result.loc[0, "视频文本"] == ""
+    assert result.loc[0, "尝试次数"] == "2"
+    assert "HTTP 403 Forbidden x2" in result.loc[0, "失败原因"]
+
+
+def test_pipeline_marks_download_404_rows_non_video_after_second_attempt(tmp_path, monkeypatch):
+    csv_path = tmp_path / "download_404.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/7387762150300814630"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="download_404.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=Download404NonVideoDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        retry_delay_seconds=0,
+    )
+    processor.process(session.job_id)
+
+    result = pd.read_csv(
+        manager.require(session.job_id).output_path,
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+
+    assert result.loc[0, "处理状态"] == "非视频"
+    assert result.loc[0, "视频文本"] == ""
+    assert result.loc[0, "尝试次数"] == "2"
+    assert "返回内容不是有效视频" in result.loc[0, "失败原因"]
 
 
 def test_pipeline_retries_audio_extraction_no_audio_errors_twice(tmp_path, monkeypatch):

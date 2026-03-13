@@ -45,7 +45,8 @@ from .transcription_service import TranscriptionService
 
 SUCCESS_STATUSES = {"成功", "部分成功"}
 NON_VIDEO_STATUS = "非视频"
-SKIP_STATUSES = {"跳过", "已删除", NON_VIDEO_STATUS}
+DOWNLOAD_UNAVAILABLE_STATUS = "无法下载"
+SKIP_STATUSES = {"跳过", "已删除", NON_VIDEO_STATUS, DOWNLOAD_UNAVAILABLE_STATUS}
 RETRY_PENDING_STATUS = "待重试"
 FAILED_STATUSES = {"失败", RETRY_PENDING_STATUS}
 TERMINAL_STATUSES = SUCCESS_STATUSES | SKIP_STATUSES
@@ -53,6 +54,10 @@ PREVIEW_ONLY_DELETE_ERROR = "浏览器兜底命中通用页，仅捕获到预览
 INVALID_LINK_DELETE_ATTEMPTS = 2
 INVALID_LINK_ERROR = "未在单元格中找到有效的抖音链接"
 NON_VIDEO_ERROR = DouyinService.NON_VIDEO_NOTE_ERROR
+DOWNLOAD_FORBIDDEN_ERROR = "HTTP 403 Forbidden x2, 浏览器兜底失败: 浏览器兜底下载失败: HTTP 403 x2"
+DOWNLOAD_UNAVAILABLE_ATTEMPTS = 2
+NON_VIDEO_DOWNLOAD_404_ERROR = "返回内容不是有效视频, HTTP 404 Not Found, 浏览器兜底失败: 浏览器兜底下载失败: 返回内容不是有效媒体, HTTP 404"
+NON_VIDEO_DOWNLOAD_404_ATTEMPTS = 2
 PREVIEW_ONLY_RETRY_ATTEMPTS = 3
 NO_AUDIO_RETRY_ATTEMPTS = 3
 NO_AUDIO_ERROR = "视频没有音轨"
@@ -717,6 +722,32 @@ class JobProcessor:
                     ),
                     log_messages=(
                         f"第 {plan.task.csv_row_number} 行识别为图文 note，按“{NON_VIDEO_STATUS}”跳过",
+                    ),
+                    cleanup_dir=row_dir,
+                )
+            if self._should_mark_non_video_from_download_error(exc, plan.attempt_number):
+                return RowExecutionResult(
+                    plan=plan,
+                    outcome=RowOutcome(
+                        status=NON_VIDEO_STATUS,
+                        attempts=plan.attempt_number,
+                        error_message=NON_VIDEO_DOWNLOAD_404_ERROR,
+                    ),
+                    log_messages=(
+                        f"第 {plan.task.csv_row_number} 行连续命中图文型 404 下载错误，按“{NON_VIDEO_STATUS}”处理",
+                    ),
+                    cleanup_dir=row_dir,
+                )
+            if self._should_mark_download_unavailable(exc, plan.attempt_number):
+                return RowExecutionResult(
+                    plan=plan,
+                    outcome=RowOutcome(
+                        status=DOWNLOAD_UNAVAILABLE_STATUS,
+                        attempts=plan.attempt_number,
+                        error_message=str(exc),
+                    ),
+                    log_messages=(
+                        f"第 {plan.task.csv_row_number} 行连续命中 403 下载限制，按“{DOWNLOAD_UNAVAILABLE_STATUS}”处理",
                     ),
                     cleanup_dir=row_dir,
                 )
@@ -1439,6 +1470,26 @@ class JobProcessor:
                     attempts=attempt_number,
                     error_message=NON_VIDEO_ERROR,
                 )
+            if self._should_mark_non_video_from_download_error(exc, attempt_number):
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行连续命中图文型 404 下载错误，按“{NON_VIDEO_STATUS}”处理",
+                )
+                return RowOutcome(
+                    status=NON_VIDEO_STATUS,
+                    attempts=attempt_number,
+                    error_message=NON_VIDEO_DOWNLOAD_404_ERROR,
+                )
+            if self._should_mark_download_unavailable(exc, attempt_number):
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行连续命中 403 下载限制，按“{DOWNLOAD_UNAVAILABLE_STATUS}”处理",
+                )
+                return RowOutcome(
+                    status=DOWNLOAD_UNAVAILABLE_STATUS,
+                    attempts=attempt_number,
+                    error_message=str(exc),
+                )
             delete_reason = self._deleted_reason_for_error(exc, attempt_number)
             if delete_reason:
                 self._consume_attempt_challenge_signal_descriptions(douyin)
@@ -1717,6 +1768,20 @@ class JobProcessor:
     @staticmethod
     def _is_non_video_parse_error(exc: RowProcessingError) -> bool:
         return exc.stage == "解析" and NON_VIDEO_ERROR in exc.detail
+
+    @staticmethod
+    def _is_download_forbidden_error(exc: RowProcessingError) -> bool:
+        return exc.stage == "下载" and DOWNLOAD_FORBIDDEN_ERROR in exc.detail
+
+    def _should_mark_download_unavailable(self, exc: RowProcessingError, attempt_number: int) -> bool:
+        return self._is_download_forbidden_error(exc) and attempt_number >= DOWNLOAD_UNAVAILABLE_ATTEMPTS
+
+    @staticmethod
+    def _is_non_video_download_404_error(exc: RowProcessingError) -> bool:
+        return exc.stage == "下载" and NON_VIDEO_DOWNLOAD_404_ERROR in exc.detail
+
+    def _should_mark_non_video_from_download_error(self, exc: RowProcessingError, attempt_number: int) -> bool:
+        return self._is_non_video_download_404_error(exc) and attempt_number >= NON_VIDEO_DOWNLOAD_404_ATTEMPTS
 
     def _should_mark_deleted_from_invalid_link(self, exc: RowProcessingError, attempt_number: int) -> bool:
         return self._is_invalid_link_parse_error(exc) and attempt_number >= INVALID_LINK_DELETE_ATTEMPTS

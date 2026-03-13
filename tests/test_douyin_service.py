@@ -215,6 +215,43 @@ def test_parse_share_text_rejects_short_link_that_resolves_to_note():
         service.close()
 
 
+def test_parse_share_text_rejects_video_url_that_browser_resolves_to_note():
+    class NoteRedirectResolver(FakeBrowserResolver):
+        def capture_video(self, share_url: str) -> BrowserCapture:
+            return BrowserCapture(
+                page_url="https://www.douyin.com/note/7341321026665499913",
+                title="note-page",
+                video_urls=(),
+                audio_urls=(),
+            )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "iesdouyin.com/share/video/" in url:
+            return httpx.Response(200, request=request, text="<html>empty</html>")
+        if "iteminfo" in url or "aweme/detail" in url:
+            return httpx.Response(200, request=request, text="not json")
+        return httpx.Response(200, request=request, text="<html></html>")
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
+        browser_resolver=NoteRedirectResolver(),
+        browser_fallback_enabled=True,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    try:
+        service.parse_share_text("https://www.douyin.com/video/7341321026665499913")
+    except RuntimeError as exc:
+        assert str(exc) == "链接类型为图文 note，非视频内容"
+    else:
+        raise AssertionError("expected browser note redirect to be treated as non-video")
+    finally:
+        service.close()
+
+
 def test_parse_share_text_uses_browser_when_interfaces_fail():
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)

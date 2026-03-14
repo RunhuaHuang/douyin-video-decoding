@@ -1,7 +1,9 @@
+import json
 import pandas as pd
 from pathlib import Path
 from zipfile import ZipFile
 
+from app.cookie_accounts import CookieAccountManager
 from app.csv_service import build_processed_output_name, inspect_csv, write_csv
 from app.job_manager import JobManager
 from app.main import app
@@ -227,3 +229,229 @@ def test_skip_batch_cooldown_endpoint_sets_skip_flags():
     assert response.status_code == 200
     assert manager.require_batch(batch.batch_id).skip_cooldown_requested is True
     assert manager.require(job.job_id).skip_cooldown_requested is True
+
+
+def test_build_cookie_pool_snapshot_clears_stale_relogin_flag(tmp_path):
+    accounts_dir = tmp_path / "browser" / "accounts"
+    accounts_dir.mkdir(parents=True, exist_ok=True)
+    (accounts_dir / "demo.json").write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "ttwid",
+                        "value": "cookie",
+                        "domain": ".douyin.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (accounts_dir / "demo.meta.json").write_text(
+        json.dumps(
+            {
+                "account_id": "demo",
+                "label": "demo",
+                "relogin_in_progress": True,
+                "source": "managed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    from app import main as main_module
+
+    previous_manager = main_module.cookie_account_manager
+    previous_threads = dict(main_module.account_relogin_threads)
+    main_module.cookie_account_manager = CookieAccountManager(
+        accounts_dir=accounts_dir,
+        legacy_storage_state_path=tmp_path / "browser" / "legacy.json",
+    )
+    main_module.account_relogin_threads = {}
+    try:
+        snapshot = main_module.build_cookie_pool_snapshot()
+        account = main_module.cookie_account_manager.get_account("demo")
+    finally:
+        main_module.cookie_account_manager = previous_manager
+        main_module.account_relogin_threads = previous_threads
+
+    assert snapshot["accounts"][0]["relogin_in_progress"] is False
+    assert account is not None
+    assert account.relogin_in_progress is False
+
+
+def test_build_cookie_pool_snapshot_recovers_when_cookie_file_was_updated(tmp_path):
+    accounts_dir = tmp_path / "browser" / "accounts"
+    accounts_dir.mkdir(parents=True, exist_ok=True)
+    storage_path = accounts_dir / "demo.json"
+    storage_path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "ttwid",
+                        "value": "cookie",
+                        "domain": ".douyin.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    meta_path = accounts_dir / "demo.meta.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "account_id": "demo",
+                "label": "demo",
+                "relogin_in_progress": True,
+                "updated_at": "2026-03-14T00:00:00+00:00",
+                "source": "managed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    storage_path.touch()
+
+    from app import main as main_module
+
+    previous_manager = main_module.cookie_account_manager
+    previous_threads = dict(main_module.account_relogin_threads)
+    main_module.cookie_account_manager = CookieAccountManager(
+        accounts_dir=accounts_dir,
+        legacy_storage_state_path=tmp_path / "browser" / "legacy.json",
+    )
+    main_module.account_relogin_threads = {}
+    try:
+        snapshot = main_module.build_cookie_pool_snapshot()
+        account = main_module.cookie_account_manager.get_account("demo")
+    finally:
+        main_module.cookie_account_manager = previous_manager
+        main_module.account_relogin_threads = previous_threads
+
+    assert snapshot["accounts"][0]["relogin_in_progress"] is False
+    assert account is not None
+    assert account.relogin_in_progress is False
+
+
+def test_relogin_endpoint_allows_retry_when_stale_flag_exists(tmp_path, monkeypatch):
+    accounts_dir = tmp_path / "browser" / "accounts"
+    accounts_dir.mkdir(parents=True, exist_ok=True)
+    (accounts_dir / "demo.json").write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "ttwid",
+                        "value": "cookie",
+                        "domain": ".douyin.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (accounts_dir / "demo.meta.json").write_text(
+        json.dumps(
+            {
+                "account_id": "demo",
+                "label": "demo",
+                "relogin_in_progress": True,
+                "source": "managed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    from app import main as main_module
+
+    previous_manager = main_module.cookie_account_manager
+    previous_threads = dict(main_module.account_relogin_threads)
+    captured = {}
+    main_module.cookie_account_manager = CookieAccountManager(
+        accounts_dir=accounts_dir,
+        legacy_storage_state_path=tmp_path / "browser" / "legacy.json",
+    )
+    main_module.account_relogin_threads = {}
+    monkeypatch.setattr(main_module, "start_account_relogin", lambda account_id: captured.update(account_id=account_id))
+    try:
+        client = TestClient(app)
+        response = client.post("/accounts/demo/relogin")
+    finally:
+        main_module.cookie_account_manager = previous_manager
+        main_module.account_relogin_threads = previous_threads
+
+    assert response.status_code == 200
+    assert captured == {"account_id": "demo"}
+
+
+def test_relogin_endpoint_allows_restart_when_thread_is_still_tracked(tmp_path, monkeypatch):
+    accounts_dir = tmp_path / "browser" / "accounts"
+    accounts_dir.mkdir(parents=True, exist_ok=True)
+    (accounts_dir / "demo.json").write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "ttwid",
+                        "value": "cookie",
+                        "domain": ".douyin.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (accounts_dir / "demo.meta.json").write_text(
+        json.dumps(
+            {
+                "account_id": "demo",
+                "label": "demo",
+                "relogin_in_progress": True,
+                "source": "managed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class DummyThread:
+        def is_alive(self):
+            return True
+
+    from app import main as main_module
+
+    previous_manager = main_module.cookie_account_manager
+    previous_threads = dict(main_module.account_relogin_threads)
+    captured = {}
+    main_module.cookie_account_manager = CookieAccountManager(
+        accounts_dir=accounts_dir,
+        legacy_storage_state_path=tmp_path / "browser" / "legacy.json",
+    )
+    main_module.account_relogin_threads = {"demo": DummyThread()}
+    monkeypatch.setattr(main_module, "start_account_relogin", lambda account_id: captured.update(account_id=account_id))
+    try:
+        client = TestClient(app)
+        response = client.post("/accounts/demo/relogin")
+    finally:
+        main_module.cookie_account_manager = previous_manager
+        main_module.account_relogin_threads = previous_threads
+
+    assert response.status_code == 200
+    assert captured == {"account_id": "demo"}

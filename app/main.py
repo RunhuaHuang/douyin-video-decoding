@@ -1,4 +1,5 @@
 import threading
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List
@@ -160,7 +161,52 @@ def build_health_snapshot() -> Dict[str, str]:
     }
 
 
+def _is_relogin_thread_alive(account_id: str) -> bool:
+    thread = account_relogin_threads.get(account_id)
+    if thread is None:
+        return False
+    if thread.is_alive():
+        return True
+    account_relogin_threads.pop(account_id, None)
+    return False
+
+
+def _reconcile_account_relogin_state(account_id: str) -> CookieAccount | None:
+    account = cookie_account_manager.get_account(account_id)
+    if account is None:
+        account_relogin_threads.pop(account_id, None)
+        return None
+    if not account.relogin_in_progress:
+        if not _is_relogin_thread_alive(account_id):
+            account_relogin_threads.pop(account_id, None)
+        return account
+    if account.has_usable_state and account.updated_at:
+        try:
+            relogin_started_at = datetime.fromisoformat(account.updated_at).timestamp()
+        except Exception:
+            relogin_started_at = 0.0
+        try:
+            storage_mtime = Path(account.storage_state_path).stat().st_mtime
+        except Exception:
+            storage_mtime = 0.0
+        if storage_mtime >= relogin_started_at:
+            account_relogin_threads.pop(account_id, None)
+            return cookie_account_manager.record_login(account_id, label=account.label)
+    if _is_relogin_thread_alive(account_id):
+        return account
+    account = cookie_account_manager.mark_relogin_in_progress(account_id, False)
+    return account
+
+
+def _reconcile_all_account_relogin_states() -> None:
+    account_ids = {account.account_id for account in cookie_account_manager.list_accounts()}
+    account_ids.update(account_relogin_threads.keys())
+    for account_id in account_ids:
+        _reconcile_account_relogin_state(account_id)
+
+
 def build_cookie_pool_snapshot(current_account_id: str = "") -> Dict[str, object]:
+    _reconcile_all_account_relogin_states()
     return cookie_account_manager.build_pool_snapshot(current_account_id=current_account_id)
 
 
@@ -182,6 +228,7 @@ def build_batch_payload(batch_id: str) -> Dict[str, object]:
 
 
 def _available_cookie_accounts() -> List[CookieAccount]:
+    _reconcile_all_account_relogin_states()
     return cookie_account_manager.list_available_accounts()
 
 
@@ -227,11 +274,12 @@ def switch_cookie_now_for_job(job_id: str, reason: str = "用户手动切换 coo
 
 
 def start_account_relogin(account_id: str) -> None:
-    account = cookie_account_manager.get_account(account_id)
+    account = _reconcile_account_relogin_state(account_id)
     if account is None:
         raise RuntimeError("cookies 账号不存在")
-    if account.relogin_in_progress:
-        raise RuntimeError("该账号正在重新登录中")
+    if account.relogin_in_progress and _is_relogin_thread_alive(account_id):
+        cookie_account_manager.mark_relogin_in_progress(account_id, False)
+        account_relogin_threads.pop(account_id, None)
     cookie_account_manager.mark_relogin_in_progress(account_id, True)
 
     def worker() -> None:
@@ -643,7 +691,7 @@ async def switch_batch_cookie(batch_id: str):
 
 @app.post("/accounts/{account_id}/exclude")
 async def exclude_cookie_account(account_id: str):
-    account = cookie_account_manager.get_account(account_id)
+    account = _reconcile_account_relogin_state(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="cookies 账号不存在")
     if account.relogin_in_progress:
@@ -657,7 +705,7 @@ async def exclude_cookie_account(account_id: str):
 
 @app.post("/accounts/{account_id}/reset")
 async def reset_cookie_account(account_id: str):
-    account = cookie_account_manager.get_account(account_id)
+    account = _reconcile_account_relogin_state(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="cookies 账号不存在")
     if account.relogin_in_progress:
@@ -669,11 +717,9 @@ async def reset_cookie_account(account_id: str):
 
 @app.post("/accounts/{account_id}/relogin")
 async def relogin_cookie_account(account_id: str):
-    account = cookie_account_manager.get_account(account_id)
+    account = _reconcile_account_relogin_state(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="cookies 账号不存在")
-    if account.relogin_in_progress:
-        raise HTTPException(status_code=409, detail="该账号正在重新登录中")
 
     try:
         start_account_relogin(account_id)

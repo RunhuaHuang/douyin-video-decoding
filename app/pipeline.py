@@ -471,7 +471,8 @@ class JobProcessor:
         pending = self._dedupe_tasks(retry_queue)
         round_index = 1
 
-        while pending and not self.manager.is_pause_requested(job_id):
+        while pending and not self.manager.is_pause_requested(job_id) and round_index <= self.max_retries:
+            self._switch_cookie_for_retry_round(job_id, round_index)
             self.manager.append_log(job_id, f"开始第 {round_index} 轮重试，共 {len(pending)} 行")
             next_round: List[RowTask] = []
             total_batches = self._batch_count(len(pending))
@@ -550,13 +551,36 @@ class JobProcessor:
                     self.sleep_fn(batch_delay_seconds)
 
             pending = self._dedupe_tasks(next_round)
-            if pending and not self.manager.is_pause_requested(job_id):
+            if pending and not self.manager.is_pause_requested(job_id) and round_index < self.max_retries:
                 self.manager.append_log(
                     job_id,
                     f"第 {round_index} 轮重试结束，剩余 {len(pending)} 行，{self.retry_delay_seconds} 秒后继续",
                 )
                 self.sleep_fn(self.retry_delay_seconds)
                 round_index += 1
+            else:
+                round_index += 1
+
+        if pending and not self.manager.is_pause_requested(job_id):
+            self.manager.append_log(
+                job_id,
+                f"重试已达到上限 {self.max_retries} 轮，剩余 {len(pending)} 行将标记为失败",
+            )
+            for task in pending:
+                attempts = self._get_attempts(dataframe, task.row_index)
+                self._set_row_meta(
+                    dataframe,
+                    task.row_index,
+                    status="失败",
+                    error_message="重试 3 轮后仍未成功，已停止继续尝试",
+                    attempts=attempts,
+                )
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行重试 3 轮后仍未成功，已标记为失败",
+                )
+            self._persist_snapshot(job_id, dataframe, output_path)
+            self._sync_progress(job_id, dataframe)
 
     def _process_batch_parallel(
         self,
@@ -1003,35 +1027,36 @@ class JobProcessor:
                 self.manager.append_log(job_id, "当前只有 1 份可用 cookies，无法切换")
             current_account = switched
 
-        preferred_account = self.cookie_account_manager.select_current_or_first_available_account(
-            current_account_id=current_account_id,
-        )
-        if (
-            current_account is not None
-            and current_account.warning
-            and preferred_account is not None
-            and preferred_account.account_id != current_account.account_id
-        ):
-            current_account = self._apply_cookie_account(
-                job_id,
-                preferred_account,
-                reason=f"当前 cookies `{current_account.label}` 处于预警状态，已切换到正常账号",
-            )
-
         if current_account is None:
-            current_account = preferred_account or self.cookie_account_manager.select_current_or_first_available_account(
+            current_account = self.cookie_account_manager.select_current_or_first_available_account(
                 current_account_id=current_account_id
             )
             if current_account is None:
                 raise RuntimeError('没有可用的 cookies。请先运行 `./login "备注"` 添加账号，或恢复/重新登录已剔除账号。')
             self._apply_cookie_account(job_id, current_account, reason="已装载 cookies 账号")
-            if current_account.warning:
-                self.manager.append_log(
-                    job_id,
-                    f"当前所有未剔除 cookies 都处于预警状态，继续使用 `{current_account.label}` 以避免任务中断",
-                )
 
         return current_account
+
+    def _switch_cookie_for_retry_round(self, job_id: str, round_index: int) -> None:
+        if self.cookie_account_manager is None:
+            return
+
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        current_account_id = str(runtime.get("current_cookie_account_id") or "").strip()
+        if not current_account_id:
+            self._prepare_cookie_account_for_batch(job_id)
+            current_account_id = str(
+                self.manager.get_effective_cookie_runtime(job_id).get("current_cookie_account_id") or ""
+            ).strip()
+
+        switched = self._switch_cookie_account(
+            job_id,
+            reason=f"开始第 {round_index} 轮重试，切换 cookies",
+            prefer_next=True,
+            required=False,
+        )
+        if switched is None:
+            self.manager.append_log(job_id, f"第 {round_index} 轮重试开始前没有其他 cookies 可切换，继续使用当前账号")
 
     def _finalize_cookie_rotation(
         self,
@@ -1067,7 +1092,6 @@ class JobProcessor:
         )
 
         switch_reason = ""
-        account_warned = False
         if run_state.current_batch_strong_issue:
             if run_state.strong_signal_phase != phase_key:
                 run_state.strong_signal_phase = phase_key
@@ -1079,44 +1103,28 @@ class JobProcessor:
 
         if current_account is not None and run_state.current_batch_strong_issue:
             signal_text = "；".join(run_state.current_batch_strong_signal_descriptions[:3]) or "403/429/验证码"
-            next_account = self.cookie_account_manager.select_next_available_account(
-                current_account_id=current_account.account_id,
-                allow_same=False,
-            )
             if run_state.strong_signal_batch_streak >= strong_signal_threshold:
-                if next_account is None:
-                    self.manager.append_log(
-                        job_id,
-                        f"连续 {run_state.strong_signal_batch_streak} 批命中强信号，但当前只有 1 个可用 cookies，继续使用 `{current_account.label}`",
+                updated_account = self.cookie_account_manager.note_issue(current_account.account_id, signal_text)
+                challenge_strikes = updated_account.challenge_strikes if updated_account is not None else 0
+                if challenge_strikes >= self.cookie_account_manager.invalidation_strike_threshold:
+                    warning_reason = (
+                        f"连续 {challenge_strikes} 次达到强信号预警阈值：{signal_text}"
                     )
-                    run_state.strong_signal_batch_streak = 0
-                else:
-                    updated_account = self.cookie_account_manager.note_issue(current_account.account_id, signal_text)
-                    challenge_strikes = updated_account.challenge_strikes if updated_account is not None else 0
-                    if challenge_strikes >= self.cookie_account_manager.invalidation_strike_threshold:
-                        warning_reason = (
-                            f"连续 {challenge_strikes} 次达到强信号切换阈值：{signal_text}"
-                        )
-                        warned_account = self.cookie_account_manager.mark_warning(
-                            current_account.account_id,
-                            warning_reason,
-                        )
-                        if warned_account is not None:
-                            self.manager.append_log(
-                                job_id,
-                                f"cookies `{warned_account.label}` 已进入预警状态：{warning_reason}",
-                            )
-                        switch_reason = "当前 cookies 已进入预警状态，已自动切换"
-                        account_warned = True
-                    else:
+                    warned_account = self.cookie_account_manager.mark_warning(
+                        current_account.account_id,
+                        warning_reason,
+                    )
+                    if warned_account is not None:
                         self.manager.append_log(
                             job_id,
-                            f"cookies `{current_account.label}` 已连续 {run_state.strong_signal_batch_streak} 批命中强信号，当前批结束后自动切换",
+                            f"cookies `{warned_account.label}` 已进入预警状态：{warning_reason}",
                         )
-                        switch_reason = (
-                            f"连续 {run_state.strong_signal_batch_streak} 批命中强信号，已自动切换 cookies"
-                        )
-                    run_state.strong_signal_batch_streak = 0
+                else:
+                    self.manager.append_log(
+                        job_id,
+                        f"cookies `{current_account.label}` 已累计 {challenge_strikes} 次强信号 strike，继续使用当前账号",
+                    )
+                run_state.strong_signal_batch_streak = 0
         elif current_account is not None:
             self.cookie_account_manager.mark_success(current_account.account_id)
 
@@ -1139,8 +1147,6 @@ class JobProcessor:
             elif switched is None and batches_since_switch >= self.cookie_switch_batch_threshold:
                 self._set_cookie_runtime(job_id, cookie_batches_since_switch=0)
                 self.manager.append_log(job_id, "账号池中没有可切换的其他 cookies，已继续使用当前账号")
-            elif switched is None and account_warned:
-                self.manager.append_log(job_id, "当前没有其他正常 cookies，可继续回退使用预警账号，任务不会自动停止")
 
         self._reset_current_batch_cookie_flags(run_state)
 

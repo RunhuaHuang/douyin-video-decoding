@@ -73,6 +73,11 @@ class StrongSignalDouyinService(FakeDouyinService):
         return reasons
 
 
+class AlwaysRetryableParseFailureDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        raise httpx.ReadTimeout("timed out")
+
+
 class FakeFfmpegService:
     def __init__(self) -> None:
         self.last_supplemental_audio_path: Path | None = None
@@ -1761,7 +1766,7 @@ def test_pipeline_warns_cookie_account_after_strong_signal(tmp_path, monkeypatch
     assert warned is not None
     assert warned.warning is True
     assert warned.invalid is False
-    assert job.current_cookie_label == "小号A"
+    assert job.current_cookie_label == "主号"
     assert any("cookies `主号` 已进入预警状态" in line for line in job.logs)
 
 
@@ -1824,7 +1829,7 @@ def test_pipeline_retry_phase_uses_retry_strong_signal_threshold(tmp_path, monke
             phase="重试",
             batch_index=1,
             total_batches=1,
-        )
+    )
 
     job = manager.require(session.job_id)
     assert job.current_cookie_label == "主号"
@@ -1840,7 +1845,11 @@ def test_pipeline_retry_phase_uses_retry_strong_signal_threshold(tmp_path, monke
     )
 
     job = manager.require(session.job_id)
-    assert job.current_cookie_label == "小号A"
+    warned = cookie_manager.get_account("主号")
+    assert job.current_cookie_label == "主号"
+    assert warned is not None
+    assert warned.warning is False
+    assert warned.challenge_strikes == 1
 
 
 def test_pipeline_with_single_cookie_account_keeps_running_on_strong_signal(tmp_path, monkeypatch):
@@ -1900,7 +1909,10 @@ def test_pipeline_with_single_cookie_account_keeps_running_on_strong_signal(tmp_
 
     assert job.status == "completed"
     assert job.current_cookie_label == "主号"
-    assert any("当前只有 1 个可用 cookies，继续使用 `主号`" in line for line in job.logs)
+    warned = cookie_manager.get_account("主号")
+    assert warned is not None
+    assert warned.warning is False
+    assert warned.challenge_strikes == 2
 
 
 def test_pipeline_uses_warned_accounts_when_all_accounts_are_warned(tmp_path, monkeypatch):
@@ -1965,4 +1977,67 @@ def test_pipeline_uses_warned_accounts_when_all_accounts_are_warned(tmp_path, mo
     job = manager.require(session.job_id)
     assert job.status == "completed"
     assert job.current_cookie_label in {"主号", "小号A"}
-    assert any("当前所有未剔除 cookies 都处于预警状态" in line for line in job.logs)
+
+
+def test_pipeline_retry_rounds_switch_cookie_and_stop_after_three_rounds(tmp_path, monkeypatch):
+    csv_path = tmp_path / "retry-limit.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    cookie_manager = _build_cookie_account_manager(tmp_path, ["主号", "小号A"])
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="retry-limit.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=AlwaysRetryableParseFailureDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        retry_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert result.loc[0, "处理状态"] == "失败"
+    assert result.loc[0, "尝试次数"] == "4"
+    assert "解析失败: 读取超时" in result.loc[0, "失败原因"]
+    assert any("开始第 1 轮重试，切换 cookies" in line for line in job.logs)
+    assert any("开始第 2 轮重试，切换 cookies" in line for line in job.logs)
+    assert any("开始第 3 轮重试，切换 cookies" in line for line in job.logs)

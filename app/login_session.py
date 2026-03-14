@@ -1,5 +1,8 @@
 import sys
 import time
+import json
+import threading
+from pathlib import Path
 from typing import Callable
 
 from .browser_service import CHROME_USER_AGENT
@@ -18,6 +21,44 @@ def _resolve_account_label(argv: list[str]) -> str:
         if value:
             return value
         print("备注不能为空，请重新输入。")
+
+
+def _storage_state_has_cookies(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    cookies = payload.get("cookies") if isinstance(payload, dict) else None
+    if not isinstance(cookies, list):
+        return False
+    return any(isinstance(cookie, dict) and str(cookie.get("name") or "").strip() for cookie in cookies)
+
+
+def _persist_storage_state_once(context, target_path: Path) -> bool:
+    try:
+        context.storage_state(path=str(target_path))
+        return _storage_state_has_cookies(target_path)
+    except Exception:
+        return False
+
+
+def _cookies_look_authenticated(cookies: list[dict]) -> bool:
+    names = {str(cookie.get("name") or "").strip() for cookie in cookies if isinstance(cookie, dict)}
+    return (
+        ("sessionid" in names or "sessionid_ss" in names)
+        and ("uid_tt" in names or "uid_tt_ss" in names or "sid_tt" in names)
+    )
+
+
+def _context_has_authenticated_cookies(context) -> bool:
+    try:
+        cookies = list(context.cookies(["https://www.douyin.com/"]))
+    except Exception:
+        try:
+            cookies = list(context.cookies())
+        except Exception:
+            cookies = []
+    return _cookies_look_authenticated(cookies)
 
 
 def login_with_label(
@@ -45,6 +86,7 @@ def login_with_label(
     logger(f"当前备注: {account.label}")
     logger(f"会话文件会保存到: {account.storage_state_path}")
     logger("登录窗口会强制从未登录状态开始，不会复用当前账号池里的旧会话。")
+    login_recorded = False
 
     try:
         with sync_playwright() as playwright:
@@ -82,30 +124,86 @@ def login_with_label(
                 pass
 
             account.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_storage_path = account.storage_state_path.with_suffix(".tmp.json")
+            temp_storage_path.unlink(missing_ok=True)
 
             if wait_mode == "browser_close":
+                saved = False
+                closed_event = threading.Event()
+
+                def persist_state(*_args) -> None:
+                    nonlocal saved
+                    if saved:
+                        closed_event.set()
+                        return
+                    saved = _persist_storage_state_once(context, temp_storage_path)
+                    closed_event.set()
+
+                try:
+                    page.on("close", persist_state)
+                except Exception:
+                    pass
+                try:
+                    context.on("close", persist_state)
+                except Exception:
+                    pass
+                try:
+                    browser.on("disconnected", persist_state)
+                except Exception:
+                    pass
+
                 while True:
-                    try:
-                        context.storage_state(path=str(account.storage_state_path))
-                    except Exception:
-                        pass
-                    try:
-                        if not browser.is_connected():
-                            break
-                    except Exception:
+                    if _context_has_authenticated_cookies(context):
+                        persist_state()
                         break
-                    time.sleep(1)
+                    if closed_event.wait(0.2):
+                        break
+                    try:
+                        page_closed = bool(getattr(page, "is_closed", lambda: False)())
+                    except Exception:
+                        page_closed = True
+                    try:
+                        pages = list(getattr(context, "pages", []))
+                    except Exception:
+                        pages = []
+                    try:
+                        browser_connected = bool(getattr(browser, "is_connected", lambda: False)())
+                    except Exception:
+                        browser_connected = False
+
+                    if page_closed or not pages or not browser_connected:
+                        persist_state()
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             else:
                 input("完成登录后按回车保存并关闭浏览器...")
-                context.storage_state(path=str(account.storage_state_path))
+                _persist_storage_state_once(context, temp_storage_path)
                 context.close()
                 browser.close()
+
+            if _storage_state_has_cookies(temp_storage_path):
+                temp_storage_path.replace(account.storage_state_path)
+                account_manager.record_login(account.account_id, label=account.label)
+                login_recorded = True
+                logger(f"登录会话已保存到 `{account.storage_state_path.name}`。后续运行 WebUI 会自动纳入 cookies 池。")
+            else:
+                temp_storage_path.unlink(missing_ok=True)
+                account_manager.mark_relogin_in_progress(account.account_id, False)
+                logger("未检测到有效登录 cookies，已保留原有会话文件。")
+                return
     except Exception:
         account_manager.mark_relogin_in_progress(account.account_id, False)
         raise
 
-    account_manager.record_login(account.account_id, label=account.label)
-    logger(f"登录会话已保存到 `{account.storage_state_path.name}`。后续运行 WebUI 会自动纳入 cookies 池。")
+    if not login_recorded:
+        account_manager.record_login(account.account_id, label=account.label)
+        logger(f"登录会话已保存到 `{account.storage_state_path.name}`。后续运行 WebUI 会自动纳入 cookies 池。")
 
 
 def run() -> None:

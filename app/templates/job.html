@@ -141,7 +141,7 @@
                       剔除
                     </button>
                     <button
-                      class="button button-accent button-compact account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      class="button button-accent button-compact account-action-button"
                       type="button"
                       data-action="relogin"
                       data-account-id="{{ account.account_id }}"
@@ -242,7 +242,7 @@
         const suffix = account.is_current ? "(当前)" : (account.is_next ? "(下一个)" : "");
         const reason = account.warning_reason || account.invalid_reason || account.last_issue_reason || "-";
         const excludeDisabled = account.invalid || account.relogin_in_progress ? "is-disabled" : "";
-        const reloginDisabled = account.relogin_in_progress ? "is-disabled" : "";
+        const reloginDisabled = "";
         const resetDisabled = account.relogin_in_progress ? "is-disabled" : "";
         return `
           <tr>

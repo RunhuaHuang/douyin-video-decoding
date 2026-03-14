@@ -203,10 +203,11 @@ class CookieAccountManager:
         ]
 
     def list_available_accounts(self) -> List[CookieAccount]:
-        active = self.list_active_accounts()
-        if active:
-            return active
-        return self.list_warning_accounts()
+        return [
+            account
+            for account in self.list_accounts()
+            if not account.invalid and account.has_usable_state
+        ]
 
     def build_pool_snapshot(self, *, current_account_id: str = "") -> Dict[str, object]:
         accounts = self.list_accounts()

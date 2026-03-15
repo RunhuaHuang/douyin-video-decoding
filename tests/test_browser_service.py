@@ -31,12 +31,15 @@ def test_download_video_skips_candidate_without_audio(tmp_path, monkeypatch):
     capture = BrowserCapture(
         page_url="https://www.douyin.com/video/123",
         title="demo",
-        video_urls=("https://cdn.example.com/no-audio.mp4", "https://cdn.example.com/with-audio.mp4"),
+        video_urls=(
+            "https://v26-web.douyinvod.com/no-audio.mp4?mime_type=video_mp4",
+            "https://v26-web.douyinvod.com/with-audio.mp4?mime_type=video_mp4",
+        ),
         audio_urls=(),
     )
     responses = {
-        "https://cdn.example.com/no-audio.mp4": _DummyResponse(200, b"noaudio", "video/mp4"),
-        "https://cdn.example.com/with-audio.mp4": _DummyResponse(200, b"withaudio", "video/mp4"),
+        "https://v26-web.douyinvod.com/no-audio.mp4?mime_type=video_mp4": _DummyResponse(200, b"noaudio", "video/mp4"),
+        "https://v26-web.douyinvod.com/with-audio.mp4?mime_type=video_mp4": _DummyResponse(200, b"withaudio", "video/mp4"),
     }
 
     monkeypatch.setattr(fallback, "capture_video", lambda share_url: capture)
@@ -55,8 +58,35 @@ def test_download_video_skips_candidate_without_audio(tmp_path, monkeypatch):
         tmp_path / "audio.m4a",
     )
 
-    assert result.source_url == "https://cdn.example.com/with-audio.mp4"
+    assert result.source_url == "https://v26-web.douyinvod.com/with-audio.mp4?mime_type=video_mp4"
     assert output_path.read_bytes() == b"withaudio"
+
+
+def test_download_video_ignores_preview_candidates(tmp_path, monkeypatch):
+    fallback = PlaywrightFallback()
+    capture = BrowserCapture(
+        page_url="https://www.douyin.com/video/123",
+        title="demo",
+        video_urls=("https://v26-web.douyinvod.com/real.mp4?mime_type=video_mp4",),
+        audio_urls=(),
+        preview_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
+    )
+    responses = {
+        "https://v26-web.douyinvod.com/real.mp4?mime_type=video_mp4": _DummyResponse(200, b"realvideo", "video/mp4"),
+    }
+
+    monkeypatch.setattr(fallback, "capture_video", lambda share_url: capture)
+    monkeypatch.setattr(fallback, "_ensure_context", lambda: _DummyContext(responses))
+
+    output_path = tmp_path / "video.mp4"
+    result = fallback.download_video(
+        "https://www.douyin.com/video/123",
+        output_path,
+        ("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
+    )
+
+    assert result.source_url == "https://v26-web.douyinvod.com/real.mp4?mime_type=video_mp4"
+    assert output_path.read_bytes() == b"realvideo"
 
 
 def test_load_cookies_reads_persisted_storage_state(tmp_path):

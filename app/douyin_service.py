@@ -430,14 +430,10 @@ class DouyinService:
                 raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
             self._sync_client_cookies_from_browser()
             browser_urls = tuple(self._candidate_download_urls(capture.media_urls))
-            if self._looks_like_deleted_title(capture.title):
-                if browser_urls and self._has_non_preview_browser_media(browser_urls):
-                    pass
-                elif capture.audio_urls:
-                    pass
-                elif browser_urls:
-                    raise RuntimeError("浏览器兜底命中通用页，仅捕获到预览片段")
-                else:
+            if not browser_urls and capture.preview_urls:
+                raise RuntimeError("浏览器兜底命中通用页，仅捕获到预览片段")
+            if not browser_urls:
+                if self._looks_like_deleted_title(capture.title):
                     video_id = self.extract_video_id(capture.page_url) or self.extract_video_id(share_url) or "browser"
                     return ParsedVideo(
                         video_id=video_id,
@@ -449,8 +445,7 @@ class DouyinService:
                         resolved_by="浏览器兜底",
                         is_deleted=True,
                     )
-            if not browser_urls:
-                raise RuntimeError("浏览器兜底没有捕获到视频地址")
+                raise RuntimeError("浏览器兜底没有捕获到真实视频地址")
 
             video_id = self.extract_video_id(capture.page_url) or self.extract_video_id(share_url) or "browser"
             return ParsedVideo(
@@ -479,13 +474,9 @@ class DouyinService:
     ) -> Optional[ParsedVideo]:
         if browser_video is None:
             return None
-        if not self._looks_like_deleted_title(browser_video.title):
-            return browser_video
         if not browser_video.download_urls:
-            return browser_video
-        if self._has_non_preview_browser_media(browser_video.download_urls):
-            return browser_video
-        return None
+            return None if self._looks_like_deleted_title(browser_video.title) else browser_video
+        return browser_video
 
     def _download_via_browser(
         self,

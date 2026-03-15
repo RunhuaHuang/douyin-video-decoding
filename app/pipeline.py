@@ -564,20 +564,23 @@ class JobProcessor:
         if pending and not self.manager.is_pause_requested(job_id):
             self.manager.append_log(
                 job_id,
-                f"重试已达到上限 {self.max_retries} 轮，剩余 {len(pending)} 行将标记为失败",
+                f"重试已达到上限 {self.max_retries} 轮，剩余 {len(pending)} 行将标记为已删除",
             )
             for task in pending:
                 attempts = self._get_attempts(dataframe, task.row_index)
+                for column_name in output_columns.values():
+                    if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
+                        dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
                 self._set_row_meta(
                     dataframe,
                     task.row_index,
-                    status="失败",
-                    error_message="重试 3 轮后仍未成功，已停止继续尝试",
+                    status="已删除",
+                    error_message="",
                     attempts=attempts,
                 )
                 self.manager.append_log(
                     job_id,
-                    f"第 {task.csv_row_number} 行重试 3 轮后仍未成功，已标记为失败",
+                    f"第 {task.csv_row_number} 行重试 3 轮后仍未成功，已标记为已删除",
                 )
             self._persist_snapshot(job_id, dataframe, output_path)
             self._sync_progress(job_id, dataframe)
@@ -821,6 +824,22 @@ class JobProcessor:
             retryable = self._is_retryable(exc, plan.attempt_number)
             weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+            if self._should_mark_deleted_after_retry_ceiling(exc, plan.attempt_number):
+                return RowExecutionResult(
+                    plan=plan,
+                    outcome=RowOutcome(
+                        status="已删除",
+                        attempts=plan.attempt_number,
+                        anti_crawl_suspected=bool(weak_signal_descriptions),
+                        anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                        anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
+                    ),
+                    transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
+                    log_messages=(
+                        f"第 {plan.task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                    ),
+                    cleanup_dir=row_dir,
+                )
             status = RETRY_PENDING_STATUS if retryable else "失败"
             return RowExecutionResult(
                 plan=plan,
@@ -1831,6 +1850,21 @@ class JobProcessor:
             retryable = self._is_retryable(exc, attempt_number)
             weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+            if self._should_mark_deleted_after_retry_ceiling(exc, attempt_number):
+                for column_name in output_columns.values():
+                    if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
+                        dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                )
+                return RowOutcome(
+                    status="已删除",
+                    attempts=attempt_number,
+                    anti_crawl_suspected=bool(weak_signal_descriptions),
+                    anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                    anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
+                )
             status = RETRY_PENDING_STATUS if retryable else "失败"
             return RowOutcome(
                 status=status,
@@ -2121,6 +2155,10 @@ class JobProcessor:
         if self._should_mark_deleted_from_invalid_link(exc, attempt_number):
             return "连续未识别到有效抖音链接"
         return ""
+
+    @staticmethod
+    def _should_mark_deleted_after_retry_ceiling(exc: RowProcessingError, attempt_number: int) -> bool:
+        return exc.stage in {"解析", "下载", "抽音频"} and attempt_number > 3
 
     @staticmethod
     def _dedupe_tasks(tasks: Sequence[RowTask]) -> List[RowTask]:

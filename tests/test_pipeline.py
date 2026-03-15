@@ -2035,9 +2035,9 @@ def test_pipeline_retry_rounds_switch_cookie_and_stop_after_three_rounds(tmp_pat
     result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
 
     assert job.status == "completed"
-    assert result.loc[0, "处理状态"] == "失败"
+    assert result.loc[0, "处理状态"] == "已删除"
     assert result.loc[0, "尝试次数"] == "4"
-    assert "解析失败: 读取超时" in result.loc[0, "失败原因"]
+    assert result.loc[0, "视频文本"] == "已删除"
     assert any("开始第 1 轮重试，切换 cookies" in line for line in job.logs)
     assert any("开始第 2 轮重试，切换 cookies" in line for line in job.logs)
     assert any("开始第 3 轮重试，切换 cookies" in line for line in job.logs)

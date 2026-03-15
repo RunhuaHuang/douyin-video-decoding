@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 
 import httpx
 import pandas as pd
 
 from app.csv_service import inspect_csv
+from app.cookie_accounts import CookieAccountManager
 from app.job_manager import JobManager
 from app.pipeline import JobProcessor, RowOutcome, RowTask, RunControlState
 from app.transcription_service import TranscriptionService
@@ -57,6 +59,25 @@ class FakeDouyinService:
         return None
 
 
+class StrongSignalDouyinService(FakeDouyinService):
+    def __init__(self) -> None:
+        self._challenge_reasons = []
+
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        self._challenge_reasons = ["HTTP 403"]
+        return super().parse_share_text(share_text)
+
+    def consume_attempt_challenge_signal_reasons(self) -> tuple[str, ...]:
+        reasons = tuple(self._challenge_reasons)
+        self._challenge_reasons = []
+        return reasons
+
+
+class AlwaysRetryableParseFailureDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        raise httpx.ReadTimeout("timed out")
+
+
 class FakeFfmpegService:
     def __init__(self) -> None:
         self.last_supplemental_audio_path: Path | None = None
@@ -88,6 +109,41 @@ class FakeTranscriptionService:
         if "bad-model" in (model_name or self.default_model):
             raise RuntimeError("boom")
         return f"transcript:{audio_path.stem}:{model_name or self.default_model}"
+
+
+def _write_cookie_state(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "ttwid",
+                        "value": value,
+                        "domain": ".douyin.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _build_cookie_account_manager(tmp_path: Path, labels: list[str], *, invalidation_threshold: int = 3) -> CookieAccountManager:
+    manager = CookieAccountManager(
+        accounts_dir=tmp_path / "browser" / "accounts",
+        legacy_storage_state_path=tmp_path / "browser" / "legacy.json",
+        switch_batch_threshold=30,
+        invalidation_strike_threshold=invalidation_threshold,
+    )
+    for index, label in enumerate(labels, start=1):
+        account = manager.prepare_account(label)
+        _write_cookie_state(account.storage_state_path, f"cookie-{index}")
+        manager.record_login(account.account_id, label=account.label)
+    return manager
 
 
 class FlakyDouyinService(FakeDouyinService):
@@ -1583,3 +1639,405 @@ def test_pipeline_passes_browser_audio_sidecar_to_ffmpeg(tmp_path, monkeypatch):
 
     assert ffmpeg_service.last_supplemental_audio_path is not None
     assert ffmpeg_service.last_supplemental_audio_path.name == "fallback_audio.m4a"
+
+
+def test_pipeline_rotates_cookie_accounts_after_threshold(tmp_path, monkeypatch):
+    csv_path = tmp_path / "rotate.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+            {"url": "https://www.douyin.com/video/3"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    cookie_manager = _build_cookie_account_manager(tmp_path, ["主号", "小号A"])
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="rotate.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+        cookie_switch_batch_threshold=2,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert job.current_cookie_label == "小号A"
+    assert job.cookie_total_batches_processed == 3
+    assert any("当前 cookies 已切换到 `主号`" in line for line in job.logs)
+    assert any("当前 cookies 已切换到 `小号A`" in line for line in job.logs)
+
+
+def test_pipeline_warns_cookie_account_after_strong_signal(tmp_path, monkeypatch):
+    csv_path = tmp_path / "warn.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    cookie_manager = _build_cookie_account_manager(
+        tmp_path,
+        ["主号", "小号A"],
+        invalidation_threshold=1,
+    )
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="warn.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=StrongSignalDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+        cookie_strong_signal_switch_threshold=1,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    warned = cookie_manager.get_account("主号")
+
+    assert job.status == "completed"
+    assert warned is not None
+    assert warned.warning is True
+    assert warned.invalid is False
+    assert job.current_cookie_label == "主号"
+    assert any("cookies `主号` 已进入预警状态" in line for line in job.logs)
+
+
+def test_pipeline_retry_phase_uses_retry_strong_signal_threshold(tmp_path, monkeypatch):
+    cookie_manager = _build_cookie_account_manager(tmp_path, ["主号", "小号A"])
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="retry-strong.csv",
+        upload_path=tmp_path / "retry-strong.csv",
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=StrongSignalDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+        cookie_strong_signal_switch_threshold=1,
+        cookie_retry_strong_signal_switch_threshold=4,
+    )
+    first_account = cookie_manager.select_current_or_first_available_account()
+    assert first_account is not None
+    processor._apply_cookie_account(session.job_id, first_account, reason="test setup")
+
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    for _ in range(3):
+        run_state.current_batch_strong_issue = True
+        run_state.current_batch_strong_signal_descriptions = ["强冷却信号：HTTP 403"]
+        processor._finalize_cookie_rotation(
+            job_id=session.job_id,
+            run_state=run_state,
+            phase="重试",
+            batch_index=1,
+            total_batches=1,
+    )
+
+    job = manager.require(session.job_id)
+    assert job.current_cookie_label == "主号"
+
+    run_state.current_batch_strong_issue = True
+    run_state.current_batch_strong_signal_descriptions = ["强冷却信号：HTTP 403"]
+    processor._finalize_cookie_rotation(
+        job_id=session.job_id,
+        run_state=run_state,
+        phase="重试",
+        batch_index=1,
+        total_batches=1,
+    )
+
+    job = manager.require(session.job_id)
+    warned = cookie_manager.get_account("主号")
+    assert job.current_cookie_label == "主号"
+    assert warned is not None
+    assert warned.warning is False
+    assert warned.challenge_strikes == 1
+
+
+def test_pipeline_with_single_cookie_account_keeps_running_on_strong_signal(tmp_path, monkeypatch):
+    csv_path = tmp_path / "single-account.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    cookie_manager = _build_cookie_account_manager(tmp_path, ["主号"])
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="single-account.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=2,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=StrongSignalDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+        cookie_strong_signal_switch_threshold=1,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+
+    assert job.status == "completed"
+    assert job.current_cookie_label == "主号"
+    warned = cookie_manager.get_account("主号")
+    assert warned is not None
+    assert warned.warning is False
+    assert warned.challenge_strikes == 2
+
+
+def test_pipeline_uses_warned_accounts_when_all_accounts_are_warned(tmp_path, monkeypatch):
+    csv_path = tmp_path / "all-warned.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://www.douyin.com/video/1"},
+            {"url": "https://www.douyin.com/video/2"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    cookie_manager = _build_cookie_account_manager(
+        tmp_path,
+        ["主号", "小号A"],
+        invalidation_threshold=1,
+    )
+    cookie_manager.mark_warning("主号", "测试预警")
+    cookie_manager.mark_warning("小号A", "测试预警")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="all-warned.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=2,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert job.current_cookie_label in {"主号", "小号A"}
+
+
+def test_pipeline_retry_rounds_switch_cookie_and_stop_after_three_rounds(tmp_path, monkeypatch):
+    csv_path = tmp_path / "retry-limit.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    cookie_manager = _build_cookie_account_manager(tmp_path, ["主号", "小号A"])
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="retry-limit.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        batch_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=AlwaysRetryableParseFailureDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        batch_size=1,
+        batch_delay_seconds=0,
+        retry_delay_seconds=0,
+        anti_crawl_streak_threshold=100,
+        anti_crawl_cooldown_seconds=0,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+        cookie_account_manager=cookie_manager,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert result.loc[0, "处理状态"] == "已删除"
+    assert result.loc[0, "尝试次数"] == "4"
+    assert result.loc[0, "视频文本"] == "已删除"
+    assert any("开始第 1 轮重试，切换 cookies" in line for line in job.logs)
+    assert any("开始第 2 轮重试，切换 cookies" in line for line in job.logs)
+    assert any("开始第 3 轮重试，切换 cookies" in line for line in job.logs)

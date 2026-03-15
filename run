@@ -36,7 +36,6 @@ stop_existing_server() {
 }
 
 stop_existing_server
-"$ROOT_DIR/login"
 
 uv run douyin-csv-webui &
 SERVER_PID="$!"

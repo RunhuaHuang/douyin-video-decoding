@@ -4,7 +4,7 @@
 
 {% block content %}
   <section class="card card-tight">
-    <div class="status-grid">
+    <div class="status-grid status-grid-home">
       <div class="status-item">
         <span class="status-label">FFmpeg</span>
         <strong>{{ health.ffmpeg }}</strong>
@@ -17,10 +17,114 @@
         <span class="status-label">SenseVoice</span>
         <strong>{{ health.sensevoice }}</strong>
       </div>
-      <div class="status-item">
+      <div class="status-item status-item-model">
         <span class="status-label">默认模型</span>
-        <strong class="mono">{{ health.default_model }}</strong>
+        <strong class="mono long-value">{{ health.default_model }}</strong>
       </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>导入表格</h2>
+      <p>支持批量上传，按顺序逐个处理。</p>
+    </div>
+    <form class="stack-form" action="/preview" method="post" enctype="multipart/form-data">
+      <label class="field file-upload-field">
+        <div class="file-picker">
+          <input
+            class="file-input-native"
+            id="upload-files"
+            type="file"
+            name="files"
+            accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            multiple
+            required
+          />
+          <div class="file-picker-copy">
+            <span class="file-picker-button">选择文件</span>
+            <div class="file-picker-meta">
+              <strong id="upload-file-summary">支持 CSV / XLSX 批量上传</strong>
+              <span id="upload-file-detail">点击这里选择文件，或一次选中多个表格一起导入。</span>
+            </div>
+          </div>
+        </div>
+      </label>
+      <button class="button button-primary" type="submit">读取表头</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="section-head">
+      <h2>Cookies 账号池</h2>
+      <p>通过终端运行 <code>./login "备注"</code> 添加或替换账号。</p>
+    </div>
+    <div class="pill-row">
+      <span class="pill">正常 {{ cookie_pool.active_count }}</span>
+      <span class="pill pill-muted">预警 {{ cookie_pool.warning_count }}</span>
+      <span class="pill pill-muted">已剔除 {{ cookie_pool.excluded_count }}</span>
+      <span class="pill pill-muted">30 批自动切换</span>
+    </div>
+    <div class="table-shell">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th class="col-label nowrap">备注</th>
+            <th class="col-status nowrap">状态</th>
+            <th class="col-file nowrap">文件</th>
+            <th class="col-signal nowrap">强信号计数</th>
+            <th class="col-reason nowrap">最近原因</th>
+            <th class="col-actions nowrap">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% if cookie_pool.accounts %}
+            {% for account in cookie_pool.accounts %}
+              <tr>
+                <td class="account-label-cell">{{ account.label }}</td>
+                <td class="account-status-cell nowrap">{{ account.status_text }}</td>
+                <td class="account-file-cell" title="{{ account.storage_state_path }}">
+                  <span class="account-file-name">{{ account.storage_state_name }}</span>
+                </td>
+                <td class="account-signal-cell nowrap">{{ account.challenge_strikes }}</td>
+                <td class="account-reason-cell" title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}">
+                  {{ account.warning_reason or account.invalid_reason or account.last_issue_reason or "-" }}
+                </td>
+                <td class="account-actions-cell">
+                  <div class="account-actions">
+                    <button
+                      class="button button-secondary button-compact account-action-button {% if account.invalid or account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="exclude"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      剔除
+                    </button>
+                    <button
+                      class="button button-accent button-compact account-action-button"
+                      type="button"
+                      data-action="relogin"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      重新登录
+                    </button>
+                    <button
+                      class="button button-ghost button-compact account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      type="button"
+                      data-action="reset"
+                      data-account-id="{{ account.account_id }}"
+                    >
+                      清零
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          {% else %}
+            <tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "主号"</code> 或 <code>./login "小号A"</code>。</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
     </div>
   </section>
 
@@ -30,20 +134,6 @@
       <p>{{ page_error }}</p>
     </section>
   {% endif %}
-
-  <section class="card">
-    <div class="section-head">
-      <h2>导入表格</h2>
-      <p>支持批量上传，按顺序逐个处理。</p>
-    </div>
-    <form class="stack-form" action="/preview" method="post" enctype="multipart/form-data">
-      <label class="field">
-        <span>文件</span>
-        <input type="file" name="files" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required />
-      </label>
-      <button class="button button-primary" type="submit">读取表头</button>
-    </form>
-  </section>
 
   {% if batch %}
     <section class="card">
@@ -274,11 +364,56 @@
 
   <script>
     const modelTextarea = document.querySelector('textarea[name="model_names"]');
+    const uploadInput = document.getElementById("upload-files");
+    const uploadFileSummary = document.getElementById("upload-file-summary");
+    const uploadFileDetail = document.getElementById("upload-file-detail");
     document.querySelectorAll(".preset-button").forEach((button) => {
       button.addEventListener("click", () => {
         if (modelTextarea) {
           modelTextarea.value = button.dataset.models || "";
         }
+      });
+    });
+
+    function updateUploadSummary() {
+      if (!uploadInput || !uploadFileSummary || !uploadFileDetail) return;
+      const files = Array.from(uploadInput.files || []);
+      if (files.length === 0) {
+        uploadFileSummary.textContent = "支持 CSV / XLSX 批量上传";
+        uploadFileDetail.textContent = "点击这里选择文件，或一次选中多个表格一起导入。";
+        return;
+      }
+
+      if (files.length === 1) {
+        uploadFileSummary.textContent = files[0].name;
+      } else {
+        uploadFileSummary.textContent = `已选择 ${files.length} 个文件`;
+      }
+      uploadFileDetail.textContent = files.slice(0, 3).map((file) => file.name).join(" · ");
+    }
+
+    if (uploadInput) {
+      uploadInput.addEventListener("change", updateUploadSummary);
+      updateUploadSummary();
+    }
+
+    async function postAccountAction(accountId, action) {
+      const response = await fetch(`/accounts/${accountId}/${action}`, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        alert(payload.detail || "操作失败");
+        return;
+      }
+      if (payload.message) {
+        alert(payload.message);
+      }
+      window.location.reload();
+    }
+
+    document.querySelectorAll(".account-action-button").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (button.classList.contains("is-disabled")) return;
+        postAccountAction(button.dataset.accountId, button.dataset.action);
       });
     });
   </script>

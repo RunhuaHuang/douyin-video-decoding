@@ -16,6 +16,9 @@ from .config import (
     ANTI_CRAWL_COOLDOWN_SECONDS,
     ANTI_CRAWL_STREAK_THRESHOLD,
     ATTEMPTS_COLUMN,
+    COOKIE_SWITCH_BATCH_THRESHOLD,
+    COOKIE_STRONG_SIGNAL_SWITCH_THRESHOLD,
+    COOKIE_RETRY_STRONG_SIGNAL_SWITCH_THRESHOLD,
     DEFAULT_BATCH_DELAY_SECONDS,
     DEFAULT_MODEL,
     DELETED_TRANSCRIPT_TEXT,
@@ -30,6 +33,7 @@ from .config import (
     ROW_RETRY_DELAY_SECONDS,
     STATUS_COLUMN,
 )
+from .cookie_accounts import CookieAccount, CookieAccountManager
 from .csv_service import (
     build_processed_output_name,
     ensure_text_column,
@@ -37,6 +41,7 @@ from .csv_service import (
     stringify_cell,
     write_csv,
 )
+from .browser_service import PlaywrightFallback
 from .douyin_service import DouyinService, DownloadResult, ParsedVideo
 from .job_manager import JobManager
 from .media_service import FfmpegService
@@ -104,6 +109,7 @@ class PreparedRow:
     browser_audio_path: Path
     audio_path: Path
     log_messages: Tuple[str, ...] = ()
+    anti_crawl_signal_descriptions: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -137,6 +143,10 @@ class RunControlState:
     pending_cooldown: Optional[CooldownRequest] = None
     healthy_batch_streak: int = 0
     current_batch_had_issue: bool = False
+    current_batch_strong_issue: bool = False
+    current_batch_strong_signal_descriptions: List[str] = field(default_factory=list)
+    strong_signal_batch_streak: int = 0
+    strong_signal_phase: str = ""
 
 
 class RowProcessingError(RuntimeError):
@@ -163,6 +173,10 @@ class JobProcessor:
         anti_crawl_cooldown_seconds: int = ANTI_CRAWL_COOLDOWN_SECONDS,
         proactive_cooldown_batch_threshold: int = PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
         proactive_cooldown_seconds: int = PROACTIVE_COOLDOWN_SECONDS,
+        cookie_account_manager: Optional[CookieAccountManager] = None,
+        cookie_switch_batch_threshold: int = COOKIE_SWITCH_BATCH_THRESHOLD,
+        cookie_strong_signal_switch_threshold: int = COOKIE_STRONG_SIGNAL_SWITCH_THRESHOLD,
+        cookie_retry_strong_signal_switch_threshold: int = COOKIE_RETRY_STRONG_SIGNAL_SWITCH_THRESHOLD,
     ) -> None:
         self.manager = manager
         self.douyin_service_factory = douyin_service_factory
@@ -177,6 +191,10 @@ class JobProcessor:
         self.anti_crawl_cooldown_seconds = max(0, int(anti_crawl_cooldown_seconds))
         self.proactive_cooldown_batch_threshold = max(1, int(proactive_cooldown_batch_threshold))
         self.proactive_cooldown_seconds = max(0, int(proactive_cooldown_seconds))
+        self.cookie_account_manager = cookie_account_manager
+        self.cookie_switch_batch_threshold = max(1, int(cookie_switch_batch_threshold))
+        self.cookie_strong_signal_switch_threshold = max(1, int(cookie_strong_signal_switch_threshold))
+        self.cookie_retry_strong_signal_switch_threshold = max(1, int(cookie_retry_strong_signal_switch_threshold))
         self._asr_local = threading.local()
         self._douyin_local = threading.local()
         self._douyin_services_by_job: Dict[str, List[DouyinService]] = {}
@@ -199,14 +217,12 @@ class JobProcessor:
             ),
         )
 
-        douyin = None
         transcriber = None
 
         try:
             ffmpeg = self.ffmpeg_service_factory()
             default_model = job.model_names[0] if job.model_names else DEFAULT_MODEL
             transcriber = self.transcription_service_factory(default_model=default_model)
-            douyin = self._create_douyin_service()
             download_workers = self._sanitize_worker_count(job.download_workers)
             asr_workers = self._sanitize_worker_count(job.asr_workers)
             batch_delay_seconds = self._sanitize_batch_delay(getattr(job, "batch_delay_seconds", self.batch_delay_seconds))
@@ -280,7 +296,6 @@ class JobProcessor:
                     output_columns=output_columns,
                     overwrite=job.overwrite,
                     workspace=workspace,
-                    douyin=douyin,
                     ffmpeg=ffmpeg,
                     transcriber=transcriber,
                     output_path=output_path,
@@ -303,7 +318,6 @@ class JobProcessor:
                         output_columns=output_columns,
                         overwrite=job.overwrite,
                         workspace=workspace,
-                        douyin=douyin,
                         ffmpeg=ffmpeg,
                         transcriber=transcriber,
                         output_path=output_path,
@@ -335,8 +349,6 @@ class JobProcessor:
             self.manager.append_log(job_id, f"任务终止：{exc}")
             self.manager.mark_failed(job_id, str(exc))
         finally:
-            if douyin is not None:
-                douyin.close()
             self._close_job_douyin_services(job_id)
             shutil.rmtree(workspace, ignore_errors=True)
 
@@ -350,7 +362,6 @@ class JobProcessor:
         output_columns: Dict[str, str],
         overwrite: bool,
         workspace: Path,
-        douyin: DouyinService,
         ffmpeg: FfmpegService,
         transcriber: TranscriptionService,
         output_path: Path,
@@ -367,6 +378,8 @@ class JobProcessor:
         for batch_index, batch in enumerate(self._iter_batches(tasks), start=1):
             if self.manager.is_pause_requested(job_id):
                 break
+
+            self._prepare_cookie_account_for_batch(job_id)
 
             if total_batches > 1:
                 self.manager.append_log(
@@ -404,7 +417,6 @@ class JobProcessor:
                         output_columns=output_columns,
                         overwrite=overwrite,
                         workspace=workspace,
-                        douyin=douyin,
                         ffmpeg=ffmpeg,
                         transcriber=transcriber,
                         output_path=output_path,
@@ -417,8 +429,16 @@ class JobProcessor:
                 dataframe=dataframe,
                 output_columns=output_columns,
                 output_path=output_path,
-                retry_queue=retry_queue,
-                allow_proactive_cooldown=batch_index < total_batches or bool(retry_queue),
+                    retry_queue=retry_queue,
+                    allow_proactive_cooldown=batch_index < total_batches or bool(retry_queue),
+                )
+
+            self._finalize_cookie_rotation(
+                job_id=job_id,
+                run_state=run_state,
+                phase=phase,
+                batch_index=batch_index,
+                total_batches=total_batches,
             )
 
             if batch_index < total_batches and not self.manager.is_pause_requested(job_id) and not cooled_down:
@@ -438,7 +458,6 @@ class JobProcessor:
         output_columns: Dict[str, str],
         overwrite: bool,
         workspace: Path,
-        douyin: DouyinService,
         ffmpeg: FfmpegService,
         transcriber: TranscriptionService,
         output_path: Path,
@@ -452,7 +471,8 @@ class JobProcessor:
         pending = self._dedupe_tasks(retry_queue)
         round_index = 1
 
-        while pending and not self.manager.is_pause_requested(job_id):
+        while pending and not self.manager.is_pause_requested(job_id) and round_index <= self.max_retries:
+            self._switch_cookie_for_retry_round(job_id, round_index)
             self.manager.append_log(job_id, f"开始第 {round_index} 轮重试，共 {len(pending)} 行")
             next_round: List[RowTask] = []
             total_batches = self._batch_count(len(pending))
@@ -460,6 +480,8 @@ class JobProcessor:
             for batch_index, batch in enumerate(self._iter_batches(pending), start=1):
                 if self.manager.is_pause_requested(job_id):
                     break
+
+                self._prepare_cookie_account_for_batch(job_id)
 
                 if total_batches > 1:
                     self.manager.append_log(
@@ -497,7 +519,6 @@ class JobProcessor:
                             output_columns=output_columns,
                             overwrite=overwrite,
                             workspace=workspace,
-                            douyin=douyin,
                             ffmpeg=ffmpeg,
                             transcriber=transcriber,
                             output_path=output_path,
@@ -514,6 +535,14 @@ class JobProcessor:
                     allow_proactive_cooldown=batch_index < total_batches or bool(next_round),
                 )
 
+                self._finalize_cookie_rotation(
+                    job_id=job_id,
+                    run_state=run_state,
+                    phase="重试",
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                )
+
                 if batch_index < total_batches and not self.manager.is_pause_requested(job_id) and not cooled_down:
                     self.manager.append_log(
                         job_id,
@@ -522,13 +551,39 @@ class JobProcessor:
                     self.sleep_fn(batch_delay_seconds)
 
             pending = self._dedupe_tasks(next_round)
-            if pending and not self.manager.is_pause_requested(job_id):
+            if pending and not self.manager.is_pause_requested(job_id) and round_index < self.max_retries:
                 self.manager.append_log(
                     job_id,
                     f"第 {round_index} 轮重试结束，剩余 {len(pending)} 行，{self.retry_delay_seconds} 秒后继续",
                 )
                 self.sleep_fn(self.retry_delay_seconds)
                 round_index += 1
+            else:
+                round_index += 1
+
+        if pending and not self.manager.is_pause_requested(job_id):
+            self.manager.append_log(
+                job_id,
+                f"重试已达到上限 {self.max_retries} 轮，剩余 {len(pending)} 行将标记为已删除",
+            )
+            for task in pending:
+                attempts = self._get_attempts(dataframe, task.row_index)
+                for column_name in output_columns.values():
+                    if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
+                        dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
+                self._set_row_meta(
+                    dataframe,
+                    task.row_index,
+                    status="已删除",
+                    error_message="",
+                    attempts=attempts,
+                )
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行重试 3 轮后仍未成功，已标记为已删除",
+                )
+            self._persist_snapshot(job_id, dataframe, output_path)
+            self._sync_progress(job_id, dataframe)
 
     def _process_batch_parallel(
         self,
@@ -680,7 +735,7 @@ class JobProcessor:
             ]
 
             if video.is_deleted:
-                self._consume_attempt_challenge_signal_descriptions(douyin)
+                strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
                 log_messages.append(
                     f"第 {plan.task.csv_row_number} 行已删除，已写入“{DELETED_TRANSCRIPT_TEXT}”"
                 )
@@ -689,6 +744,8 @@ class JobProcessor:
                     outcome=RowOutcome(
                         status="已删除",
                         attempts=plan.attempt_number,
+                        anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                        anti_crawl_signal_descriptions=strong_signal_descriptions,
                     ),
                     transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
                     log_messages=tuple(log_messages),
@@ -701,8 +758,8 @@ class JobProcessor:
             )
             if download_result.audio_source_url:
                 log_messages.append(f"第 {plan.task.csv_row_number} 行已捕获补充音频流")
+            strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
 
-            self._consume_attempt_challenge_signal_descriptions(douyin)
             return PreparedRow(
                 plan=plan,
                 row_dir=row_dir,
@@ -710,6 +767,7 @@ class JobProcessor:
                 browser_audio_path=browser_audio_path,
                 audio_path=audio_path,
                 log_messages=tuple(log_messages),
+                anti_crawl_signal_descriptions=strong_signal_descriptions,
             )
         except RowProcessingError as exc:
             if self._is_non_video_parse_error(exc):
@@ -766,6 +824,22 @@ class JobProcessor:
             retryable = self._is_retryable(exc, plan.attempt_number)
             weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+            if self._should_mark_deleted_after_retry_ceiling(exc, plan.attempt_number):
+                return RowExecutionResult(
+                    plan=plan,
+                    outcome=RowOutcome(
+                        status="已删除",
+                        attempts=plan.attempt_number,
+                        anti_crawl_suspected=bool(weak_signal_descriptions),
+                        anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                        anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
+                    ),
+                    transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
+                    log_messages=(
+                        f"第 {plan.task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                    ),
+                    cleanup_dir=row_dir,
+                )
             status = RETRY_PENDING_STATUS if retryable else "失败"
             return RowExecutionResult(
                 plan=plan,
@@ -808,7 +882,12 @@ class JobProcessor:
             if not model_failures:
                 return RowExecutionResult(
                     plan=prepared.plan,
-                    outcome=RowOutcome(status="成功", attempts=prepared.plan.attempt_number),
+                    outcome=RowOutcome(
+                        status="成功",
+                        attempts=prepared.plan.attempt_number,
+                        anti_crawl_strong_suspected=bool(prepared.anti_crawl_signal_descriptions),
+                        anti_crawl_signal_descriptions=prepared.anti_crawl_signal_descriptions,
+                    ),
                     transcripts=transcripts,
                     log_messages=tuple(log_messages),
                     cleanup_dir=prepared.row_dir,
@@ -821,6 +900,8 @@ class JobProcessor:
                     status=status,
                     attempts=prepared.plan.attempt_number,
                     error_message=" | ".join(model_failures),
+                    anti_crawl_strong_suspected=bool(prepared.anti_crawl_signal_descriptions),
+                    anti_crawl_signal_descriptions=prepared.anti_crawl_signal_descriptions,
                 ),
                 transcripts=transcripts,
                 log_messages=tuple(log_messages),
@@ -833,6 +914,8 @@ class JobProcessor:
                     status="失败",
                     attempts=prepared.plan.attempt_number,
                     error_message=str(exc),
+                    anti_crawl_strong_suspected=bool(prepared.anti_crawl_signal_descriptions),
+                    anti_crawl_signal_descriptions=prepared.anti_crawl_signal_descriptions,
                 ),
                 log_messages=(),
                 cleanup_dir=prepared.row_dir,
@@ -928,23 +1011,270 @@ class JobProcessor:
             self._asr_local.service = service
         return service
 
+    def _prepare_cookie_account_for_batch(self, job_id: str) -> Optional[CookieAccount]:
+        if self.cookie_account_manager is None:
+            return None
+
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        current_account_id = str(runtime.get("current_cookie_account_id") or "").strip()
+        current_account = self.cookie_account_manager.get_account(current_account_id) if current_account_id else None
+
+        if current_account is not None and (current_account.invalid or not current_account.has_usable_state):
+            if not current_account.has_usable_state:
+                invalid_reason = "cookies 文件缺失或为空会话"
+                self.cookie_account_manager.mark_invalid(current_account.account_id, invalid_reason)
+                self.manager.append_log(
+                    job_id,
+                    f"cookies `{current_account.label}` 不可用，已从账号池剔除：{invalid_reason}",
+                )
+            current_account = self._switch_cookie_account(
+                job_id,
+                reason="当前 cookies 不可用，已自动切换",
+                prefer_next=True,
+                required=True,
+            )
+
+        if runtime.get("cookie_switch_requested"):
+            switched = self._switch_cookie_account(
+                job_id,
+                reason="用户手动切换 cookies",
+                prefer_next=True,
+                required=False,
+            )
+            if switched is None:
+                self._set_cookie_runtime(job_id, cookie_switch_requested=False)
+                self.manager.append_log(job_id, "当前只有 1 份可用 cookies，无法切换")
+            current_account = switched
+
+        if current_account is None:
+            current_account = self.cookie_account_manager.select_current_or_first_available_account(
+                current_account_id=current_account_id
+            )
+            if current_account is None:
+                raise RuntimeError('没有可用的 cookies。请先运行 `./login "备注"` 添加账号，或恢复/重新登录已剔除账号。')
+            self._apply_cookie_account(job_id, current_account, reason="已装载 cookies 账号")
+
+        return current_account
+
+    def _switch_cookie_for_retry_round(self, job_id: str, round_index: int) -> None:
+        if self.cookie_account_manager is None:
+            return
+
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        current_account_id = str(runtime.get("current_cookie_account_id") or "").strip()
+        if not current_account_id:
+            self._prepare_cookie_account_for_batch(job_id)
+            current_account_id = str(
+                self.manager.get_effective_cookie_runtime(job_id).get("current_cookie_account_id") or ""
+            ).strip()
+
+        switched = self._switch_cookie_account(
+            job_id,
+            reason=f"开始第 {round_index} 轮重试，切换 cookies",
+            prefer_next=True,
+            required=False,
+        )
+        if switched is None:
+            self.manager.append_log(job_id, f"第 {round_index} 轮重试开始前没有其他 cookies 可切换，继续使用当前账号")
+
+    def _finalize_cookie_rotation(
+        self,
+        *,
+        job_id: str,
+        run_state: RunControlState,
+        phase: str,
+        batch_index: int,
+        total_batches: int,
+    ) -> None:
+        if self.cookie_account_manager is None:
+            self._reset_current_batch_cookie_flags(run_state)
+            return
+
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        current_account_id = str(runtime.get("current_cookie_account_id") or "").strip()
+        current_account = self.cookie_account_manager.get_account(current_account_id) if current_account_id else None
+        phase_key = "retry" if phase.startswith("重试") else "normal"
+        strong_signal_threshold = (
+            self.cookie_retry_strong_signal_switch_threshold
+            if phase_key == "retry"
+            else self.cookie_strong_signal_switch_threshold
+        )
+        if current_account is not None:
+            self.cookie_account_manager.mark_used(current_account.account_id)
+
+        total_batches_processed = int(runtime.get("cookie_total_batches_processed") or 0) + 1
+        batches_since_switch = int(runtime.get("cookie_batches_since_switch") or 0) + 1
+        self._set_cookie_runtime(
+            job_id,
+            cookie_total_batches_processed=total_batches_processed,
+            cookie_batches_since_switch=batches_since_switch,
+        )
+
+        switch_reason = ""
+        if run_state.current_batch_strong_issue:
+            if run_state.strong_signal_phase != phase_key:
+                run_state.strong_signal_phase = phase_key
+                run_state.strong_signal_batch_streak = 0
+            run_state.strong_signal_batch_streak += 1
+        else:
+            run_state.strong_signal_phase = phase_key
+            run_state.strong_signal_batch_streak = 0
+
+        if current_account is not None and run_state.current_batch_strong_issue:
+            signal_text = "；".join(run_state.current_batch_strong_signal_descriptions[:3]) or "403/429/验证码"
+            if run_state.strong_signal_batch_streak >= strong_signal_threshold:
+                updated_account = self.cookie_account_manager.note_issue(current_account.account_id, signal_text)
+                challenge_strikes = updated_account.challenge_strikes if updated_account is not None else 0
+                if challenge_strikes >= self.cookie_account_manager.invalidation_strike_threshold:
+                    warning_reason = (
+                        f"连续 {challenge_strikes} 次达到强信号预警阈值：{signal_text}"
+                    )
+                    warned_account = self.cookie_account_manager.mark_warning(
+                        current_account.account_id,
+                        warning_reason,
+                    )
+                    if warned_account is not None:
+                        self.manager.append_log(
+                            job_id,
+                            f"cookies `{warned_account.label}` 已进入预警状态：{warning_reason}",
+                        )
+                else:
+                    self.manager.append_log(
+                        job_id,
+                        f"cookies `{current_account.label}` 已累计 {challenge_strikes} 次强信号 strike，继续使用当前账号",
+                    )
+                run_state.strong_signal_batch_streak = 0
+        elif current_account is not None:
+            self.cookie_account_manager.mark_success(current_account.account_id)
+
+        if not switch_reason and runtime.get("cookie_switch_requested"):
+            switch_reason = "用户手动切换 cookies"
+
+        if not switch_reason and batches_since_switch >= self.cookie_switch_batch_threshold:
+            switch_reason = f"已连续处理 {batches_since_switch} 批，自动切换 cookies"
+
+        if switch_reason:
+            switched = self._switch_cookie_account(
+                job_id,
+                reason=switch_reason,
+                prefer_next=True,
+                required=False,
+            )
+            if switched is None and runtime.get("cookie_switch_requested"):
+                self._set_cookie_runtime(job_id, cookie_switch_requested=False, cookie_batches_since_switch=0)
+                self.manager.append_log(job_id, "当前只有 1 份可用 cookies，继续使用当前账号")
+            elif switched is None and batches_since_switch >= self.cookie_switch_batch_threshold:
+                self._set_cookie_runtime(job_id, cookie_batches_since_switch=0)
+                self.manager.append_log(job_id, "账号池中没有可切换的其他 cookies，已继续使用当前账号")
+
+        self._reset_current_batch_cookie_flags(run_state)
+
+    def _reset_current_batch_cookie_flags(self, run_state: RunControlState) -> None:
+        run_state.current_batch_strong_issue = False
+        run_state.current_batch_strong_signal_descriptions.clear()
+
+    def _set_cookie_runtime(self, job_id: str, **fields) -> None:
+        job = self.manager.require(job_id)
+        if job.batch_id:
+            self.manager.update_batch_cookie_runtime(job.batch_id, **fields)
+        else:
+            self.manager.update_job_cookie_runtime(job_id, **fields)
+
+    def _apply_cookie_account(self, job_id: str, account: CookieAccount, *, reason: str) -> CookieAccount:
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        generation = int(runtime.get("cookie_service_generation") or 0) + 1
+        self._set_cookie_runtime(
+            job_id,
+            current_cookie_account_id=account.account_id,
+            current_cookie_label=account.label,
+            cookie_batches_since_switch=0,
+            cookie_switch_requested=False,
+            cookie_last_switch_reason=reason,
+            cookie_service_generation=generation,
+        )
+        self._close_job_douyin_services(job_id)
+        self.manager.append_log(job_id, f"当前 cookies 已切换到 `{account.label}`：{reason}")
+        return account
+
+    def _switch_cookie_account(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        prefer_next: bool,
+        required: bool,
+    ) -> Optional[CookieAccount]:
+        if self.cookie_account_manager is None:
+            return None
+
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        current_account_id = str(runtime.get("current_cookie_account_id") or "").strip()
+        account = (
+            self.cookie_account_manager.select_next_available_account(
+                current_account_id=current_account_id,
+                allow_same=not prefer_next,
+            )
+            if prefer_next
+            else self.cookie_account_manager.select_current_or_first_available_account(
+                current_account_id=current_account_id
+            )
+        )
+        if account is None:
+            if required:
+                raise RuntimeError('当前 cookies 已不可用，且账号池中没有其他可用 cookies。请运行 `./login "备注"` 重新登录。')
+            return None
+        return self._apply_cookie_account(job_id, account, reason=reason)
+
     def _get_thread_douyin_service(self, job_id: str) -> DouyinService:
         service = getattr(self._douyin_local, "service", None)
         service_job_id = getattr(self._douyin_local, "job_id", None)
-        if service is None or service_job_id != job_id:
+        runtime = self.manager.get_effective_cookie_runtime(job_id)
+        desired_generation = int(runtime.get("cookie_service_generation") or 0)
+        desired_account_id = str(runtime.get("current_cookie_account_id") or "").strip()
+        service_generation = getattr(self._douyin_local, "cookie_generation", None)
+        service_account_id = getattr(self._douyin_local, "cookie_account_id", "")
+        if (
+            service is None
+            or service_job_id != job_id
+            or service_generation != desired_generation
+            or service_account_id != desired_account_id
+        ):
             if service is not None:
                 try:
                     service.close()
                 except Exception:
                     pass
-            service = self._create_douyin_service()
+            account = None
+            if self.cookie_account_manager is not None and desired_account_id:
+                account = self.cookie_account_manager.get_account(desired_account_id)
+            service = self._create_douyin_service(account=account)
             self._douyin_local.service = service
             self._douyin_local.job_id = job_id
+            self._douyin_local.cookie_generation = desired_generation
+            self._douyin_local.cookie_account_id = desired_account_id
             self._register_douyin_service(job_id, service)
         return service
 
-    def _create_douyin_service(self):
-        return self.douyin_service_factory()
+    def _create_douyin_service(self, *, account: Optional[CookieAccount] = None):
+        service = self.douyin_service_factory()
+        if account is not None and hasattr(service, "request_coordinator"):
+            existing_resolver = getattr(service, "browser_resolver", None)
+            if existing_resolver is not None:
+                try:
+                    existing_resolver.close()
+                except Exception:
+                    pass
+            try:
+                service.browser_resolver = PlaywrightFallback(
+                    storage_state_path=account.storage_state_path,
+                    request_coordinator=getattr(service, "request_coordinator", None),
+                )
+            except Exception:
+                pass
+
+        setattr(service, "cookie_account_id", account.account_id if account is not None else "")
+        setattr(service, "cookie_account_label", account.label if account is not None else "")
+        return service
 
     def _register_douyin_service(self, job_id: str, service: DouyinService) -> None:
         with self._douyin_services_lock:
@@ -959,6 +1289,11 @@ class JobProcessor:
                 service.close()
             except Exception:
                 pass
+        if getattr(self._douyin_local, "job_id", None) == job_id:
+            self._douyin_local.service = None
+            self._douyin_local.job_id = None
+            self._douyin_local.cookie_generation = None
+            self._douyin_local.cookie_account_id = ""
 
     def _record_row_control_signal(
         self,
@@ -967,6 +1302,11 @@ class JobProcessor:
         task: RowTask,
         outcome: RowOutcome,
     ) -> None:
+        if outcome.anti_crawl_strong_suspected:
+            run_state.current_batch_strong_issue = True
+            for description in outcome.anti_crawl_signal_descriptions:
+                self._append_unique_text(run_state.current_batch_strong_signal_descriptions, description)
+
         if outcome.status == "已删除":
             return
 
@@ -1319,7 +1659,6 @@ class JobProcessor:
         output_columns: Dict[str, str],
         overwrite: bool,
         workspace: Path,
-        douyin: DouyinService,
         ffmpeg: FfmpegService,
         transcriber: TranscriptionService,
         output_path: Path,
@@ -1339,7 +1678,6 @@ class JobProcessor:
             output_columns=output_columns,
             overwrite=overwrite,
             workspace=workspace,
-            douyin=douyin,
             ffmpeg=ffmpeg,
             transcriber=transcriber,
         )
@@ -1382,10 +1720,10 @@ class JobProcessor:
         output_columns: Dict[str, str],
         overwrite: bool,
         workspace: Path,
-        douyin: DouyinService,
         ffmpeg: FfmpegService,
         transcriber: TranscriptionService,
     ) -> RowOutcome:
+        douyin = self._get_thread_douyin_service(job_id)
         current_attempts = self._get_attempts(dataframe, task.row_index)
         pending_models = self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite)
 
@@ -1413,7 +1751,7 @@ class JobProcessor:
             )
 
             if video.is_deleted:
-                self._consume_attempt_challenge_signal_descriptions(douyin)
+                strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
                 for column_name in output_columns.values():
                     if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
                         dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
@@ -1424,6 +1762,8 @@ class JobProcessor:
                 return RowOutcome(
                     status="已删除",
                     attempts=attempt_number,
+                    anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                    anti_crawl_signal_descriptions=strong_signal_descriptions,
                 )
 
             download_result = self._download_video(douyin, video, video_path, browser_audio_path)
@@ -1447,17 +1787,23 @@ class JobProcessor:
                 pending_models=pending_models,
                 transcriber=transcriber,
             )
+            strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
             if not model_failures:
-                self._consume_attempt_challenge_signal_descriptions(douyin)
-                return RowOutcome(status="成功", attempts=attempt_number)
+                return RowOutcome(
+                    status="成功",
+                    attempts=attempt_number,
+                    anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                    anti_crawl_signal_descriptions=strong_signal_descriptions,
+                )
 
             remaining_models = self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite)
             status = "部分成功" if remaining_models and len(remaining_models) < len(output_columns) else "失败"
-            self._consume_attempt_challenge_signal_descriptions(douyin)
             return RowOutcome(
                 status=status,
                 attempts=attempt_number,
                 error_message=" | ".join(model_failures),
+                anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                anti_crawl_signal_descriptions=strong_signal_descriptions,
             )
         except RowProcessingError as exc:
             if self._is_non_video_parse_error(exc):
@@ -1504,6 +1850,21 @@ class JobProcessor:
             retryable = self._is_retryable(exc, attempt_number)
             weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+            if self._should_mark_deleted_after_retry_ceiling(exc, attempt_number):
+                for column_name in output_columns.values():
+                    if overwrite or not stringify_cell(dataframe.at[task.row_index, column_name]).strip():
+                        dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                )
+                return RowOutcome(
+                    status="已删除",
+                    attempts=attempt_number,
+                    anti_crawl_suspected=bool(weak_signal_descriptions),
+                    anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                    anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
+                )
             status = RETRY_PENDING_STATUS if retryable else "失败"
             return RowOutcome(
                 status=status,
@@ -1794,6 +2155,10 @@ class JobProcessor:
         if self._should_mark_deleted_from_invalid_link(exc, attempt_number):
             return "连续未识别到有效抖音链接"
         return ""
+
+    @staticmethod
+    def _should_mark_deleted_after_retry_ceiling(exc: RowProcessingError, attempt_number: int) -> bool:
+        return exc.stage in {"解析", "下载", "抽音频"} and attempt_number > 3
 
     @staticmethod
     def _dedupe_tasks(tasks: Sequence[RowTask]) -> List[RowTask]:

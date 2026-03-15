@@ -291,8 +291,9 @@ def test_parse_share_text_keeps_retryable_when_interfaces_fail_and_browser_only_
             return BrowserCapture(
                 page_url="https://www.douyin.com/video/7337254060967447834",
                 title="在抖音记录美好生活20260309 - 抖音",
-                video_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
+                video_urls=(),
                 audio_urls=(),
+                preview_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
             )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -439,7 +440,7 @@ def test_detail_api_keeps_real_browser_cookie_instead_of_temporary():
     assert all("temporary" not in header for header in seen_detail_cookie_headers)
 
 
-def test_browser_video_url_priority_puts_preview_last():
+def test_browser_video_url_priority_filters_preview_urls():
     from app.browser_service import PlaywrightFallback
 
     urls = [
@@ -451,7 +452,7 @@ def test_browser_video_url_priority_puts_preview_last():
     prioritized = PlaywrightFallback._prioritize_video_urls(urls)
 
     assert "douyinvod.com" in prioritized[0]
-    assert prioritized[-1].endswith("uuu_265.mp4")
+    assert all("uuu_265.mp4" not in url for url in prioritized)
 
 
 def test_parse_with_browser_raises_for_preview_only_result():
@@ -460,8 +461,9 @@ def test_parse_with_browser_raises_for_preview_only_result():
             return BrowserCapture(
                 page_url=share_url,
                 title="在抖音记录美好生活20260309 - 抖音",
-                video_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
+                video_urls=(),
                 audio_urls=(),
+                preview_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
             )
 
     service = DouyinService(browser_resolver=PreviewOnlyResolver(), browser_fallback_enabled=True)
@@ -531,7 +533,7 @@ def test_resolve_browser_preview_result_keeps_retryable_when_initial_page_is_cha
         video_id="7336856430550601010",
         title="在抖音记录美好生活20260309 - 抖音",
         author="tester",
-        download_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
+        download_urls=(),
         share_url="https://www.douyin.com/video/7336856430550601010",
         page_url="https://www.douyin.com/video/7336856430550601010",
         resolved_by="浏览器兜底",
@@ -549,7 +551,7 @@ def test_resolve_browser_preview_result_keeps_retryable_when_not_challenge():
         video_id="7337254060967447834",
         title="在抖音记录美好生活20260309 - 抖音",
         author="tester",
-        download_urls=("https://lf-douyin-pc-web.douyinstatic.com/obj/douyin-pc-web/uuu_265.mp4",),
+        download_urls=(),
         share_url="https://www.douyin.com/video/7337254060967447834",
         page_url="https://www.douyin.com/video/7337254060967447834",
         resolved_by="浏览器兜底",

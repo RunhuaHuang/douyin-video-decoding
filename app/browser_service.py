@@ -38,6 +38,7 @@ class BrowserCapture:
     title: str
     video_urls: Tuple[str, ...]
     audio_urls: Tuple[str, ...] = ()
+    preview_urls: Tuple[str, ...] = ()
     author: str = "未知作者"
 
     @property
@@ -88,6 +89,7 @@ class PlaywrightFallback:
         page = self._ensure_context().new_page()
         video_urls: List[str] = []
         audio_urls: List[str] = []
+        preview_urls: List[str] = []
         seen_urls = set()
         title = ""
 
@@ -100,6 +102,9 @@ class PlaywrightFallback:
             if self._looks_like_audio(response.url, content_type) and response.url not in seen_urls:
                 seen_urls.add(response.url)
                 audio_urls.append(response.url)
+            elif self._is_preview_video_url(response.url) and response.url not in seen_urls:
+                seen_urls.add(response.url)
+                preview_urls.append(response.url)
             elif self._looks_like_video(response.url, content_type) and response.url not in seen_urls:
                 seen_urls.add(response.url)
                 video_urls.append(response.url)
@@ -135,11 +140,7 @@ class PlaywrightFallback:
                     )
                 except Exception:
                     pass
-                page.wait_for_timeout(self.after_play_wait_ms)
-                src = str(video_locator.evaluate("(node) => node.currentSrc || node.src || ''")).strip()
-                if src and src not in seen_urls:
-                    seen_urls.add(src)
-                    video_urls.insert(0, src)
+                self._wait_for_preferred_video_urls(page, video_locator, video_urls, preview_urls, seen_urls)
             except Exception:
                 pass
 
@@ -167,8 +168,9 @@ class PlaywrightFallback:
             return BrowserCapture(
                 page_url=page.url,
                 title=title or "抖音视频",
-                video_urls=tuple(self._dedupe_urls(video_urls)),
+                video_urls=tuple(self._prioritize_video_urls(video_urls)),
                 audio_urls=tuple(self._dedupe_urls(audio_urls)),
+                preview_urls=tuple(self._dedupe_urls(preview_urls)),
             )
         except Exception as exc:
             self._reset_runtime()
@@ -302,6 +304,19 @@ class PlaywrightFallback:
             or "format=mp4" in lowered_url
             or lowered_url.endswith(".mp4")
         )
+
+    @staticmethod
+    def _is_preview_video_url(url: str) -> bool:
+        lowered = (url or "").lower()
+        return "lf-douyin-pc-web.douyinstatic.com" in lowered and "/uuu_" in lowered
+
+    @staticmethod
+    def _is_preferred_video_url(url: str) -> bool:
+        lowered = (url or "").lower()
+        return (
+            "douyinvod.com" in lowered
+            or "tos-cn-ve" in lowered
+        ) and not PlaywrightFallback._is_preview_video_url(lowered)
 
     @staticmethod
     def _looks_like_audio(url: str, content_type: str) -> bool:
@@ -450,14 +465,12 @@ class PlaywrightFallback:
 
     @classmethod
     def _prioritize_video_urls(cls, urls: Sequence[str]) -> List[str]:
-        deduped = cls._dedupe_urls(urls)
+        deduped = [url for url in cls._dedupe_urls(urls) if cls._is_preferred_video_url(url)]
         return sorted(deduped, key=cls._video_url_priority)
 
     @staticmethod
     def _video_url_priority(url: str) -> tuple[int, int]:
         lowered = (url or "").lower()
-        if "lf-douyin-pc-web.douyinstatic.com" in lowered and "/uuu_" in lowered:
-            return (9, len(lowered))
         if "douyinvod.com" in lowered and "mime_type=video_mp4" in lowered:
             return (0, len(lowered))
         if "douyinvod.com" in lowered or "tos-cn-ve" in lowered:
@@ -467,6 +480,37 @@ class PlaywrightFallback:
         if lowered.endswith(".mp4"):
             return (3, len(lowered))
         return (5, len(lowered))
+
+    def _wait_for_preferred_video_urls(
+        self,
+        page,
+        video_locator,
+        video_urls: List[str],
+        preview_urls: List[str],
+        seen_urls: set[str],
+    ) -> None:
+        deadline = time.monotonic() + max(
+            self.after_play_wait_ms / 1000.0,
+            3.0,
+        )
+        while time.monotonic() < deadline:
+            src = self._read_video_src(video_locator)
+            if src and src not in seen_urls:
+                seen_urls.add(src)
+                if self._is_preview_video_url(src):
+                    preview_urls.append(src)
+                elif self._looks_like_video(src, ""):
+                    video_urls.insert(0, src)
+            if any(self._is_preferred_video_url(url) for url in video_urls):
+                return
+            page.wait_for_timeout(500)
+
+    @staticmethod
+    def _read_video_src(video_locator) -> str:
+        try:
+            return str(video_locator.evaluate("(node) => node.currentSrc || node.src || ''")).strip()
+        except Exception:
+            return ""
 
     @staticmethod
     def _summarize_errors(errors: Sequence[str]) -> List[str]:

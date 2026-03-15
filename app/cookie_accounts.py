@@ -155,14 +155,16 @@ class CookieAccountManager:
             self._write_metadata(account_id, metadata)
             return self._load_account(account_id)
 
-    def list_accounts(self, *, include_legacy: bool = True) -> List[CookieAccount]:
+    def list_accounts(self, *, include_legacy: bool = False) -> List[CookieAccount]:
         self.ensure_directories()
         with self._lock:
             accounts: List[CookieAccount] = []
             for metadata_path in sorted(self.accounts_dir.glob("*.meta.json")):
                 account_id = metadata_path.name[: -len(".meta.json")]
                 state_path = self._state_path(account_id)
-                if account_id == "__legacy_default__" and state_path != self.legacy_storage_state_path:
+                if account_id == "__legacy_default__" and (
+                    not include_legacy or state_path != self.legacy_storage_state_path
+                ):
                     continue
                 accounts.append(self._load_account(account_id))
 

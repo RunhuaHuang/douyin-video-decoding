@@ -58,6 +58,7 @@ TERMINAL_STATUSES = SUCCESS_STATUSES | SKIP_STATUSES
 PREVIEW_ONLY_DELETE_ERROR = "浏览器兜底命中通用页，仅捕获到预览片段"
 INVALID_LINK_DELETE_ATTEMPTS = 2
 INVALID_LINK_ERROR = "未在单元格中找到有效的抖音链接"
+VIDEO_DETAIL_MISSING_ERROR = "分享页中未找到视频详情"
 NON_VIDEO_ERROR = DouyinService.NON_VIDEO_NOTE_ERROR
 DOWNLOAD_FORBIDDEN_ERROR = "HTTP 403 Forbidden x2, 浏览器兜底失败: 浏览器兜底下载失败: HTTP 403 x2"
 DOWNLOAD_UNAVAILABLE_ATTEMPTS = 2
@@ -67,7 +68,15 @@ PREVIEW_ONLY_RETRY_ATTEMPTS = 3
 NO_AUDIO_RETRY_ATTEMPTS = 3
 NO_AUDIO_ERROR = "视频没有音轨"
 WEAK_SIGNAL_DELETED_PAGE = "浏览器兜底删除页标题（在抖音记录美好生活）"
-WEAK_SIGNAL_PARSE_FALLBACK = "分享页/接口异常且浏览器未捕获视频地址"
+ROUTER_DATA_MISSING_ERROR = "分享页中未找到 _ROUTER_DATA"
+ITEMINFO_JSON_ERROR = "iteminfo API: Expecting value: line 1 column 1 (char 0)"
+DETAIL_JSON_ERROR = "detail API: Expecting value: line 1 column 1 (char 0)"
+BROWSER_REAL_VIDEO_ADDRESS_MISSING_ERROR = "浏览器兜底没有捕获到真实视频地址"
+DNS_LOOKUP_ERROR = "nodename nor servname provided, or not known"
+BROWSER_DISCONNECTED_ERROR = "ERR_INTERNET_DISCONNECTED"
+BROWSER_NAV_TIMEOUT_ERROR = "Page.goto: Timeout 15000ms exceeded"
+SSL_CERT_VERIFY_ERROR = "CERTIFICATE_VERIFY_FAILED"
+WEAK_SIGNAL_PARSE_FALLBACK = "分享页/接口异常、浏览器兜底异常或网络异常"
 STRONG_SIGNAL_CHALLENGE_FALLBACK = "challenge/验证码信号"
 
 
@@ -1360,7 +1369,7 @@ class JobProcessor:
     def _should_trigger_anti_crawl_cooldown(outcome: RowOutcome) -> bool:
         # Only weak signals participate in cooldown. Strong signals remain useful
         # for logs, but they are too noisy in real runs to drive the stop logic.
-        return outcome.anti_crawl_suspected and outcome.attempts == 1
+        return outcome.anti_crawl_suspected and outcome.attempts == 3
 
     def _finalize_batch(
         self,
@@ -1590,14 +1599,23 @@ class JobProcessor:
             return False
 
         detail = exc.detail or ""
-        return (
-            "分享页中未找到 _ROUTER_DATA" in detail
-            and (
-                "iteminfo API: Expecting value: line 1 column 1 (char 0)" in detail
-                or "detail API: Expecting value: line 1 column 1 (char 0)" in detail
-            )
-            and "浏览器兜底没有捕获到视频地址" in detail
+        if VIDEO_DETAIL_MISSING_ERROR in detail:
+            return False
+
+        has_router_data_failure = (
+            ROUTER_DATA_MISSING_ERROR in detail
+            and (ITEMINFO_JSON_ERROR in detail or DETAIL_JSON_ERROR in detail)
         )
+        has_network_failure = (
+            DNS_LOOKUP_ERROR in detail
+            and (BROWSER_DISCONNECTED_ERROR in detail or BROWSER_NAV_TIMEOUT_ERROR in detail)
+        ) or (
+            SSL_CERT_VERIFY_ERROR in detail and BROWSER_DISCONNECTED_ERROR in detail
+        ) or (
+            "Connection refused" in detail and BROWSER_REAL_VIDEO_ADDRESS_MISSING_ERROR in detail
+        )
+
+        return has_router_data_failure or has_network_failure
 
     def _weak_signal_descriptions_for_video(self, video: ParsedVideo) -> Tuple[str, ...]:
         if not self._is_suspected_anti_crawl_deleted_video(video):
@@ -2127,6 +2145,10 @@ class JobProcessor:
         return exc.stage == "解析" and INVALID_LINK_ERROR in exc.detail
 
     @staticmethod
+    def _is_video_detail_missing_parse_error(exc: RowProcessingError) -> bool:
+        return exc.stage == "解析" and VIDEO_DETAIL_MISSING_ERROR in exc.detail
+
+    @staticmethod
     def _is_non_video_parse_error(exc: RowProcessingError) -> bool:
         return exc.stage == "解析" and NON_VIDEO_ERROR in exc.detail
 
@@ -2154,6 +2176,8 @@ class JobProcessor:
     def _deleted_reason_for_error(self, exc: RowProcessingError, attempt_number: int) -> str:
         if self._should_mark_deleted_from_invalid_link(exc, attempt_number):
             return "连续未识别到有效抖音链接"
+        if self._is_video_detail_missing_parse_error(exc):
+            return "分享页未找到视频详情"
         return ""
 
     @staticmethod

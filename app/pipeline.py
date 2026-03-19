@@ -1370,7 +1370,7 @@ class JobProcessor:
     def _should_trigger_anti_crawl_cooldown(outcome: RowOutcome) -> bool:
         # Only weak signals participate in cooldown. Strong signals remain useful
         # for logs, but they are too noisy in real runs to drive the stop logic.
-        return outcome.anti_crawl_suspected and outcome.attempts == 3
+        return outcome.anti_crawl_suspected and outcome.attempts <= 2
 
     def _finalize_batch(
         self,

@@ -271,7 +271,7 @@ class RecoverAfterMixedAntiCrawlParseFailureDouyinService(FakeDouyinService):
         attempts = self.attempts_by_url.get(share_text, 0) + 1
         self.attempts_by_url[share_text] = attempts
         if share_text.endswith("/1") or share_text.endswith("/3"):
-            if attempts <= 3:
+            if attempts <= 2:
                 raise RuntimeError(
                     "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
                     "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
@@ -838,7 +838,7 @@ def test_record_row_control_signal_keeps_suspicion_until_explicit_success():
         task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
         outcome=RowOutcome(
             status="失败",
-            attempts=3,
+            attempts=2,
             anti_crawl_suspected=True,
             anti_crawl_signal_descriptions=("弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",),
         ),
@@ -860,7 +860,7 @@ def test_record_row_control_signal_keeps_suspicion_until_explicit_success():
     assert run_state.suspicious_tasks == []
 
 
-def test_record_row_control_signal_ignores_pre_threshold_weak_suspicion():
+def test_record_row_control_signal_ignores_post_threshold_weak_suspicion():
     processor = JobProcessor(JobManager())
     run_state = RunControlState(
         anti_crawl_streak_threshold=1,
@@ -874,7 +874,7 @@ def test_record_row_control_signal_ignores_pre_threshold_weak_suspicion():
         task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
         outcome=RowOutcome(
             status="失败",
-            attempts=2,
+            attempts=3,
             anti_crawl_suspected=True,
             anti_crawl_signal_descriptions=("弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",),
         ),

@@ -1232,24 +1232,28 @@ def test_weak_signal_descriptions_match_real_video_address_failure():
     )
 
 
-def test_weak_signal_descriptions_ignore_preview_only_without_router_data_failure():
+def test_weak_signal_descriptions_match_preview_only_without_router_data_failure():
     processor = JobProcessor(JobManager())
     exc = RowProcessingError(
         "解析",
         "抖音解析失败: 浏览器兜底: 浏览器兜底命中通用页，仅捕获到预览片段",
     )
 
-    assert processor._weak_signal_descriptions_for_error(exc) == ()
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
 
 
-def test_weak_signal_descriptions_ignore_real_video_address_without_router_data_failure():
+def test_weak_signal_descriptions_match_real_video_address_without_router_data_failure():
     processor = JobProcessor(JobManager())
     exc = RowProcessingError(
         "解析",
         "抖音解析失败: 浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
     )
 
-    assert processor._weak_signal_descriptions_for_error(exc) == ()
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
 
 
 def test_weak_signal_descriptions_match_router_data_failure_without_browser_suffix():
@@ -1285,6 +1289,11 @@ def test_weak_signal_descriptions_match_network_failures():
         "短链解析失败: [Errno 61] Connection refused | "
         "浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
     )
+    active_refused_exc = RowProcessingError(
+        "解析",
+        "短链解析失败: No connection could be made because the target machine actively refused it | "
+        "浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
+    )
 
     assert processor._weak_signal_descriptions_for_error(dns_exc) == (
         "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
@@ -1293,6 +1302,9 @@ def test_weak_signal_descriptions_match_network_failures():
         "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
     )
     assert processor._weak_signal_descriptions_for_error(refused_exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+    assert processor._weak_signal_descriptions_for_error(active_refused_exc) == (
         "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
     )
 

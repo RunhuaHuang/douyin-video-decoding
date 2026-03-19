@@ -76,6 +76,7 @@ DNS_LOOKUP_ERROR = "nodename nor servname provided, or not known"
 BROWSER_DISCONNECTED_ERROR = "ERR_INTERNET_DISCONNECTED"
 BROWSER_NAV_TIMEOUT_ERROR = "Page.goto: Timeout 15000ms exceeded"
 SSL_CERT_VERIFY_ERROR = "CERTIFICATE_VERIFY_FAILED"
+ACTIVE_REFUSED_ERROR = "No connection could be made because the target machine actively refused it"
 WEAK_SIGNAL_PARSE_FALLBACK = "分享页/接口异常、浏览器兜底异常或网络异常"
 STRONG_SIGNAL_CHALLENGE_FALLBACK = "challenge/验证码信号"
 
@@ -1606,16 +1607,26 @@ class JobProcessor:
             ROUTER_DATA_MISSING_ERROR in detail
             and (ITEMINFO_JSON_ERROR in detail or DETAIL_JSON_ERROR in detail)
         )
+        has_browser_capture_failure = (
+            PREVIEW_ONLY_DELETE_ERROR in detail
+            or BROWSER_REAL_VIDEO_ADDRESS_MISSING_ERROR in detail
+        )
         has_network_failure = (
             DNS_LOOKUP_ERROR in detail
             and (BROWSER_DISCONNECTED_ERROR in detail or BROWSER_NAV_TIMEOUT_ERROR in detail)
         ) or (
             SSL_CERT_VERIFY_ERROR in detail and BROWSER_DISCONNECTED_ERROR in detail
         ) or (
-            "Connection refused" in detail and BROWSER_REAL_VIDEO_ADDRESS_MISSING_ERROR in detail
+            (
+                "Connection refused" in detail
+                or ACTIVE_REFUSED_ERROR in detail
+            )
+            and (
+                BROWSER_REAL_VIDEO_ADDRESS_MISSING_ERROR in detail or "短链解析失败" in detail
+            )
         )
 
-        return has_router_data_failure or has_network_failure
+        return has_router_data_failure or has_browser_capture_failure or has_network_failure
 
     def _weak_signal_descriptions_for_video(self, video: ParsedVideo) -> Tuple[str, ...]:
         if not self._is_suspected_anti_crawl_deleted_video(video):

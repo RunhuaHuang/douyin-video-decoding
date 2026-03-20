@@ -7,7 +7,7 @@ import pandas as pd
 from app.csv_service import inspect_csv
 from app.cookie_accounts import CookieAccountManager
 from app.job_manager import JobManager
-from app.pipeline import JobProcessor, RowOutcome, RowTask, RunControlState
+from app.pipeline import JobProcessor, RowOutcome, RowProcessingError, RowTask, RunControlState
 from app.transcription_service import TranscriptionService
 
 
@@ -270,16 +270,28 @@ class RecoverAfterMixedAntiCrawlParseFailureDouyinService(FakeDouyinService):
     def parse_share_text(self, share_text: str) -> FakeVideo:
         attempts = self.attempts_by_url.get(share_text, 0) + 1
         self.attempts_by_url[share_text] = attempts
-        if attempts == 1:
-            if share_text.endswith("/1") or share_text.endswith("/3"):
+        if share_text.endswith("/1") or share_text.endswith("/3"):
+            if attempts <= 2:
                 raise RuntimeError(
                     "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
                     "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
                     "detail API: Expecting value: line 1 column 1 (char 0) | "
-                    "浏览器兜底: 浏览器兜底没有捕获到视频地址"
+                    "浏览器兜底: 浏览器兜底没有捕获到真实视频地址"
                 )
+            return super().parse_share_text(share_text)
+        if attempts == 1:
             raise httpx.ReadTimeout("timed out")
         return super().parse_share_text(share_text)
+
+
+class VideoDetailMissingDeletedDouyinService(FakeDouyinService):
+    def parse_share_text(self, share_text: str) -> FakeVideo:
+        raise RuntimeError(
+            "抖音解析失败: 分享页: 分享页中未找到视频详情 | "
+            "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+            "detail API: Expecting value: line 1 column 1 (char 0) | "
+            "浏览器兜底: 浏览器兜底没有捕获到真实视频地址"
+        )
 
 
 class PersistentDeletedAfterCooldownDouyinService(FakeDouyinService):
@@ -826,9 +838,9 @@ def test_record_row_control_signal_keeps_suspicion_until_explicit_success():
         task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
         outcome=RowOutcome(
             status="失败",
-            attempts=1,
+            attempts=2,
             anti_crawl_suspected=True,
-            anti_crawl_signal_descriptions=("弱冷却信号：分享页/接口异常且浏览器未捕获视频地址",),
+            anti_crawl_signal_descriptions=("弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",),
         ),
     )
     assert [task.csv_row_number for task in run_state.suspicious_tasks] == [2]
@@ -846,6 +858,30 @@ def test_record_row_control_signal_keeps_suspicion_until_explicit_success():
         outcome=RowOutcome(status="成功", attempts=1),
     )
     assert run_state.suspicious_tasks == []
+
+
+def test_record_row_control_signal_ignores_post_threshold_weak_suspicion():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1"),
+        outcome=RowOutcome(
+            status="失败",
+            attempts=3,
+            anti_crawl_suspected=True,
+            anti_crawl_signal_descriptions=("弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",),
+        ),
+    )
+
+    assert run_state.suspicious_tasks == []
+    assert run_state.pending_cooldown is None
 
 
 def test_record_row_control_signal_ignores_retry_stage_weak_suspicion():
@@ -869,7 +905,6 @@ def test_record_row_control_signal_ignores_retry_stage_weak_suspicion():
     )
 
     assert run_state.suspicious_tasks == []
-    assert run_state.suspicious_deleted_tasks == []
     assert run_state.pending_cooldown is None
 
 
@@ -895,7 +930,6 @@ def test_record_row_control_signal_ignores_deleted_strong_suspicion():
     )
 
     assert run_state.suspicious_tasks == []
-    assert run_state.suspicious_deleted_tasks == []
     assert run_state.pending_cooldown is None
 
 
@@ -920,7 +954,33 @@ def test_record_row_control_signal_ignores_non_deleted_strong_suspicion():
     )
 
     assert run_state.suspicious_tasks == []
-    assert run_state.suspicious_deleted_tasks == []
+    assert run_state.pending_cooldown is None
+
+
+def test_record_row_control_signal_trusted_delete_resets_anti_crawl_tracking():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+    run_state.suspicious_tasks = [RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1")]
+    run_state.suspicious_signal_descriptions = ["弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常"]
+    run_state.pending_cooldown = object()  # type: ignore[assignment]
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=1, position=2, csv_row_number=3, url_value="u2"),
+        outcome=RowOutcome(
+            status="已删除",
+            attempts=1,
+            resets_anti_crawl_state=True,
+        ),
+    )
+
+    assert run_state.suspicious_tasks == []
+    assert run_state.suspicious_signal_descriptions == []
     assert run_state.pending_cooldown is None
 
 
@@ -1042,6 +1102,64 @@ def test_pipeline_marks_deleted_after_repeated_invalid_link_failures(tmp_path, m
     assert result.loc[0, "视频文本"] == "已删除"
 
 
+def test_pipeline_marks_deleted_when_share_page_video_detail_missing(tmp_path, monkeypatch):
+    csv_path = tmp_path / "video_detail_missing.csv"
+    pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
+        csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+
+    sleeps = []
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="video_detail_missing.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="视频文本",
+        model_names_text="mlx-community/test-model",
+        model_names=["mlx-community/test-model"],
+        overwrite=False,
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=VideoDetailMissingDeletedDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=FakeTranscriptionService,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+        retry_delay_seconds=0,
+        batch_size=1,
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+    assert job.status == "completed"
+    assert sleeps == []
+    assert result.loc[0, "处理状态"] == "已删除"
+    assert result.loc[0, "视频文本"] == "已删除"
+    assert result.loc[0, "尝试次数"] == "1"
+    assert not any("自动冷却" in line for line in job.logs)
+    assert not any("弱冷却信号：" in line for line in job.logs)
+
+
 def test_pipeline_does_not_cool_down_for_retry_stage_suspected_deletes(tmp_path, monkeypatch):
     csv_path = tmp_path / "persistent_deleted.csv"
     pd.DataFrame([{"url": "https://www.douyin.com/video/1"}]).to_csv(
@@ -1106,6 +1224,127 @@ def test_pipeline_does_not_cool_down_for_retry_stage_suspected_deletes(tmp_path,
     assert not any("自动冷却" in line for line in job.logs)
     assert not any("冷却信号：" in line for line in job.logs)
     assert not any("恢复为“待重试”" in line for line in job.logs)
+
+
+def test_weak_signal_descriptions_match_preview_only_router_data_failure():
+    processor = JobProcessor(JobManager())
+    exc = RowProcessingError(
+        "解析",
+        "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
+        "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+        "detail API: Expecting value: line 1 column 1 (char 0) | "
+        "浏览器兜底: 浏览器兜底命中通用页，仅捕获到预览片段",
+    )
+
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+
+
+def test_weak_signal_descriptions_match_real_video_address_failure():
+    processor = JobProcessor(JobManager())
+    exc = RowProcessingError(
+        "解析",
+        "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
+        "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+        "detail API: Expecting value: line 1 column 1 (char 0) | "
+        "浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
+    )
+
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+
+
+def test_weak_signal_descriptions_match_preview_only_without_router_data_failure():
+    processor = JobProcessor(JobManager())
+    exc = RowProcessingError(
+        "解析",
+        "抖音解析失败: 浏览器兜底: 浏览器兜底命中通用页，仅捕获到预览片段",
+    )
+
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+
+
+def test_weak_signal_descriptions_match_real_video_address_without_router_data_failure():
+    processor = JobProcessor(JobManager())
+    exc = RowProcessingError(
+        "解析",
+        "抖音解析失败: 浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
+    )
+
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+
+
+def test_weak_signal_descriptions_match_router_data_failure_without_browser_suffix():
+    processor = JobProcessor(JobManager())
+    exc = RowProcessingError(
+        "解析",
+        "抖音解析失败: 分享页: 分享页中未找到 _ROUTER_DATA | "
+        "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+        "detail API: Expecting value: line 1 column 1 (char 0)",
+    )
+
+    assert processor._weak_signal_descriptions_for_error(exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+
+
+def test_weak_signal_descriptions_match_network_failures():
+    processor = JobProcessor(JobManager())
+
+    dns_exc = RowProcessingError(
+        "解析",
+        "短链解析失败: [Errno 8] nodename nor servname provided, or not known | "
+        "浏览器兜底: Page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.douyin.com/video/1",
+    )
+    ssl_exc = RowProcessingError(
+        "解析",
+        "短链解析失败: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "self-signed certificate (_ssl.c:1028) | "
+        "浏览器兜底: Page.goto: net::ERR_INTERNET_DISCONNECTED at https://www.douyin.com/video/2",
+    )
+    refused_exc = RowProcessingError(
+        "解析",
+        "短链解析失败: [Errno 61] Connection refused | "
+        "浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
+    )
+    active_refused_exc = RowProcessingError(
+        "解析",
+        "短链解析失败: No connection could be made because the target machine actively refused it | "
+        "浏览器兜底: 浏览器兜底没有捕获到真实视频地址",
+    )
+
+    assert processor._weak_signal_descriptions_for_error(dns_exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+    assert processor._weak_signal_descriptions_for_error(ssl_exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+    assert processor._weak_signal_descriptions_for_error(refused_exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+    assert processor._weak_signal_descriptions_for_error(active_refused_exc) == (
+        "弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常",
+    )
+
+
+def test_video_detail_missing_is_deleted_before_anti_crawl_signal():
+    processor = JobProcessor(JobManager())
+    exc = RowProcessingError(
+        "解析",
+        "抖音解析失败: 分享页: 分享页中未找到视频详情 | "
+        "iteminfo API: Expecting value: line 1 column 1 (char 0) | "
+        "detail API: Expecting value: line 1 column 1 (char 0) | "
+        "浏览器兜底: 浏览器兜底命中通用页，仅捕获到预览片段",
+    )
+
+    assert processor._deleted_reason_for_error(exc, 1) == "分享页未找到视频详情"
+    assert processor._weak_signal_descriptions_for_error(exc) == ()
 
 
 def test_pipeline_logs_but_does_not_cool_down_for_challenge_signals(tmp_path, monkeypatch):

@@ -67,7 +67,6 @@ NON_VIDEO_DOWNLOAD_404_ATTEMPTS = 2
 PREVIEW_ONLY_RETRY_ATTEMPTS = 3
 NO_AUDIO_RETRY_ATTEMPTS = 3
 NO_AUDIO_ERROR = "视频没有音轨"
-WEAK_SIGNAL_DELETED_PAGE = "浏览器兜底删除页标题（在抖音记录美好生活）"
 ROUTER_DATA_MISSING_ERROR = "分享页中未找到 _ROUTER_DATA"
 ITEMINFO_JSON_ERROR = "iteminfo API: Expecting value: line 1 column 1 (char 0)"
 DETAIL_JSON_ERROR = "detail API: Expecting value: line 1 column 1 (char 0)"
@@ -95,6 +94,7 @@ class RowOutcome:
     attempts: int
     error_message: str = ""
     retryable: bool = False
+    resets_anti_crawl_state: bool = False
     anti_crawl_suspected: bool = False
     anti_crawl_strong_suspected: bool = False
     anti_crawl_signal_descriptions: Tuple[str, ...] = ()
@@ -137,7 +137,6 @@ class CooldownRequest:
     reason: str
     threshold: int = 0
     affected_tasks: List[RowTask] = field(default_factory=list)
-    restore_deleted_tasks: List[RowTask] = field(default_factory=list)
     signal_descriptions: List[str] = field(default_factory=list)
 
 
@@ -148,7 +147,6 @@ class RunControlState:
     proactive_cooldown_batch_threshold: int
     proactive_cooldown_seconds: int
     suspicious_tasks: List[RowTask] = field(default_factory=list)
-    suspicious_deleted_tasks: List[RowTask] = field(default_factory=list)
     suspicious_signal_descriptions: List[str] = field(default_factory=list)
     pending_cooldown: Optional[CooldownRequest] = None
     healthy_batch_streak: int = 0
@@ -754,6 +752,7 @@ class JobProcessor:
                     outcome=RowOutcome(
                         status="已删除",
                         attempts=plan.attempt_number,
+                        resets_anti_crawl_state=True,
                         anti_crawl_strong_suspected=bool(strong_signal_descriptions),
                         anti_crawl_signal_descriptions=strong_signal_descriptions,
                     ),
@@ -824,7 +823,11 @@ class JobProcessor:
                 self._consume_attempt_challenge_signal_descriptions(douyin)
                 return RowExecutionResult(
                     plan=plan,
-                    outcome=RowOutcome(status="已删除", attempts=plan.attempt_number),
+                    outcome=RowOutcome(
+                        status="已删除",
+                        attempts=plan.attempt_number,
+                        resets_anti_crawl_state=(delete_reason == "分享页未找到视频详情"),
+                    ),
                     transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
                     log_messages=(
                         f"第 {plan.task.csv_row_number} 行{delete_reason}，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
@@ -1317,16 +1320,17 @@ class JobProcessor:
             for description in outcome.anti_crawl_signal_descriptions:
                 self._append_unique_text(run_state.current_batch_strong_signal_descriptions, description)
 
+        if outcome.resets_anti_crawl_state:
+            self._reset_anti_crawl_tracking(run_state)
+            return
+
         if outcome.status == "已删除":
             return
 
         if self._should_trigger_anti_crawl_cooldown(outcome):
             run_state.current_batch_had_issue = True
-            should_restore_deleted = outcome.status == "已删除"
             if run_state.pending_cooldown is not None:
                 self._append_unique_task(run_state.pending_cooldown.affected_tasks, task)
-                if should_restore_deleted:
-                    self._append_unique_task(run_state.pending_cooldown.restore_deleted_tasks, task)
                 for description in outcome.anti_crawl_signal_descriptions:
                     self._append_unique_text(run_state.pending_cooldown.signal_descriptions, description)
                 run_state.pending_cooldown.reason = self._build_anti_crawl_cooldown_reason(
@@ -1338,8 +1342,6 @@ class JobProcessor:
                 return
 
             self._append_unique_task(run_state.suspicious_tasks, task)
-            if should_restore_deleted:
-                self._append_unique_task(run_state.suspicious_deleted_tasks, task)
             for description in outcome.anti_crawl_signal_descriptions:
                 self._append_unique_text(run_state.suspicious_signal_descriptions, description)
             if len(run_state.suspicious_tasks) >= run_state.anti_crawl_streak_threshold:
@@ -1353,15 +1355,12 @@ class JobProcessor:
                     ),
                     threshold=run_state.anti_crawl_streak_threshold,
                     affected_tasks=list(run_state.suspicious_tasks),
-                    restore_deleted_tasks=list(run_state.suspicious_deleted_tasks),
                     signal_descriptions=list(run_state.suspicious_signal_descriptions),
                 )
             return
 
         if outcome.status == "成功" and run_state.pending_cooldown is None:
-            run_state.suspicious_tasks.clear()
-            run_state.suspicious_deleted_tasks.clear()
-            run_state.suspicious_signal_descriptions.clear()
+            self._reset_anti_crawl_tracking(run_state)
 
         if outcome.status in {RETRY_PENDING_STATUS, "失败", "部分成功"}:
             run_state.current_batch_had_issue = True
@@ -1438,53 +1437,20 @@ class JobProcessor:
         if request is None:
             return
 
-        for task in request.restore_deleted_tasks:
-            self._restore_false_deleted_row(
-                job_id=job_id,
-                dataframe=dataframe,
-                row_task=task,
-                output_columns=output_columns,
-                retry_queue=retry_queue,
-            )
-
         self.manager.append_log(job_id, request.reason)
         self._persist_snapshot(job_id, dataframe, output_path)
         self._sleep_with_cooldown_message(job_id, request.seconds, request.reason)
         self._sync_progress(job_id, dataframe, current_message="任务执行中")
 
-        run_state.pending_cooldown = None
-        run_state.suspicious_tasks.clear()
-        run_state.suspicious_deleted_tasks.clear()
-        run_state.suspicious_signal_descriptions.clear()
+        self._reset_anti_crawl_tracking(run_state)
         run_state.current_batch_had_issue = False
         run_state.healthy_batch_streak = 0
 
-    def _restore_false_deleted_row(
-        self,
-        *,
-        job_id: str,
-        dataframe,
-        row_task: RowTask,
-        output_columns: Dict[str, str],
-        retry_queue: List[RowTask],
-    ) -> None:
-        for column_name in output_columns.values():
-            if stringify_cell(dataframe.at[row_task.row_index, column_name]).strip() == DELETED_TRANSCRIPT_TEXT:
-                dataframe.at[row_task.row_index, column_name] = ""
-
-        attempts = self._get_attempts(dataframe, row_task.row_index)
-        self._set_row_meta(
-            dataframe,
-            row_task.row_index,
-            status=RETRY_PENDING_STATUS,
-            error_message="疑似触发抖音风控通用页，冷却后重试",
-            attempts=attempts,
-        )
-        self._append_unique_task(retry_queue, row_task)
-        self.manager.append_log(
-            job_id,
-            f"第 {row_task.csv_row_number} 行已从“已删除”恢复为“{RETRY_PENDING_STATUS}”",
-        )
+    @staticmethod
+    def _reset_anti_crawl_tracking(run_state: RunControlState) -> None:
+        run_state.pending_cooldown = None
+        run_state.suspicious_tasks.clear()
+        run_state.suspicious_signal_descriptions.clear()
 
     def _sleep_with_cooldown_message(self, job_id: str, seconds: int, reason: str) -> None:
         remaining = max(0, int(seconds))
@@ -1587,14 +1553,6 @@ class JobProcessor:
         return "".join(parts)
 
     @staticmethod
-    def _is_suspected_anti_crawl_deleted_video(video: ParsedVideo) -> bool:
-        return (
-            video.is_deleted
-            and video.resolved_by == "浏览器兜底"
-            and (video.title or "").strip().startswith("在抖音记录美好生活")
-        )
-
-    @staticmethod
     def _is_suspected_anti_crawl_parse_failure(exc: RowProcessingError) -> bool:
         if exc.stage != "解析":
             return False
@@ -1627,11 +1585,6 @@ class JobProcessor:
         )
 
         return has_router_data_failure or has_browser_capture_failure or has_network_failure
-
-    def _weak_signal_descriptions_for_video(self, video: ParsedVideo) -> Tuple[str, ...]:
-        if not self._is_suspected_anti_crawl_deleted_video(video):
-            return ()
-        return (self._format_signal_description("弱", WEAK_SIGNAL_DELETED_PAGE),)
 
     def _weak_signal_descriptions_for_error(self, exc: RowProcessingError) -> Tuple[str, ...]:
         if not self._is_suspected_anti_crawl_parse_failure(exc):
@@ -1791,6 +1744,7 @@ class JobProcessor:
                 return RowOutcome(
                     status="已删除",
                     attempts=attempt_number,
+                    resets_anti_crawl_state=True,
                     anti_crawl_strong_suspected=bool(strong_signal_descriptions),
                     anti_crawl_signal_descriptions=strong_signal_descriptions,
                 )
@@ -1875,7 +1829,11 @@ class JobProcessor:
                     job_id,
                     f"第 {task.csv_row_number} 行{delete_reason}，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
                 )
-                return RowOutcome(status="已删除", attempts=attempt_number)
+                return RowOutcome(
+                    status="已删除",
+                    attempts=attempt_number,
+                    resets_anti_crawl_state=(delete_reason == "分享页未找到视频详情"),
+                )
             retryable = self._is_retryable(exc, attempt_number)
             weak_signal_descriptions = self._weak_signal_descriptions_for_error(exc)
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)

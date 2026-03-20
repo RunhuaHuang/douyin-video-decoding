@@ -905,7 +905,6 @@ def test_record_row_control_signal_ignores_retry_stage_weak_suspicion():
     )
 
     assert run_state.suspicious_tasks == []
-    assert run_state.suspicious_deleted_tasks == []
     assert run_state.pending_cooldown is None
 
 
@@ -931,7 +930,6 @@ def test_record_row_control_signal_ignores_deleted_strong_suspicion():
     )
 
     assert run_state.suspicious_tasks == []
-    assert run_state.suspicious_deleted_tasks == []
     assert run_state.pending_cooldown is None
 
 
@@ -956,7 +954,33 @@ def test_record_row_control_signal_ignores_non_deleted_strong_suspicion():
     )
 
     assert run_state.suspicious_tasks == []
-    assert run_state.suspicious_deleted_tasks == []
+    assert run_state.pending_cooldown is None
+
+
+def test_record_row_control_signal_trusted_delete_resets_anti_crawl_tracking():
+    processor = JobProcessor(JobManager())
+    run_state = RunControlState(
+        anti_crawl_streak_threshold=1,
+        anti_crawl_cooldown_seconds=60,
+        proactive_cooldown_batch_threshold=100,
+        proactive_cooldown_seconds=0,
+    )
+    run_state.suspicious_tasks = [RowTask(row_index=0, position=1, csv_row_number=2, url_value="u1")]
+    run_state.suspicious_signal_descriptions = ["弱冷却信号：分享页/接口异常、浏览器兜底异常或网络异常"]
+    run_state.pending_cooldown = object()  # type: ignore[assignment]
+
+    processor._record_row_control_signal(
+        run_state=run_state,
+        task=RowTask(row_index=1, position=2, csv_row_number=3, url_value="u2"),
+        outcome=RowOutcome(
+            status="已删除",
+            attempts=1,
+            resets_anti_crawl_state=True,
+        ),
+    )
+
+    assert run_state.suspicious_tasks == []
+    assert run_state.suspicious_signal_descriptions == []
     assert run_state.pending_cooldown is None
 
 

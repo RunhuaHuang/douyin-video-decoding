@@ -300,9 +300,20 @@
             </div>
           </div>
 
+          <label class="field" id="video-output-dir-field">
+            <span>视频保存目录（仅下载模式生效，留空则用 output/videos/）</span>
+            <input
+              type="text"
+              name="video_output_dir"
+              id="video-output-dir"
+              placeholder="/Volumes/电影/test"
+              disabled
+            />
+          </label>
+
           <label class="checkbox">
             <input type="checkbox" name="download_only" id="download-only-toggle" />
-            <span>仅下载视频（跳过转写，保存到 output/videos/）</span>
+            <span>仅下载视频（跳过转写，保存到视频保存目录）</span>
           </label>
 
           <label class="checkbox">
@@ -371,6 +382,7 @@
     const modelTextarea = document.querySelector('textarea[name="model_names"]');
     const downloadOnlyToggle = document.getElementById("download-only-toggle");
     const transcriptColumnInput = document.querySelector('input[name="transcript_column"]');
+    const videoOutputDirInput = document.getElementById("video-output-dir");
 
     function syncDownloadOnlyFields() {
       if (!downloadOnlyToggle) return;
@@ -378,6 +390,9 @@
       if (transcriptColumnInput) {
         transcriptColumnInput.required = !downloadOnly;
         transcriptColumnInput.disabled = downloadOnly;
+      }
+      if (videoOutputDirInput) {
+        videoOutputDirInput.disabled = !downloadOnly;
       }
       if (modelTextarea) {
         modelTextarea.required = !downloadOnly;

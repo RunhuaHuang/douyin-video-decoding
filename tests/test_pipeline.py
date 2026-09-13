@@ -2393,3 +2393,101 @@ def test_pipeline_download_only_runs_without_ffmpeg(tmp_path, monkeypatch):
     job = manager.require(session.job_id)
     assert job.status == "completed"
     assert list((tmp_path / "videos_out" / "no-ffmpeg").glob("row*.mp4"))
+
+
+def test_pipeline_download_only_saves_to_custom_video_dir(tmp_path, monkeypatch):
+    csv_path = tmp_path / "custom-dir.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path, index=False, encoding="utf-8-sig"
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(pipeline_module, "VIDEO_OUTPUT_DIR", tmp_path / "videos_out")
+
+    custom_dir = tmp_path / "nas-like" / "target"
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="custom-dir.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="",
+        model_names_text="",
+        model_names=[],
+        overwrite=False,
+        download_only=True,
+        video_output_dir=str(custom_dir),
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=_explode_transcription_factory,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert any(str(custom_dir) in line for line in job.logs)
+
+    saved = list((custom_dir / "custom-dir").glob("row*.mp4"))
+    assert len(saved) == 1
+    assert saved[0].read_bytes() == b"fake-video"
+    assert not (tmp_path / "videos_out").exists()
+
+
+def test_pipeline_download_only_fails_fast_when_video_dir_unwritable(tmp_path, monkeypatch):
+    csv_path = tmp_path / "bad-dir.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path, index=False, encoding="utf-8-sig"
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(pipeline_module, "VIDEO_OUTPUT_DIR", tmp_path / "videos_out")
+
+    # 用一个已存在的文件路径冒充目录，mkdir 必然失败
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="bad-dir.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="",
+        model_names_text="",
+        model_names=[],
+        overwrite=False,
+        download_only=True,
+        video_output_dir=str(blocker),
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=_explode_transcription_factory,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "failed"
+    assert any("视频保存目录不可用" in line for line in job.logs)

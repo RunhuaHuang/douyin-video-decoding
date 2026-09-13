@@ -33,6 +33,7 @@ class JobRecord:
     model_names: List[str] = field(default_factory=list)
     overwrite: bool = False
     download_only: bool = False
+    video_output_dir: Optional[str] = None
     download_workers: int = DEFAULT_DOWNLOAD_WORKERS
     asr_workers: int = DEFAULT_ASR_WORKERS
     batch_delay_seconds: int = DEFAULT_BATCH_DELAY_SECONDS
@@ -95,6 +96,7 @@ class BatchRecord:
     model_names: List[str] = field(default_factory=list)
     overwrite: bool = False
     download_only: bool = False
+    video_output_dir: Optional[str] = None
     download_workers: int = DEFAULT_DOWNLOAD_WORKERS
     asr_workers: int = DEFAULT_ASR_WORKERS
     batch_delay_seconds: int = DEFAULT_BATCH_DELAY_SECONDS

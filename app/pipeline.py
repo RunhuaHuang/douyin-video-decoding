@@ -268,10 +268,14 @@ class JobProcessor:
             output_path = self._build_output_path(job)
             self.manager.mark_running(job_id, len(dataframe))
             if download_only:
-                video_dir = VIDEO_OUTPUT_DIR / Path(job.original_filename).stem
+                video_root = self._video_output_root(job)
+                try:
+                    self._ensure_video_output_root_writable(video_root)
+                except Exception as exc:
+                    raise RuntimeError(f"视频保存目录不可用：{video_root}（{self._format_error(exc)}）") from exc
                 self.manager.append_log(
                     job_id,
-                    f"仅下载模式：视频将保存到 {video_dir}",
+                    f"仅下载模式：视频将保存到 {video_root / Path(job.original_filename).stem}",
                 )
             self.manager.append_log(
                 job_id,
@@ -799,9 +803,10 @@ class JobProcessor:
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
 
             if download_only:
-                saved_path = self._save_download_only_video(job, plan.task, video, video_path, browser_audio_path)
+                video_root = self._video_output_root(job)
+                saved_path = self._save_download_only_video(job, plan.task, video, video_path, browser_audio_path, video_root)
                 log_messages.append(
-                    f"第 {plan.task.csv_row_number} 行视频已保存：{saved_path.relative_to(VIDEO_OUTPUT_DIR)}"
+                    f"第 {plan.task.csv_row_number} 行视频已保存：{saved_path.relative_to(video_root)}"
                 )
                 return RowExecutionResult(
                     plan=plan,
@@ -1817,10 +1822,11 @@ class JobProcessor:
                 )
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
             if download_only:
-                saved_path = self._save_download_only_video(job, task, video, video_path, browser_audio_path)
+                video_root = self._video_output_root(job)
+                saved_path = self._save_download_only_video(job, task, video, video_path, browser_audio_path, video_root)
                 self.manager.append_log(
                     job_id,
-                    f"第 {task.csv_row_number} 行视频已保存：{saved_path.relative_to(VIDEO_OUTPUT_DIR)}",
+                    f"第 {task.csv_row_number} 行视频已保存：{saved_path.relative_to(video_root)}",
                 )
                 return RowOutcome(
                     status="成功",
@@ -1992,6 +1998,18 @@ class JobProcessor:
     def _is_download_only(self, job_id: str) -> bool:
         return bool(getattr(self.manager.require(job_id), "download_only", False))
 
+    @staticmethod
+    def _video_output_root(job) -> Path:
+        custom_dir = str(getattr(job, "video_output_dir", "") or "").strip()
+        return Path(custom_dir).expanduser() if custom_dir else VIDEO_OUTPUT_DIR
+
+    @staticmethod
+    def _ensure_video_output_root_writable(root: Path) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".write_probe"
+        probe.write_bytes(b"")
+        probe.unlink()
+
     def _pending_work_for_row(
         self,
         dataframe,
@@ -2008,8 +2026,8 @@ class JobProcessor:
         return [DOWNLOAD_ONLY_MODEL]
 
     @staticmethod
-    def _save_download_only_video(job, task: RowTask, video: ParsedVideo, video_path: Path, browser_audio_path: Path) -> Path:
-        target_dir = VIDEO_OUTPUT_DIR / Path(job.original_filename).stem
+    def _save_download_only_video(job, task: RowTask, video: ParsedVideo, video_path: Path, browser_audio_path: Path, root: Path) -> Path:
+        target_dir = root / Path(job.original_filename).stem
         target_dir.mkdir(parents=True, exist_ok=True)
 
         source_path = None

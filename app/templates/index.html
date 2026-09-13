@@ -301,6 +301,11 @@
           </div>
 
           <label class="checkbox">
+            <input type="checkbox" name="download_only" id="download-only-toggle" />
+            <span>仅下载视频（跳过转写，保存到 output/videos/）</span>
+          </label>
+
+          <label class="checkbox">
             <input type="checkbox" name="overwrite" />
             <span>覆盖已有文本</span>
           </label>
@@ -364,6 +369,30 @@
 
   <script>
     const modelTextarea = document.querySelector('textarea[name="model_names"]');
+    const downloadOnlyToggle = document.getElementById("download-only-toggle");
+    const transcriptColumnInput = document.querySelector('input[name="transcript_column"]');
+
+    function syncDownloadOnlyFields() {
+      if (!downloadOnlyToggle) return;
+      const downloadOnly = downloadOnlyToggle.checked;
+      if (transcriptColumnInput) {
+        transcriptColumnInput.required = !downloadOnly;
+        transcriptColumnInput.disabled = downloadOnly;
+      }
+      if (modelTextarea) {
+        modelTextarea.required = !downloadOnly;
+        modelTextarea.disabled = downloadOnly;
+      }
+      document.querySelectorAll(".preset-button").forEach((button) => {
+        button.disabled = downloadOnly;
+      });
+    }
+
+    if (downloadOnlyToggle) {
+      downloadOnlyToggle.addEventListener("change", syncDownloadOnlyFields);
+      syncDownloadOnlyFields();
+    }
+
     const uploadInput = document.getElementById("upload-files");
     const uploadFileSummary = document.getElementById("upload-file-summary");
     const uploadFileDetail = document.getElementById("upload-file-detail");

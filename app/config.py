@@ -9,6 +9,7 @@ JOB_DIR = TMP_DIR / "jobs"
 BROWSER_STATE_DIR = PROJECT_ROOT / "tmp" / "browser"
 BROWSER_ACCOUNTS_DIR = BROWSER_STATE_DIR / "accounts"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "spreadsheet"
+VIDEO_OUTPUT_DIR = PROJECT_ROOT / "output" / "videos"
 TEMPLATE_DIR = APP_DIR / "templates"
 STATIC_DIR = APP_DIR / "static"
 
@@ -106,6 +107,7 @@ def ensure_directories() -> None:
         BROWSER_STATE_DIR,
         BROWSER_ACCOUNTS_DIR,
         OUTPUT_DIR,
+        VIDEO_OUTPUT_DIR,
         STATIC_DIR,
         TEMPLATE_DIR,
     ):

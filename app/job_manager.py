@@ -99,6 +99,7 @@ class JobManager:
         model_names_text: str,
         model_names: List[str],
         overwrite: bool,
+        download_only: bool = False,
         download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
         asr_workers: int = DEFAULT_ASR_WORKERS,
         batch_delay_seconds: int = DEFAULT_BATCH_DELAY_SECONDS,
@@ -117,6 +118,7 @@ class JobManager:
             job.model_names_text = model_names_text
             job.model_names = model_names
             job.overwrite = overwrite
+            job.download_only = download_only
             job.download_workers = download_workers
             job.asr_workers = asr_workers
             job.batch_delay_seconds = batch_delay_seconds
@@ -159,6 +161,7 @@ class JobManager:
         model_names_text: str,
         model_names: List[str],
         overwrite: bool,
+        download_only: bool = False,
         download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
         asr_workers: int = DEFAULT_ASR_WORKERS,
         batch_delay_seconds: int = DEFAULT_BATCH_DELAY_SECONDS,
@@ -177,6 +180,7 @@ class JobManager:
             batch.model_names_text = model_names_text
             batch.model_names = model_names
             batch.overwrite = overwrite
+            batch.download_only = download_only
             batch.download_workers = download_workers
             batch.asr_workers = asr_workers
             batch.batch_delay_seconds = batch_delay_seconds
@@ -209,6 +213,7 @@ class JobManager:
                     model_names_text=model_names_text,
                     model_names=model_names,
                     overwrite=overwrite,
+                    download_only=download_only,
                     download_workers=download_workers,
                     asr_workers=asr_workers,
                     batch_delay_seconds=batch_delay_seconds,

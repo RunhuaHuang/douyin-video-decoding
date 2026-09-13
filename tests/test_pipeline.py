@@ -2280,3 +2280,116 @@ def test_pipeline_retry_rounds_switch_cookie_and_stop_after_three_rounds(tmp_pat
     assert any("开始第 1 轮重试，切换 cookies" in line for line in job.logs)
     assert any("开始第 2 轮重试，切换 cookies" in line for line in job.logs)
     assert any("开始第 3 轮重试，切换 cookies" in line for line in job.logs)
+
+
+class UnavailableFfmpegService(FakeFfmpegService):
+    def is_available(self) -> bool:
+        return False
+
+
+def _explode_transcription_factory(default_model):
+    raise AssertionError("仅下载模式不应初始化转写服务")
+
+
+def test_pipeline_download_only_saves_videos_without_transcription(tmp_path, monkeypatch):
+    csv_path = tmp_path / "videos.csv"
+    pd.DataFrame(
+        [
+            {"url": "https://v.douyin.com/AAA111/", "name": "a"},
+            {"url": "", "name": "b"},
+            {"url": "https://v.douyin.com/BBB222/", "name": "c"},
+        ]
+    ).to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(pipeline_module, "VIDEO_OUTPUT_DIR", tmp_path / "videos_out")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="videos.csv",
+        upload_path=csv_path,
+        columns=["url", "name"],
+        preview_rows=[],
+        row_count=3,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="",
+        model_names_text="",
+        model_names=[],
+        overwrite=False,
+        download_only=True,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=FakeFfmpegService,
+        transcription_service_factory=_explode_transcription_factory,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert any("仅下载模式" in line for line in job.logs)
+
+    result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    assert "视频文本" not in result.columns
+    assert result.loc[0, "处理状态"] == "成功"
+    assert result.loc[1, "处理状态"] == "跳过"
+    assert result.loc[2, "处理状态"] == "成功"
+    assert result.loc[0, "尝试次数"] == "1"
+
+    video_dir = tmp_path / "videos_out" / "videos"
+    saved_files = sorted(video_dir.glob("row*.mp4"))
+    assert len(saved_files) == 2
+    assert saved_files[0].name.startswith("row0002_")
+    assert saved_files[1].name.startswith("row0004_")
+    assert saved_files[0].read_bytes() == b"fake-video"
+
+
+def test_pipeline_download_only_runs_without_ffmpeg(tmp_path, monkeypatch):
+    csv_path = tmp_path / "no-ffmpeg.csv"
+    pd.DataFrame([{"url": "https://v.douyin.com/AAA111/"}]).to_csv(
+        csv_path, index=False, encoding="utf-8-sig"
+    )
+
+    from app import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "JOB_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(pipeline_module, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(pipeline_module, "VIDEO_OUTPUT_DIR", tmp_path / "videos_out")
+
+    manager = JobManager()
+    session = manager.create_session(
+        original_filename="no-ffmpeg.csv",
+        upload_path=csv_path,
+        columns=["url"],
+        preview_rows=[],
+        row_count=1,
+    )
+    manager.configure_job(
+        session.job_id,
+        url_column="url",
+        transcript_column="",
+        model_names_text="",
+        model_names=[],
+        overwrite=False,
+        download_only=True,
+    )
+
+    processor = JobProcessor(
+        manager,
+        douyin_service_factory=FakeDouyinService,
+        ffmpeg_service_factory=UnavailableFfmpegService,
+        transcription_service_factory=_explode_transcription_factory,
+    )
+    processor.process(session.job_id)
+
+    job = manager.require(session.job_id)
+    assert job.status == "completed"
+    assert list((tmp_path / "videos_out" / "no-ffmpeg").glob("row*.mp4"))

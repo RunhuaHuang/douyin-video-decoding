@@ -32,6 +32,7 @@ from .config import (
     ROW_MAX_RETRIES,
     ROW_RETRY_DELAY_SECONDS,
     STATUS_COLUMN,
+    VIDEO_OUTPUT_DIR,
 )
 from .cookie_accounts import CookieAccount, CookieAccountManager
 from .csv_service import (
@@ -78,6 +79,9 @@ SSL_CERT_VERIFY_ERROR = "CERTIFICATE_VERIFY_FAILED"
 ACTIVE_REFUSED_ERROR = "No connection could be made because the target machine actively refused it"
 WEAK_SIGNAL_PARSE_FALLBACK = "分享页/接口异常、浏览器兜底异常或网络异常"
 STRONG_SIGNAL_CHALLENGE_FALLBACK = "challenge/验证码信号"
+DOWNLOAD_ONLY_MODEL = "_download_only"
+DOWNLOAD_ONLY_VIDEO_SUFFIX = ".mp4"
+DOWNLOAD_ONLY_AUDIO_SUFFIX = ".m4a"
 
 
 @dataclass(frozen=True)
@@ -229,13 +233,14 @@ class JobProcessor:
 
         try:
             ffmpeg = self.ffmpeg_service_factory()
+            download_only = bool(getattr(job, "download_only", False))
             default_model = job.model_names[0] if job.model_names else DEFAULT_MODEL
-            transcriber = self.transcription_service_factory(default_model=default_model)
+            transcriber = None if download_only else self.transcription_service_factory(default_model=default_model)
             download_workers = self._sanitize_worker_count(job.download_workers)
             asr_workers = self._sanitize_worker_count(job.asr_workers)
             batch_delay_seconds = self._sanitize_batch_delay(getattr(job, "batch_delay_seconds", self.batch_delay_seconds))
 
-            if not ffmpeg.is_available():
+            if not download_only and not ffmpeg.is_available():
                 raise RuntimeError("当前系统未检测到 ffmpeg，请先安装后再运行任务")
 
             source_path = self._resolve_source_path(job, mode)
@@ -247,11 +252,14 @@ class JobProcessor:
 
             if not job.url_column or job.url_column not in dataframe.columns:
                 raise RuntimeError("URL 列不存在，请重新选择")
-            if not job.transcript_column:
+            if not download_only and not job.transcript_column:
                 raise RuntimeError("视频文本列不能为空")
 
             model_names = job.model_names or [DEFAULT_MODEL]
-            output_columns = self._build_output_columns(job.transcript_column, model_names, transcriber)
+            if download_only:
+                output_columns: Dict[str, str] = {}
+            else:
+                output_columns = self._build_output_columns(job.transcript_column, model_names, transcriber)
             for column_name in output_columns.values():
                 ensure_text_column(dataframe, column_name)
             for column_name in (STATUS_COLUMN, ERROR_COLUMN, ATTEMPTS_COLUMN):
@@ -259,6 +267,12 @@ class JobProcessor:
 
             output_path = self._build_output_path(job)
             self.manager.mark_running(job_id, len(dataframe))
+            if download_only:
+                video_dir = VIDEO_OUTPUT_DIR / Path(job.original_filename).stem
+                self.manager.append_log(
+                    job_id,
+                    f"仅下载模式：视频将保存到 {video_dir}",
+                )
             self.manager.append_log(
                 job_id,
                 self._build_start_message(
@@ -276,7 +290,9 @@ class JobProcessor:
             self._sync_progress(job_id, dataframe, current_message="任务执行中")
 
             tasks = self._build_tasks(dataframe, job)
-            primary_tasks, retry_queue = self._split_tasks(dataframe, tasks, output_columns, job.overwrite, mode)
+            primary_tasks, retry_queue = self._split_tasks(
+                dataframe, tasks, output_columns, job.overwrite, mode, download_only=download_only
+            )
             parallel_enabled = download_workers > 1 or asr_workers > 1
 
             with ExitStack() as stack:
@@ -429,6 +445,7 @@ class JobProcessor:
                         transcriber=transcriber,
                         output_path=output_path,
                         retry_queue=retry_queue,
+                        download_only=self._is_download_only(job_id),
                     )
 
             cooled_down = self._finalize_batch(
@@ -531,6 +548,7 @@ class JobProcessor:
                             transcriber=transcriber,
                             output_path=output_path,
                             retry_queue=next_round,
+                            download_only=self._is_download_only(job_id),
                         )
 
                 cooled_down = self._finalize_batch(
@@ -613,10 +631,11 @@ class JobProcessor:
         batch_delay_seconds: int,
     ) -> None:
         plans: List[RowPlan] = []
+        download_only = self._is_download_only(job_id)
         for task in tasks:
             if self.manager.is_pause_requested(job_id):
                 break
-            result = self._plan_task(dataframe, task, output_columns, overwrite)
+            result = self._plan_task(dataframe, task, output_columns, overwrite, download_only)
             if isinstance(result, RowExecutionResult):
                 self._handle_row_result(
                     job_id=job_id,
@@ -699,9 +718,12 @@ class JobProcessor:
         task: RowTask,
         output_columns: Dict[str, str],
         overwrite: bool,
+        download_only: bool = False,
     ) -> RowPlan | RowExecutionResult:
         current_attempts = self._get_attempts(dataframe, task.row_index)
-        pending_models = tuple(self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite))
+        pending_models = tuple(
+            self._pending_work_for_row(dataframe, task.row_index, output_columns, overwrite, download_only)
+        )
 
         if not task.url_value:
             return RowExecutionResult(
@@ -711,16 +733,19 @@ class JobProcessor:
             )
 
         if not pending_models:
+            skip_reason = "该行已处理过" if download_only else "目标文本列已有内容"
             return RowExecutionResult(
                 plan=RowPlan(task=task, attempts_before=current_attempts, pending_models=pending_models),
-                outcome=RowOutcome(status="跳过", attempts=current_attempts, error_message="目标文本列已有内容"),
-                log_messages=(f"第 {task.csv_row_number} 行跳过：目标文本列已有内容",),
+                outcome=RowOutcome(status="跳过", attempts=current_attempts, error_message=skip_reason),
+                log_messages=(f"第 {task.csv_row_number} 行跳过：{skip_reason}",),
             )
 
         return RowPlan(task=task, attempts_before=current_attempts, pending_models=pending_models)
 
     def _run_download_stage(self, job_id: str, plan: RowPlan, workspace: Path) -> PreparedRow | RowExecutionResult:
         douyin = self._get_thread_douyin_service(job_id)
+        job = self.manager.require(job_id)
+        download_only = bool(getattr(job, "download_only", False))
         row_dir = workspace / f"row_{plan.task.position:05d}"
         video_path = row_dir / "source.mp4"
         browser_audio_path = row_dir / "fallback_audio.m4a"
@@ -756,7 +781,11 @@ class JobProcessor:
                         anti_crawl_strong_suspected=bool(strong_signal_descriptions),
                         anti_crawl_signal_descriptions=strong_signal_descriptions,
                     ),
-                    transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
+                    transcripts={
+                        model_name: DELETED_TRANSCRIPT_TEXT
+                        for model_name in plan.pending_models
+                        if model_name != DOWNLOAD_ONLY_MODEL
+                    },
                     log_messages=tuple(log_messages),
                     cleanup_dir=row_dir,
                 )
@@ -768,6 +797,24 @@ class JobProcessor:
             if download_result.audio_source_url:
                 log_messages.append(f"第 {plan.task.csv_row_number} 行已捕获补充音频流")
             strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+
+            if download_only:
+                saved_path = self._save_download_only_video(job, plan.task, video, video_path, browser_audio_path)
+                log_messages.append(
+                    f"第 {plan.task.csv_row_number} 行视频已保存：{saved_path.relative_to(VIDEO_OUTPUT_DIR)}"
+                )
+                return RowExecutionResult(
+                    plan=plan,
+                    outcome=RowOutcome(
+                        status="成功",
+                        attempts=plan.attempt_number,
+                        anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                        anti_crawl_signal_descriptions=strong_signal_descriptions,
+                    ),
+                    transcripts={},
+                    log_messages=tuple(log_messages),
+                    cleanup_dir=row_dir,
+                )
 
             return PreparedRow(
                 plan=plan,
@@ -847,7 +894,11 @@ class JobProcessor:
                         anti_crawl_strong_suspected=bool(strong_signal_descriptions),
                         anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
                     ),
-                    transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
+                    transcripts={
+                        model_name: DELETED_TRANSCRIPT_TEXT
+                        for model_name in plan.pending_models
+                        if model_name != DOWNLOAD_ONLY_MODEL
+                    },
                     log_messages=(
                         f"第 {plan.task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
                     ),
@@ -1645,6 +1696,7 @@ class JobProcessor:
         transcriber: TranscriptionService,
         output_path: Path,
         retry_queue: List[RowTask],
+        download_only: bool = False,
     ) -> None:
         self.manager.update_progress(
             job_id,
@@ -1662,6 +1714,7 @@ class JobProcessor:
             workspace=workspace,
             ffmpeg=ffmpeg,
             transcriber=transcriber,
+            download_only=download_only,
         )
 
         self._set_row_meta(
@@ -1704,18 +1757,21 @@ class JobProcessor:
         workspace: Path,
         ffmpeg: FfmpegService,
         transcriber: TranscriptionService,
+        download_only: bool = False,
     ) -> RowOutcome:
         douyin = self._get_thread_douyin_service(job_id)
+        job = self.manager.require(job_id)
         current_attempts = self._get_attempts(dataframe, task.row_index)
-        pending_models = self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite)
+        pending_models = self._pending_work_for_row(dataframe, task.row_index, output_columns, overwrite, download_only)
 
         if not task.url_value:
             self.manager.append_log(job_id, f"第 {task.csv_row_number} 行跳过：URL 为空")
             return RowOutcome(status="跳过", attempts=current_attempts, error_message="URL 为空")
 
         if not pending_models:
-            self.manager.append_log(job_id, f"第 {task.csv_row_number} 行跳过：目标文本列已有内容")
-            return RowOutcome(status="跳过", attempts=current_attempts, error_message="目标文本列已有内容")
+            skip_reason = "该行已处理过" if download_only else "目标文本列已有内容"
+            self.manager.append_log(job_id, f"第 {task.csv_row_number} 行跳过：{skip_reason}")
+            return RowOutcome(status="跳过", attempts=current_attempts, error_message=skip_reason)
 
         attempt_number = current_attempts + 1
         row_dir = workspace / f"row_{task.position:05d}"
@@ -1759,6 +1815,19 @@ class JobProcessor:
                     job_id,
                     f"第 {task.csv_row_number} 行已捕获补充音频流",
                 )
+            strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+            if download_only:
+                saved_path = self._save_download_only_video(job, task, video, video_path, browser_audio_path)
+                self.manager.append_log(
+                    job_id,
+                    f"第 {task.csv_row_number} 行视频已保存：{saved_path.relative_to(VIDEO_OUTPUT_DIR)}",
+                )
+                return RowOutcome(
+                    status="成功",
+                    attempts=attempt_number,
+                    anti_crawl_strong_suspected=bool(strong_signal_descriptions),
+                    anti_crawl_signal_descriptions=strong_signal_descriptions,
+                )
             self._extract_audio(ffmpeg, video_path, audio_path, browser_audio_path)
             model_failures = self._transcribe_models(
                 job_id=job_id,
@@ -1770,7 +1839,7 @@ class JobProcessor:
                 pending_models=pending_models,
                 transcriber=transcriber,
             )
-            strong_signal_descriptions = self._consume_attempt_challenge_signal_descriptions(douyin)
+            strong_signal_descriptions = strong_signal_descriptions or self._consume_attempt_challenge_signal_descriptions(douyin)
             if not model_failures:
                 return RowOutcome(
                     status="成功",
@@ -1920,6 +1989,51 @@ class JobProcessor:
             if overwrite or not stringify_cell(dataframe.at[row_index, column_name]).strip()
         ]
 
+    def _is_download_only(self, job_id: str) -> bool:
+        return bool(getattr(self.manager.require(job_id), "download_only", False))
+
+    def _pending_work_for_row(
+        self,
+        dataframe,
+        row_index,
+        output_columns: Dict[str, str],
+        overwrite: bool,
+        download_only: bool,
+    ) -> List[str]:
+        if not download_only:
+            return self._pending_models_for_row(dataframe, row_index, output_columns, overwrite)
+        status = stringify_cell(dataframe.at[row_index, STATUS_COLUMN]).strip()
+        if status in TERMINAL_STATUSES:
+            return []
+        return [DOWNLOAD_ONLY_MODEL]
+
+    @staticmethod
+    def _save_download_only_video(job, task: RowTask, video: ParsedVideo, video_path: Path, browser_audio_path: Path) -> Path:
+        target_dir = VIDEO_OUTPUT_DIR / Path(job.original_filename).stem
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        source_path = None
+        suffix = DOWNLOAD_ONLY_VIDEO_SUFFIX
+        if video_path.exists():
+            source_path = video_path
+        elif browser_audio_path.exists():
+            source_path = browser_audio_path
+            suffix = DOWNLOAD_ONLY_AUDIO_SUFFIX
+
+        if source_path is None:
+            raise RowProcessingError("下载", "下载完成但没有找到可保存的媒体文件")
+
+        safe_title = re.sub(r'[\\/:*?"<>|\r\n\t]', " ", video.title)
+        safe_title = re.sub(r"\s+", " ", safe_title).strip(" .")
+        if len(safe_title) > 50:
+            safe_title = safe_title[:50].rstrip()
+        stem = f"row{task.csv_row_number:04d}_{safe_title or video.video_id}"
+        target_path = target_dir / f"{stem}{suffix}"
+        if target_path.exists():
+            target_path.unlink()
+        shutil.move(str(source_path), str(target_path))
+        return target_path
+
     @staticmethod
     def _reset_attempt_files(row_dir: Path, *paths: Path) -> None:
         shutil.rmtree(row_dir, ignore_errors=True)
@@ -2021,13 +2135,14 @@ class JobProcessor:
         output_columns: Dict[str, str],
         overwrite: bool,
         mode: str,
+        download_only: bool = False,
     ) -> tuple[List[RowTask], List[RowTask]]:
         primary_tasks: List[RowTask] = []
         retry_queue: List[RowTask] = []
 
         for task in tasks:
             status = stringify_cell(dataframe.at[task.row_index, STATUS_COLUMN]).strip()
-            pending_models = self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite)
+            pending_models = self._pending_work_for_row(dataframe, task.row_index, output_columns, overwrite, download_only)
 
             if mode == "retry_failed":
                 if status in FAILED_STATUSES or (status == "部分成功" and pending_models):

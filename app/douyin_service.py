@@ -12,6 +12,7 @@ import httpx
 from .browser_service import CHROME_USER_AGENT, PlaywrightFallback
 from .config import (
     DOUYIN_BROWSER_FALLBACK_ENABLED,
+    DOUYIN_BROWSER_FIRST,
     DOUYIN_CHALLENGE_BASE_COOLDOWN_SECONDS,
     DOUYIN_CHALLENGE_MAX_COOLDOWN_SECONDS,
     DOUYIN_DOWNLOAD_TIMEOUT_SECONDS,
@@ -114,6 +115,7 @@ class DouyinService:
         jitter_fn: Callable[[float, float], float] = random.uniform,
         monotonic_fn: Callable[[], float] = time.monotonic,
         browser_fallback_enabled: bool = DOUYIN_BROWSER_FALLBACK_ENABLED,
+        browser_first: bool = DOUYIN_BROWSER_FIRST,
         request_coordinator: Optional[RequestCoordinator] = None,
     ) -> None:
         self.client = client or self._build_http_client(timeout)
@@ -122,6 +124,7 @@ class DouyinService:
         self.download_timeout = download_timeout
         self.browser_resolver = browser_resolver
         self.browser_fallback_enabled = browser_fallback_enabled
+        self.browser_first = bool(browser_first)
         self.request_interval_range = request_interval_range
         self.sleep_fn = sleep_fn
         self.jitter_fn = jitter_fn
@@ -162,6 +165,15 @@ class DouyinService:
             raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
 
         self._sync_client_cookies_from_browser()
+        # 浏览器优先：直接用账号池会话解析，跳过直连尝试；
+        # 浏览器不可用（如未安装）时仍退回直连解析链路
+        if self.browser_first and self.browser_fallback_enabled:
+            browser_video, browser_error = self._try_parse_with_browser(share_url)
+            if browser_error == self.NON_VIDEO_NOTE_ERROR:
+                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
+            if browser_video is not None:
+                return browser_video
+
         initial_page_was_challenge = False
         try:
             response = self._get(share_url, headers=MOBILE_PARSE_HEADERS)
@@ -243,11 +255,12 @@ class DouyinService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         referer = video.page_url or video.share_url or "https://www.douyin.com/"
         self._sync_client_cookies_from_browser()
-        self._prime_session(video.page_url or video.share_url)
 
         errors: List[str] = []
         attempts = 0
-        if video.resolved_by == "浏览器兜底" and self.browser_fallback_enabled:
+        # 浏览器优先（或本来就是浏览器解析的）：先走浏览器会话下载，
+        # 失败再退回直连地址
+        if self.browser_fallback_enabled and (self.browser_first or video.resolved_by == "浏览器兜底"):
             try:
                 browser_result = self._download_via_browser(video, output_path, audio_output_path)
             except Exception as exc:
@@ -262,6 +275,8 @@ class DouyinService:
                         audio_attempts=browser_result.audio_attempts,
                     )
 
+        # 浏览器优先时，只有浏览器路径失败后才预热直连会话，避免无意义的直连请求。
+        self._prime_session(video.page_url or video.share_url)
         download_headers = self._build_video_headers(referer)
         for url in self._candidate_download_urls(video.download_urls):
             attempts += 1

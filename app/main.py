@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import threading
 from datetime import datetime
+from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List
@@ -10,6 +13,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from .config import (
     ANTI_CRAWL_COOLDOWN_SECONDS,
@@ -55,26 +59,78 @@ MAX_ANTI_CRAWL_STREAK_THRESHOLD = 50
 MAX_COOLDOWN_MINUTES = 12 * 60
 MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD = 500
 account_relogin_threads: Dict[str, threading.Thread] = {}
+_worker_registry_lock = threading.RLock()
+_job_workers: Dict[str, threading.Thread] = {}
+_batch_workers: Dict[str, threading.Thread] = {}
 
 
-def start_job_worker(job_id: str, mode: str = "full") -> None:
-    worker = threading.Thread(
-        target=job_processor.process,
-        kwargs={"job_id": job_id, "mode": mode},
-        daemon=True,
-        name=f"douyin-job-{job_id[:8]}-{mode}",
-    )
-    worker.start()
+def _worker_is_active(registry: Dict[str, threading.Thread], key: str) -> bool:
+    with _worker_registry_lock:
+        worker = registry.get(key)
+        if worker is None:
+            return False
+        if worker.is_alive():
+            return True
+        registry.pop(key, None)
+        return False
 
 
-def start_batch_worker(batch_id: str, mode: str = "full") -> None:
-    worker = threading.Thread(
-        target=process_batch,
-        kwargs={"batch_id": batch_id, "mode": mode},
-        daemon=True,
-        name=f"douyin-batch-{batch_id[:8]}-{mode}",
-    )
-    worker.start()
+def _job_start_conflict(job_id: str) -> bool:
+    """Return whether a job or its owning batch already has a worker."""
+    if _worker_is_active(_job_workers, job_id):
+        return True
+    job = job_manager.get(job_id)
+    return bool(job and job.batch_id and _worker_is_active(_batch_workers, job.batch_id))
+
+
+def _run_job_worker(job_id: str, mode: str) -> None:
+    try:
+        job_processor.process(job_id=job_id, mode=mode)
+    finally:
+        with _worker_registry_lock:
+            worker = _job_workers.get(job_id)
+            if worker is threading.current_thread():
+                _job_workers.pop(job_id, None)
+
+
+def _run_batch_worker(batch_id: str, mode: str) -> None:
+    try:
+        process_batch(batch_id=batch_id, mode=mode)
+    finally:
+        with _worker_registry_lock:
+            worker = _batch_workers.get(batch_id)
+            if worker is threading.current_thread():
+                _batch_workers.pop(batch_id, None)
+
+
+def start_job_worker(job_id: str, mode: str = "full") -> bool:
+    with _worker_registry_lock:
+        if _worker_is_active(_job_workers, job_id):
+            return False
+        worker = threading.Thread(
+            target=_run_job_worker,
+            kwargs={"job_id": job_id, "mode": mode},
+            daemon=True,
+            name=f"douyin-job-{job_id[:8]}-{mode}",
+        )
+        _job_workers[job_id] = worker
+        worker.start()
+        return True
+
+
+def start_batch_worker(batch_id: str, mode: str = "full") -> bool:
+    with _worker_registry_lock:
+        if _worker_is_active(_batch_workers, batch_id):
+            return False
+        worker = threading.Thread(
+            target=_run_batch_worker,
+            kwargs={"batch_id": batch_id, "mode": mode},
+            daemon=True,
+            name=f"douyin-batch-{batch_id[:8]}-{mode}",
+        )
+        _batch_workers[batch_id] = worker
+        worker.start()
+        return True
 
 
 def process_batch(batch_id: str, mode: str = "full") -> None:
@@ -313,6 +369,105 @@ def sanitize_cooldown_minutes(value: int, *, maximum: int) -> int:
     return max(0, min(int(value), maximum))
 
 
+class ApiRunOptions(BaseModel):
+    """启动任务的完整参数（表单与 JSON API 共用一份默认值）。"""
+
+    url_column: str
+    transcript_column: str = ""
+    model_names: str = DEFAULT_MODEL
+    overwrite: bool = False
+    download_only: bool = False
+    video_output_dir: str = ""
+    download_workers: int = DEFAULT_DOWNLOAD_WORKERS
+    asr_workers: int = DEFAULT_ASR_WORKERS
+    batch_delay_seconds: int = DEFAULT_BATCH_DELAY_SECONDS
+    anti_crawl_streak_threshold: int = ANTI_CRAWL_STREAK_THRESHOLD
+    anti_crawl_cooldown_minutes: int = ANTI_CRAWL_COOLDOWN_SECONDS // 60
+    proactive_cooldown_batch_threshold: int = PROACTIVE_COOLDOWN_BATCH_THRESHOLD
+    proactive_cooldown_minutes: int = PROACTIVE_COOLDOWN_SECONDS // 60
+
+
+_FORM_RUN_OPTION_FIELDS = (
+    "url_column",
+    "transcript_column",
+    "model_names",
+    "overwrite",
+    "download_only",
+    "video_output_dir",
+    "download_workers",
+    "asr_workers",
+    "batch_delay_seconds",
+    "anti_crawl_streak_threshold",
+    "anti_crawl_cooldown_minutes",
+    "proactive_cooldown_batch_threshold",
+    "proactive_cooldown_minutes",
+)
+
+
+def _form_run_options(scope: Dict[str, object]) -> SimpleNamespace:
+    """从表单端点的局部变量里挑出运行参数字段（四个端点参数名一致）。"""
+    return SimpleNamespace(**{name: scope[name] for name in _FORM_RUN_OPTION_FIELDS})
+
+
+def normalized_run_options(options) -> Dict[str, object]:
+    """把用户提交的运行参数清洗成 configure_job/configure_batch 的统一入参。"""
+    parsed_model_names = transcription_service.normalize_model_names(
+        str(options.model_names or "").strip()
+    )
+    return {
+        "url_column": options.url_column,
+        "transcript_column": str(options.transcript_column or "").strip() or DEFAULT_TRANSCRIPT_COLUMN,
+        "model_names_text": str(options.model_names or "").strip() or DEFAULT_MODEL,
+        "model_names": parsed_model_names,
+        "overwrite": bool(options.overwrite),
+        "download_only": bool(options.download_only),
+        "video_output_dir": str(options.video_output_dir or "").strip() or None,
+        "download_workers": sanitize_worker_count(int(options.download_workers), maximum=MAX_DOWNLOAD_WORKERS),
+        "asr_workers": sanitize_worker_count(int(options.asr_workers), maximum=MAX_ASR_WORKERS),
+        "batch_delay_seconds": sanitize_batch_delay(
+            int(options.batch_delay_seconds), maximum=MAX_BATCH_DELAY_SECONDS
+        ),
+        "anti_crawl_streak_threshold": sanitize_threshold(
+            int(options.anti_crawl_streak_threshold),
+            minimum=1,
+            maximum=MAX_ANTI_CRAWL_STREAK_THRESHOLD,
+        ),
+        "anti_crawl_cooldown_seconds": sanitize_cooldown_minutes(
+            int(options.anti_crawl_cooldown_minutes), maximum=MAX_COOLDOWN_MINUTES
+        )
+        * 60,
+        "proactive_cooldown_batch_threshold": sanitize_threshold(
+            int(options.proactive_cooldown_batch_threshold),
+            minimum=1,
+            maximum=MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
+        ),
+        "proactive_cooldown_seconds": sanitize_cooldown_minutes(
+            int(options.proactive_cooldown_minutes), maximum=MAX_COOLDOWN_MINUTES
+        )
+        * 60,
+    }
+
+
+def _configure_and_start_job(job_id: str, options, mode: str) -> bool:
+    """Atomically claim a job worker before resetting/configuring the job."""
+    with _worker_registry_lock:
+        if _job_start_conflict(job_id):
+            return False
+        job_manager.configure_job(job_id=job_id, **normalized_run_options(options))
+        start_job_worker(job_id, mode=mode)
+        return True
+
+
+def _configure_and_start_batch(batch_id: str, options, mode: str) -> bool:
+    """Atomically claim a batch worker before resetting/configuring the batch."""
+    with _worker_registry_lock:
+        if _worker_is_active(_batch_workers, batch_id):
+            return False
+        job_manager.configure_batch(batch_id=batch_id, **normalized_run_options(options))
+        start_batch_worker(batch_id, mode=mode)
+        return True
+
+
 def build_index_context(*, request: Request, batch=None, page_error: str = "") -> Dict[str, object]:
     return {
         "request": request,
@@ -433,48 +588,11 @@ async def run_job(
     if job.status == "running":
         return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
 
-    parsed_model_names = transcription_service.normalize_model_names(model_names.strip())
-    download_workers = sanitize_worker_count(download_workers, maximum=MAX_DOWNLOAD_WORKERS)
-    asr_workers = sanitize_worker_count(asr_workers, maximum=MAX_ASR_WORKERS)
-    batch_delay_seconds = sanitize_batch_delay(batch_delay_seconds, maximum=MAX_BATCH_DELAY_SECONDS)
-    anti_crawl_streak_threshold = sanitize_threshold(
-        anti_crawl_streak_threshold,
-        minimum=1,
-        maximum=MAX_ANTI_CRAWL_STREAK_THRESHOLD,
-    )
-    anti_crawl_cooldown_minutes = sanitize_cooldown_minutes(
-        anti_crawl_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
-    proactive_cooldown_batch_threshold = sanitize_threshold(
-        proactive_cooldown_batch_threshold,
-        minimum=1,
-        maximum=MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
-    )
-    proactive_cooldown_minutes = sanitize_cooldown_minutes(
-        proactive_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
+    if url_column not in job.columns:
+        raise HTTPException(status_code=409, detail="所选链接列不存在于该文件")
 
-    job_manager.configure_job(
-        job_id=job_id,
-        url_column=url_column,
-        transcript_column=transcript_column.strip() or DEFAULT_TRANSCRIPT_COLUMN,
-        model_names_text=model_names.strip() or DEFAULT_MODEL,
-        model_names=parsed_model_names,
-        overwrite=overwrite,
-        download_only=download_only,
-        video_output_dir=video_output_dir.strip() or None,
-        download_workers=download_workers,
-        asr_workers=asr_workers,
-        batch_delay_seconds=batch_delay_seconds,
-        anti_crawl_streak_threshold=anti_crawl_streak_threshold,
-        anti_crawl_cooldown_seconds=anti_crawl_cooldown_minutes * 60,
-        proactive_cooldown_batch_threshold=proactive_cooldown_batch_threshold,
-        proactive_cooldown_seconds=proactive_cooldown_minutes * 60,
-    )
-
-    start_job_worker(job_id, mode="full")
+    if not _configure_and_start_job(job_id, _form_run_options(locals()), mode="full"):
+        raise HTTPException(status_code=409, detail="任务或所属批次已有 worker 在运行")
 
     return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
 
@@ -509,46 +627,8 @@ async def run_batch(
     if url_column not in batch.common_columns:
         raise HTTPException(status_code=409, detail="所选链接列不在所有文件中都存在")
 
-    parsed_model_names = transcription_service.normalize_model_names(model_names.strip())
-    download_workers = sanitize_worker_count(download_workers, maximum=MAX_DOWNLOAD_WORKERS)
-    asr_workers = sanitize_worker_count(asr_workers, maximum=MAX_ASR_WORKERS)
-    batch_delay_seconds = sanitize_batch_delay(batch_delay_seconds, maximum=MAX_BATCH_DELAY_SECONDS)
-    anti_crawl_streak_threshold = sanitize_threshold(
-        anti_crawl_streak_threshold,
-        minimum=1,
-        maximum=MAX_ANTI_CRAWL_STREAK_THRESHOLD,
-    )
-    anti_crawl_cooldown_minutes = sanitize_cooldown_minutes(
-        anti_crawl_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
-    proactive_cooldown_batch_threshold = sanitize_threshold(
-        proactive_cooldown_batch_threshold,
-        minimum=1,
-        maximum=MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
-    )
-    proactive_cooldown_minutes = sanitize_cooldown_minutes(
-        proactive_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
-    job_manager.configure_batch(
-        batch_id=batch_id,
-        url_column=url_column,
-        transcript_column=transcript_column.strip() or DEFAULT_TRANSCRIPT_COLUMN,
-        model_names_text=model_names.strip() or DEFAULT_MODEL,
-        model_names=parsed_model_names,
-        overwrite=overwrite,
-        download_only=download_only,
-        video_output_dir=video_output_dir.strip() or None,
-        download_workers=download_workers,
-        asr_workers=asr_workers,
-        batch_delay_seconds=batch_delay_seconds,
-        anti_crawl_streak_threshold=anti_crawl_streak_threshold,
-        anti_crawl_cooldown_seconds=anti_crawl_cooldown_minutes * 60,
-        proactive_cooldown_batch_threshold=proactive_cooldown_batch_threshold,
-        proactive_cooldown_seconds=proactive_cooldown_minutes * 60,
-    )
-    start_batch_worker(batch_id, mode="full")
+    if not _configure_and_start_batch(batch_id, _form_run_options(locals()), mode="full"):
+        raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
     return RedirectResponse(url=f"/batches/{batch_id}", status_code=303)
 
 
@@ -582,46 +662,12 @@ async def continue_batch(
     if url_column not in batch.common_columns:
         raise HTTPException(status_code=409, detail="所选链接列不在所有文件中都存在")
 
-    parsed_model_names = transcription_service.normalize_model_names(model_names.strip())
-    download_workers = sanitize_worker_count(download_workers, maximum=MAX_DOWNLOAD_WORKERS)
-    asr_workers = sanitize_worker_count(asr_workers, maximum=MAX_ASR_WORKERS)
-    batch_delay_seconds = sanitize_batch_delay(batch_delay_seconds, maximum=MAX_BATCH_DELAY_SECONDS)
-    anti_crawl_streak_threshold = sanitize_threshold(
-        anti_crawl_streak_threshold,
-        minimum=1,
-        maximum=MAX_ANTI_CRAWL_STREAK_THRESHOLD,
-    )
-    anti_crawl_cooldown_minutes = sanitize_cooldown_minutes(
-        anti_crawl_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
-    proactive_cooldown_batch_threshold = sanitize_threshold(
-        proactive_cooldown_batch_threshold,
-        minimum=1,
-        maximum=MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
-    )
-    proactive_cooldown_minutes = sanitize_cooldown_minutes(
-        proactive_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
-    job_manager.configure_batch(
-        batch_id=batch_id,
-        url_column=url_column,
-        transcript_column=transcript_column.strip() or DEFAULT_TRANSCRIPT_COLUMN,
-        model_names_text=model_names.strip() or DEFAULT_MODEL,
-        model_names=parsed_model_names,
-        overwrite=overwrite,
-        download_only=download_only,
-        video_output_dir=video_output_dir.strip() or None,
-        download_workers=download_workers,
-        asr_workers=asr_workers,
-        batch_delay_seconds=batch_delay_seconds,
-        anti_crawl_streak_threshold=anti_crawl_streak_threshold,
-        anti_crawl_cooldown_seconds=anti_crawl_cooldown_minutes * 60,
-        proactive_cooldown_batch_threshold=proactive_cooldown_batch_threshold,
-        proactive_cooldown_seconds=proactive_cooldown_minutes * 60,
-    )
-    start_batch_worker(batch_id, mode="continue_existing")
+    if not _configure_and_start_batch(
+        batch_id,
+        _form_run_options(locals()),
+        mode="continue_existing",
+    ):
+        raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
     return RedirectResponse(url=f"/batches/{batch_id}", status_code=303)
 
 
@@ -649,13 +695,16 @@ async def resume_batch(batch_id: str):
     if batch.status != "paused":
         raise HTTPException(status_code=409, detail="当前批次不在暂停状态")
 
-    job_manager.queue_existing_batch(batch_id, "批次已恢复")
-    if batch.current_job_id:
-        current_job = job_manager.get(batch.current_job_id)
-        if current_job and current_job.status == "paused":
-            job_manager.clear_pause(batch.current_job_id)
-    job_manager.clear_batch_pause(batch_id)
-    start_batch_worker(batch_id, mode="resume")
+    with _worker_registry_lock:
+        if _worker_is_active(_batch_workers, batch_id):
+            raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
+        job_manager.queue_existing_batch(batch_id, "批次已恢复")
+        if batch.current_job_id:
+            current_job = job_manager.get(batch.current_job_id)
+            if current_job and current_job.status == "paused":
+                job_manager.clear_pause(batch.current_job_id)
+        job_manager.clear_batch_pause(batch_id)
+        start_batch_worker(batch_id, mode="resume")
     return JSONResponse({"ok": True})
 
 
@@ -766,8 +815,11 @@ async def resume_job(job_id: str):
     if job.status != "paused":
         raise HTTPException(status_code=409, detail="当前任务不在暂停状态")
 
-    job_manager.queue_existing_job(job_id, "任务已恢复")
-    start_job_worker(job_id, mode="resume")
+    with _worker_registry_lock:
+        if _job_start_conflict(job_id):
+            raise HTTPException(status_code=409, detail="任务已有 worker 在运行")
+        job_manager.queue_existing_job(job_id, "任务已恢复")
+        start_job_worker(job_id, mode="resume")
     return JSONResponse({"ok": True})
 
 
@@ -837,48 +889,15 @@ async def continue_job(
     if job.status == "running":
         return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
 
-    parsed_model_names = transcription_service.normalize_model_names(model_names.strip())
-    download_workers = sanitize_worker_count(download_workers, maximum=MAX_DOWNLOAD_WORKERS)
-    asr_workers = sanitize_worker_count(asr_workers, maximum=MAX_ASR_WORKERS)
-    batch_delay_seconds = sanitize_batch_delay(batch_delay_seconds, maximum=MAX_BATCH_DELAY_SECONDS)
-    anti_crawl_streak_threshold = sanitize_threshold(
-        anti_crawl_streak_threshold,
-        minimum=1,
-        maximum=MAX_ANTI_CRAWL_STREAK_THRESHOLD,
-    )
-    anti_crawl_cooldown_minutes = sanitize_cooldown_minutes(
-        anti_crawl_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
-    proactive_cooldown_batch_threshold = sanitize_threshold(
-        proactive_cooldown_batch_threshold,
-        minimum=1,
-        maximum=MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
-    )
-    proactive_cooldown_minutes = sanitize_cooldown_minutes(
-        proactive_cooldown_minutes,
-        maximum=MAX_COOLDOWN_MINUTES,
-    )
+    if url_column not in job.columns:
+        raise HTTPException(status_code=409, detail="所选链接列不存在于该文件")
 
-    job_manager.configure_job(
-        job_id=job_id,
-        url_column=url_column,
-        transcript_column=transcript_column.strip() or DEFAULT_TRANSCRIPT_COLUMN,
-        model_names_text=model_names.strip() or DEFAULT_MODEL,
-        model_names=parsed_model_names,
-        overwrite=overwrite,
-        download_only=download_only,
-        video_output_dir=video_output_dir.strip() or None,
-        download_workers=download_workers,
-        asr_workers=asr_workers,
-        batch_delay_seconds=batch_delay_seconds,
-        anti_crawl_streak_threshold=anti_crawl_streak_threshold,
-        anti_crawl_cooldown_seconds=anti_crawl_cooldown_minutes * 60,
-        proactive_cooldown_batch_threshold=proactive_cooldown_batch_threshold,
-        proactive_cooldown_seconds=proactive_cooldown_minutes * 60,
-    )
-
-    start_job_worker(job_id, mode="continue_existing")
+    if not _configure_and_start_job(
+        job_id,
+        _form_run_options(locals()),
+        mode="continue_existing",
+    ):
+        raise HTTPException(status_code=409, detail="任务或所属批次已有 worker 在运行")
     return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
 
 
@@ -892,8 +911,11 @@ async def retry_failed_job(job_id: str):
     if job.failed_rows <= 0:
         raise HTTPException(status_code=409, detail="当前没有可重试的失败项")
 
-    job_manager.queue_existing_job(job_id, "失败项重试中")
-    start_job_worker(job_id, mode="retry_failed")
+    with _worker_registry_lock:
+        if _job_start_conflict(job_id):
+            raise HTTPException(status_code=409, detail="任务已有 worker 在运行")
+        job_manager.queue_existing_job(job_id, "失败项重试中")
+        start_job_worker(job_id, mode="retry_failed")
     return JSONResponse({"ok": True})
 
 
@@ -941,6 +963,121 @@ async def batch_status(batch_id: str):
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
     return JSONResponse(build_batch_payload(batch_id))
+
+
+@app.get("/api/accounts")
+async def api_accounts():
+    return JSONResponse(build_cookie_pool_snapshot())
+
+
+@app.post("/api/preview")
+async def api_preview_csv(files: List[UploadFile] = File(...)):
+    """无头上传表格：返回 batch_id、每个文件的 job_id、表头和行数（JSON）。"""
+    valid_files = [file for file in files if file.filename]
+    if not valid_files:
+        raise HTTPException(status_code=400, detail="请先选择文件")
+
+    jobs = []
+    inspections = []
+    jobs_payload = []
+    for file in valid_files:
+        safe_name = Path(file.filename or "").name
+        save_path = save_upload_file(file)
+        with save_path.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+
+        try:
+            inspection = inspect_csv(save_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{safe_name}: {exc}")
+
+        resume_output_path = processed_output_path_for_filename(safe_name)
+        job = job_manager.create_session(
+            original_filename=safe_name,
+            upload_path=save_path,
+            columns=inspection.columns,
+            preview_rows=inspection.preview_rows,
+            row_count=inspection.row_count,
+            file_type=inspection.file_type,
+            resume_output_path=resume_output_path if resume_output_path.exists() else None,
+        )
+        inspections.append(inspection)
+        jobs.append(job)
+        jobs_payload.append(
+            {
+                "job_id": job.job_id,
+                "original_filename": job.original_filename,
+                "columns": inspection.columns,
+                "row_count": inspection.row_count,
+                "file_type": inspection.file_type,
+                "preview_rows": inspection.preview_rows,
+                "resume_output_path": str(job.resume_output_path) if job.resume_output_path else None,
+            }
+        )
+
+    batch = job_manager.create_batch(
+        jobs,
+        common_columns=compute_common_columns([inspection.columns for inspection in inspections]),
+    )
+    return JSONResponse(
+        {
+            "batch_id": batch.batch_id,
+            "common_columns": batch.common_columns,
+            "jobs": jobs_payload,
+        }
+    )
+
+
+def _start_job_from_api(job_id: str, options: ApiRunOptions, mode: str) -> Dict[str, object]:
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if job.status == "running":
+        return build_job_payload(job_id)
+    if options.url_column not in job.columns:
+        raise HTTPException(status_code=409, detail="所选链接列不存在于该文件")
+    if not _configure_and_start_job(job_id, options, mode=mode):
+        raise HTTPException(status_code=409, detail="任务或所属批次已有 worker 在运行")
+    return build_job_payload(job_id)
+
+
+def _start_batch_from_api(batch_id: str, options: ApiRunOptions, mode: str) -> Dict[str, object]:
+    batch = job_manager.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    if batch.status == "running":
+        return build_batch_payload(batch_id)
+    if not batch.common_columns:
+        raise HTTPException(status_code=409, detail="这批文件没有共同表头，无法统一配置")
+    if options.url_column not in batch.common_columns:
+        raise HTTPException(status_code=409, detail="所选链接列不在所有文件中都存在")
+    if not _configure_and_start_batch(batch_id, options, mode=mode):
+        raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
+    return build_batch_payload(batch_id)
+
+
+@app.post("/api/run/{job_id}")
+async def api_run_job(job_id: str, options: ApiRunOptions):
+    return JSONResponse(_start_job_from_api(job_id, options, mode="full"))
+
+
+@app.post("/api/jobs/{job_id}/continue")
+async def api_continue_job(job_id: str, options: ApiRunOptions):
+    return JSONResponse(_start_job_from_api(job_id, options, mode="continue_existing"))
+
+
+@app.post("/api/batches/{batch_id}/run")
+async def api_run_batch(batch_id: str, options: ApiRunOptions):
+    return JSONResponse(_start_batch_from_api(batch_id, options, mode="full"))
+
+
+@app.post("/api/batches/{batch_id}/continue")
+async def api_continue_batch(batch_id: str, options: ApiRunOptions):
+    return JSONResponse(_start_batch_from_api(batch_id, options, mode="continue_existing"))
 
 
 @app.get("/download/{job_id}")

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -2491,3 +2493,101 @@ def test_pipeline_download_only_fails_fast_when_video_dir_unwritable(tmp_path, m
     job = manager.require(session.job_id)
     assert job.status == "failed"
     assert any("视频保存目录不可用" in line for line in job.logs)
+
+
+def _download_only_job_fixture(tmp_path: Path, *, video_bytes: bytes, audio_bytes: bytes | None):
+    from types import SimpleNamespace
+
+    from app.pipeline import JobProcessor
+
+    row_dir = tmp_path / "row_00001"
+    row_dir.mkdir(parents=True)
+    video_path = row_dir / "source.mp4"
+    video_path.write_bytes(video_bytes)
+    audio_path = row_dir / "fallback_audio.m4a"
+    if audio_bytes is not None:
+        audio_path.write_bytes(audio_bytes)
+
+    job = SimpleNamespace(original_filename="links.csv")
+    task = SimpleNamespace(csv_row_number=2)
+    video = SimpleNamespace(title="demo", video_id="7411111111111111111")
+    return job, task, video, video_path, audio_path
+
+
+def test_save_download_only_prefers_audio_when_probe_fails(tmp_path, monkeypatch):
+    from app import pipeline as pipeline_module
+
+    class _BrokenProbeFfmpeg:
+        def probe_media(self, path):
+            raise RuntimeError("ffprobe 不可用")
+
+    job, task, video, video_path, audio_path = _download_only_job_fixture(
+        tmp_path, video_bytes=b"video-only", audio_bytes=b"audio"
+    )
+    monkeypatch.setattr(pipeline_module, "FfmpegService", _BrokenProbeFfmpeg)
+
+    saved = JobProcessor._save_download_only_video(
+        job, task, video, video_path, audio_path, tmp_path / "videos"
+    )
+
+    assert saved.suffix == ".m4a"
+    assert saved.read_bytes() == b"audio"
+
+
+def test_save_download_only_prefers_audio_when_video_has_no_frames(tmp_path, monkeypatch):
+    from app import pipeline as pipeline_module
+
+    class _AudioOnlyProbeFfmpeg:
+        def probe_media(self, path):
+            return {"streams": [{"codec_type": "audio"}]}
+
+    job, task, video, video_path, audio_path = _download_only_job_fixture(
+        tmp_path, video_bytes=b"audio-in-mp4", audio_bytes=b"audio"
+    )
+    monkeypatch.setattr(pipeline_module, "FfmpegService", _AudioOnlyProbeFfmpeg)
+
+    saved = JobProcessor._save_download_only_video(
+        job, task, video, video_path, audio_path, tmp_path / "videos"
+    )
+
+    assert saved.suffix == ".m4a"
+
+
+def test_save_download_only_prefers_audio_when_video_has_no_audio_stream(tmp_path, monkeypatch):
+    from app import pipeline as pipeline_module
+
+    class _VideoOnlyProbeFfmpeg:
+        def probe_media(self, path):
+            return {"streams": [{"codec_type": "video"}]}
+
+    job, task, video, video_path, audio_path = _download_only_job_fixture(
+        tmp_path, video_bytes=b"video-only", audio_bytes=b"audio"
+    )
+    monkeypatch.setattr(pipeline_module, "FfmpegService", _VideoOnlyProbeFfmpeg)
+
+    saved = JobProcessor._save_download_only_video(
+        job, task, video, video_path, audio_path, tmp_path / "videos"
+    )
+
+    assert saved.suffix == ".m4a"
+    assert saved.read_bytes() == b"audio"
+
+
+def test_save_download_only_keeps_merged_video(tmp_path, monkeypatch):
+    from app import pipeline as pipeline_module
+
+    class _MuxedProbeFfmpeg:
+        def probe_media(self, path):
+            return {"streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}
+
+    job, task, video, video_path, audio_path = _download_only_job_fixture(
+        tmp_path, video_bytes=b"merged", audio_bytes=b"audio"
+    )
+    monkeypatch.setattr(pipeline_module, "FfmpegService", _MuxedProbeFfmpeg)
+
+    saved = JobProcessor._save_download_only_video(
+        job, task, video, video_path, audio_path, tmp_path / "videos"
+    )
+
+    assert saved.suffix == ".mp4"
+    assert saved.read_bytes() == b"merged"

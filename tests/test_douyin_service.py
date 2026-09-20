@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import httpx
@@ -371,6 +373,7 @@ def test_parse_share_text_syncs_browser_cookies_to_http_client():
     service = DouyinService(
         client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
         browser_resolver=CookieResolver(),
+        browser_first=False,
         request_interval_range=(0.0, 0.0),
         sleep_fn=lambda _: None,
         jitter_fn=lambda a, b: 0.0,
@@ -562,3 +565,64 @@ def test_resolve_browser_preview_result_keeps_retryable_when_not_challenge():
     service.close()
 
     assert resolved is None
+
+
+def test_parse_share_text_browser_first_skips_direct_attempts():
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(str(request.url))
+        return httpx.Response(403, request=request)
+
+    resolver = FakeBrowserResolver()
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True),
+        browser_resolver=resolver,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    parsed = service.parse_share_text("https://www.douyin.com/video/7411111111111111111")
+    service.close()
+
+    assert parsed.resolved_by == "浏览器兜底"
+    assert parsed.download_url == "https://browser.example.com/video.mp4"
+    assert resolver.capture_calls == 1
+    assert seen_requests == []
+
+
+def test_download_video_browser_first_prefers_browser(tmp_path):
+    seen_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(str(request.url))
+        return httpx.Response(403, request=request)
+
+    resolver = FakeBrowserResolver()
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        browser_resolver=resolver,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    video = ParsedVideo(
+        video_id="7411111111111111111",
+        title="demo",
+        author="tester",
+        download_urls=("https://cdn.example.com/play/video_a.mp4",),
+        share_url="https://v.douyin.com/example/",
+        page_url="https://www.douyin.com/video/7411111111111111111",
+        resolved_by="解析接口",
+    )
+
+    output_path = tmp_path / "video.mp4"
+    result = service.download_video(video, output_path, tmp_path / "browser_audio.m4a")
+    service.close()
+
+    assert result.strategy == "浏览器兜底"
+    assert resolver.download_calls == 1
+    assert output_path.read_bytes() == b"browser-video"
+    assert seen_requests == []

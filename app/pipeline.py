@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import re
 import shutil
@@ -2037,6 +2039,25 @@ class JobProcessor:
         elif browser_audio_path.exists():
             source_path = browser_audio_path
             suffix = DOWNLOAD_ONLY_AUDIO_SUFFIX
+
+        # 分流视频没合并上音轨（合并失败 / ffmpeg 不可用）时退回保存纯音频 .m4a。
+        # 关键是检查视频文件是否已经包含音轨；只检查视频流会把无声的 video-only
+        # 文件误认为合并成功，最后生成一个静音 mp4。
+        if (
+            source_path == video_path
+            and browser_audio_path.exists()
+            and browser_audio_path.stat().st_size > 0
+        ):
+            try:
+                streams = FfmpegService().probe_media(video_path).get("streams") or []
+                has_video_stream = any(stream.get("codec_type") == "video" for stream in streams)
+                has_audio_stream = any(stream.get("codec_type") == "audio" for stream in streams)
+            except Exception:
+                has_video_stream = False
+                has_audio_stream = False
+            if not (has_video_stream and has_audio_stream):
+                source_path = browser_audio_path
+                suffix = DOWNLOAD_ONLY_AUDIO_SUFFIX
 
         if source_path is None:
             raise RowProcessingError("下载", "下载完成但没有找到可保存的媒体文件")

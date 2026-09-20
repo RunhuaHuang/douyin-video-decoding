@@ -1,158 +1,151 @@
 # 抖音文案提取工具
 
-一个独立的本地 Python Web 项目，只保留这一条链路：
+本地 Python 工具，链路：读取表格里的抖音链接 → 下载视频（浏览器优先 + 账号池会话）→ ffmpeg 抽音频 → MLX Whisper / SenseVoice 转写 → 写回表格。
 
-1. 从 CSV 或 XLSX 中读取你指定的抖音链接列
-2. 解析抖音链接并下载视频
-3. 用 FFmpeg 抽取音频
-4. 用 MLX Whisper 或 SenseVoice 转写
-5. 把转写文本写回同一行的指定视频文本列
+三种用法，按需选择：
 
-## 仅下载模式
+| 场景 | 入口 |
+|---|---|
+| 下载单个/少量视频 | 命令行 `uv run douyin-dl <链接>` |
+| 人工批量（浏览器界面） | `./run` 打开 WebUI |
+| 无人值守批量（脚本/Agent） | WebUI 的 JSON API，见「无头批量」 |
 
-如果你只想要批量下载视频、不需要转写，勾选页面上的 **「仅下载视频（跳过转写，保存到视频保存目录）」** 复选框：
+## 前置自检
 
-- 跳过抽音频和转写，也不需要安装 ffmpeg
-- 视频保存到 `output/videos/<原表格文件名>/row<行号>_<视频标题>.mp4`（浏览器兜底只捕获到音频流时保存 `.m4a`）
-- **视频保存目录**可以改成任意本机路径，比如 NAS 挂载路径 `/Volumes/电影/test`，留空则用默认的 `output/videos/`
-- 任务开始时会预检保存目录（不存在会自动创建；不可写则任务直接报错终止，不会跑一半才失败）
-- 文本列和模型名不用填
+```bash
+cd "/Users/runhua/Runhua MBP/Python/抖音文案提取工具"
+uv sync                                  # 依赖
+uv run playwright install chromium       # 浏览器兜底必需
+uv run douyin-dl --list-accounts         # 账号池：列出可用会话，空则见「登录抖音会话」
+uv run pytest                            # 全量测试
+```
+
+- ffmpeg：转写和长视频（音视频分离流）合并需要；`brew install ffmpeg`
+- 账号池为空时浏览器会话没有登录态，大部分视频会解析失败——先找人工执行 `./login`
+
+## 命令行下载（douyin-dl）
+
+```bash
+# 单个链接（jingxuan、/video/、短链、整段分享文案都可以）
+uv run douyin-dl "https://www.douyin.com/video/7687432578693284239"
+
+# 多个链接 + 自定义保存目录
+uv run douyin-dl "链接1" "链接2" -o /Volumes/电影/test
+```
+
+- 默认保存到 `output/downloads/<视频标题>.mp4`；只抓到音频流时保存 `.m4a`
+- 长视频（约 5 分钟以上）网页端是音视频分离流，会分别下载视频/音频流后用 ffmpeg 合并成单个 mp4
+- 退出码：全部成功 0，任一失败 1；逐条打印 `完成 链接 -> 路径` / `失败 链接: 原因`
+
+## WebUI 批量（人工使用）
+
+```bash
+./run        # 启动并自动打开浏览器
+# 或 uv run douyin-csv-webui 后手动访问 http://127.0.0.1:8000
+```
+
+1. 上传一个或多个 CSV / XLSX
+2. 选择抖音链接列，填写「视频文本列」列名和模型名（仅下载模式下都不用填）
+3. 勾选「仅下载视频（跳过转写）」可只下载不转写，视频保存目录可改任意本机路径（如 NAS）
+4. 批次页查看进度、暂停/继续、重试失败项、下载结果
+
+### 仅下载模式说明
+
+- 跳过抽音频和转写；短视频不需要 ffmpeg，长视频合并时需要，没装会退回保存 `.m4a` 纯音频
+- 视频保存到 `output/videos/<原表格文件名>/row<行号>_<视频标题>.mp4`
 - 反风控、账号池轮换、失败重试等逻辑与完整模式完全一致
-- 结果表格仍会输出到 `output/spreadsheet/`，只是不含转写文本列
+- 结果表格仍输出到 `output/spreadsheet/`，只是不含转写文本列
 
+## 无头批量（JSON API，脚本 / Agent 用）
 
-## 运行要求
-
-- macOS Apple Silicon
-- `ffmpeg` 已安装并可在终端直接运行
-- Python 3.9+
-- `uv` 已安装
-
-如果没装 `ffmpeg`：
+先起服务：`uv run douyin-csv-webui`（监听 `127.0.0.1:8000`）。完整链路四步：
 
 ```bash
-brew install ffmpeg
+# 1. 上传表格，拿 batch_id / job_id / 表头
+curl -s -F "files=@links.csv" http://127.0.0.1:8000/api/preview
+# → {"batch_id":"...", "common_columns":["链接",...], "jobs":[{"job_id":"...", "columns":[...], "row_count":10, ...}]}
+
+# 2. 启动整个批次（所有文件统一配置；也可以只跑单文件 POST /api/run/<job_id>）
+curl -s -X POST http://127.0.0.1:8000/api/batches/<batch_id>/run \
+  -H "Content-Type: application/json" \
+  -d '{"url_column":"链接","download_only":true}'
+
+# 3. 轮询状态（status: uploaded → running → completed / failed / paused；进度看 processed_rows/total_rows）
+curl -s http://127.0.0.1:8000/api/batches/<batch_id>
+curl -s http://127.0.0.1:8000/api/jobs/<job_id>       # 单文件，含逐行日志 logs
+
+# 4. 下载结果（批次为 zip，单文件为处理后的 CSV）
+curl -sO http://127.0.0.1:8000/download/batches/<batch_id>
+curl -sO http://127.0.0.1:8000/download/<job_id>
 ```
 
-## 安装依赖
+启动参数（`/api/run/{job_id}`、`/api/batches/{batch_id}/run`、两者 `/continue` 变体的 JSON body）：
 
-```bash
-cd "/Users/runhua/Desktop/文本转录/douyin-creator-toolkit/抖音文案提取工具"
-uv sync
-uv run playwright install chromium
-```
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `url_column` | str | 必填 | 哪一列是抖音链接 |
+| `transcript_column` | str | `视频文本` | 转写写回的列（仅下载模式不用填） |
+| `model_names` | str | `FunAudioLLM/SenseVoiceSmall` | 模型名，逗号分隔可多个 |
+| `overwrite` | bool | false | 覆盖已有转写文本 |
+| `download_only` | bool | false | 仅下载模式 |
+| `video_output_dir` | str | 空→`output/videos/` | 仅下载模式的视频保存目录，可填 NAS 挂载路径 |
+| `download_workers` | int | 2 | 下载并发（上限 8） |
+| `asr_workers` | int | 1 | 转写并发（上限 4） |
+| `batch_delay_seconds` | int | 8 | 批间隔秒数（上限 30） |
+| `anti_crawl_streak_threshold` | int | 6 | 强风控连续批次切换阈值 |
+| `anti_crawl_cooldown_minutes` | int | 60 | 风控冷却时长 |
+| `proactive_cooldown_batch_threshold` | int | 20 | 主动冷却触发批次阈值 |
+| `proactive_cooldown_minutes` | int | 30 | 主动冷却时长 |
 
-## 启动 WebUI
+其他控制端点（POST，无 body 或表单）：
 
-```bash
-uv run douyin-csv-webui
-```
+| 端点 | 作用 |
+|---|---|
+| `POST /jobs/{id}/pause` `/resume` | 暂停/继续（批次：`/batches/{id}/pause` 等） |
+| `POST /jobs/{id}/skip-cooldown` | 跳过当前风控冷却 |
+| `POST /jobs/{id}/switch-cookie` | 强制切换 cookies（当前批结束后生效） |
+| `POST /jobs/{id}/retry-failed` | 重试失败项 |
+| `GET /api/accounts` | 账号池快照（可用会话、预警状态） |
+| `GET /health` | ffmpeg / MLX / 模型就绪状态 |
 
-启动后打开：
+`/continue` 变体（`POST /api/jobs/{id}/continue`、`POST /api/batches/{id}/continue`）沿用已有输出文件续跑，参数同上。
 
-```text
-http://127.0.0.1:8000
-```
+## 登录抖音会话（需要人工）
 
-## 登录抖音会话
-
-程序不会自动帮你“登录抖音账号”。如果你想让浏览器兜底和直连接口复用账号池里的会话，请手动添加一个或多个账号：
-
-```bash
-./login "主号"
-./login "小号A"
-```
-
-执行后会打开一个 Chromium 窗口：
-
-1. 在窗口里登录抖音，或者完成验证码
-2. 完成后回到终端按回车
-3. 程序会把会话保存到 `tmp/browser/accounts/<备注>.json`
-
-后续再运行：
-
-```bash
-uv run douyin-csv-webui
-```
-
-WebUI 和浏览器兜底会自动从账号池中轮换使用这些会话。
-
-## 快捷命令
-
-在项目目录里可以直接使用：
-
-```bash
-./run
-```
-
-它会直接启动 WebUI，并自动打开浏览器访问：
-
-```text
-http://127.0.0.1:8000
-```
-
-如果你想新增一个账号或替换某个备注对应的 cookies：
+程序不会自动登录。账号池为空时请人工执行：
 
 ```bash
 ./login "主号"
 ```
 
-如果备注已存在，会覆盖对应账号的状态，并清除该账号的“预警 / 已剔除”标记。
+会打开 Chromium：登录抖音或完成验证码 → 回终端按回车 → 会话保存到 `tmp/browser/accounts/<备注>.json`。之后 WebUI、CLI 和浏览器兜底会自动轮换使用这些会话。备注已存在则覆盖并清除预警标记。
 
-## 使用方式
+## 输出位置
 
-1. 一次上传一个或多个 CSV / XLSX 文件
-2. 统一选择哪一列是抖音链接列
-3. 填写要写回的“视频文本列”列名（仅下载模式下不用填）
-4. 填写一个或多个模型名（仅下载模式下不用填）
-5. 点击开始执行
-6. 在批次页查看每个文件的进度，并分别下载当前结果文件
+| 内容 | 位置 |
+|---|---|
+| CLI 下载的视频 | `output/downloads/` |
+| 仅下载模式的视频 | `output/videos/<表格文件名>/row<行号>_<标题>.mp4` |
+| 结果表格（含转写列） | `output/spreadsheet/` |
+| 上传与中间文件 | `tmp/spreadsheets/` |
+| 账号池会话 | `tmp/browser/accounts/` |
 
 ## 说明
 
-- 你可以把整段抖音分享文本放进单元格，不一定非要纯 URL。
-- 支持一次性上传多个文件，程序会按照上传顺序逐个处理。
-- 如果“视频文本列”不存在，程序会自动新建这一列。
-- 默认不会覆盖已有文本；如果要覆盖，勾选页面上的复选框。
-- 如果填写多个模型，每个模型会写入一个单独的输出列，方便横向对比效果。
-- SenseVoice 首次运行除了主模型外，还会额外下载一个 VAD 模型。
-- 输出 CSV 会额外写入 `处理状态`、`失败原因`、`尝试次数`。
-- 如果输入是 XLSX，输出也会保持为 XLSX。
-- 删除视频会直接写入 `已删除`，不再重复重试。
-- 连续两次命中 `HTTP 403 Forbidden x2, 浏览器兜底失败: 浏览器兜底下载失败: HTTP 403 x2` 会直接标记为 `无法下载`，不再重复重试。
-- 图文 `note` 链接会直接标记为 `非视频`，不参与重试。
-- 即使原始链接写着 `/video/`，如果浏览器最终落到 `/note/` 页面，也会按 `非视频` 处理。
-- 连续两次命中 `返回内容不是有效视频, HTTP 404 Not Found, 浏览器兜底失败: 浏览器兜底下载失败: 返回内容不是有效媒体, HTTP 404` 也会直接标记为 `非视频`。
-- 程序会先扫完整个 CSV，再分批重试失败项；默认每批最多处理 10 行。
-- 当前会直接标记为 `已删除` 的情况包括：解析结果明确返回删除视频，或错误里出现 `分享页: 分享页中未找到视频详情`。
-- `已删除` 结果会打破当前的弱风控累计，后续弱风控信号会重新开始计数。
-- 当前会计入弱风控阈值的情况包括：`分享页: 分享页中未找到 _ROUTER_DATA` 且 `iteminfo/detail API Expecting value...`，以及浏览器兜底仅捕获到预览片段、未捕获到真实视频地址、部分 DNS/断网/证书/连接拒绝错误。
-- 弱风控阈值只统计前两次尝试；从第 3 次尝试开始，这类结果不再继续累计到冷却阈值。
-- `强冷却信号：验证码挑战页` 不计入弱风控阈值，但仍会参与强信号 strike 和 cookies 预警/切换逻辑。
-- 默认每处理 30 个内部批次会自动切换到下一份可用 cookies；重试轮次也会计入这个累计值。
-- 主任务阶段如果连续 6 个内部批次命中强风控/验证码，会提前切换 cookies；重试阶段会放宽到连续 20 个内部批次再切换。
-- 弱信号不会直接切换 cookies，仍然只参与现有的冷却逻辑。
-- 如果某份 cookies 多次达到“强信号切换阈值”，程序会把该账号标记为“预警”，默认不再优先使用。
-- 如果所有未剔除账号都处于预警状态，程序会继续轮流使用这些预警账号，避免任务停下来。
-- 程序不会自动剔除账号。是否剔除由你在 WebUI 手动决定。
-- 账号池表格里提供两个操作按钮：`剔除` 和 `重新登录`。点击 `重新登录` 会打开新的 Chromium 登录窗口，登录完成后直接关闭该窗口即可自动保存并恢复账号状态。
-- 任务页和批次页都提供“强制切换 cookies”按钮，切换会在当前批结束后生效；暂停状态下可立即切换。
-- 单文件页面支持暂停、继续、重试失败项；批次页面支持按文件查看状态并下载当前结果。
-- 下载层会优先尝试多个直链地址和多组浏览器请求头；如果仍然被拦截，会自动切到 Playwright 浏览器会话兜底。
-- 输出文件保存在 `output/spreadsheet/`。
-- 上传和中间文件会放在 `tmp/spreadsheets/`。
+- 单元格里可以放整段抖音分享文本，不一定要纯 URL。
+- 图文 `note` 链接直接标记 `非视频`；即使链接写着 `/video/`，最终落到 `/note/` 页也按 `非视频` 处理。
+- 明确删除的视频写 `已删除`；连续两次 403 或 404 类失败直接标记 `无法下载`/`非视频`，不再重复重试。
+- 下载层默认**浏览器优先**：直接用账号池会话走 Playwright 解析和下载，跳过直连接口尝试（直连近年基本都被 403）；浏览器不可用时自动退回直连链路。想恢复旧的「直连优先」，把 `app/config.py` 的 `DOUYIN_BROWSER_FIRST` 改为 `False`。
+- 默认每处理 30 个内部批次自动切换下一份可用 cookies；主任务阶段连续 6 个批次命中强风控会提前切换，重试阶段放宽到 20。
+- 弱风控信号只参与冷却计数；强冷却（验证码挑战页）不计入弱阈值但参与 cookies 预警/切换。
+- 多次达到强信号切换阈值的账号标记「预警」，仍会轮流使用避免任务停摆；是否剔除由人在 WebUI 决定。
+- 默认不覆盖已有转写文本；多个模型各写一列方便对比。
+- 输出结果统一为 `*.processed.csv`，并额外写入 `处理状态`、`失败原因`、`尝试次数`；XLSX 输入会先读取后输出为 CSV。
+- 先扫完整个表格再分批重试失败项，默认每批 10 行。
 
 ## 默认模型
 
-默认使用：
-
-```text
-FunAudioLLM/SenseVoiceSmall
-```
-
-你也可以在页面上手动改成别的 MLX Whisper 或 SenseVoice 模型名。
-
-建议对比：
+默认 `FunAudioLLM/SenseVoiceSmall`。可对比：
 
 ```text
 mlx-community/whisper-large-v3-turbo
@@ -160,7 +153,7 @@ mlx-community/whisper-large-v3-mlx
 FunAudioLLM/SenseVoiceSmall
 ```
 
-通常 `large-v3-mlx` 会比 `turbo` 更稳一些，但速度更慢。`SenseVoiceSmall` 在中文口语上往往值得一起对比。
+通常 `large-v3-mlx` 更稳但更慢；`SenseVoiceSmall` 中文口语自然，首次运行会额外下载 VAD 模型。
 
 ## 测试
 

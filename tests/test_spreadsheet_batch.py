@@ -455,3 +455,260 @@ def test_relogin_endpoint_allows_restart_when_thread_is_still_tracked(tmp_path, 
 
     assert response.status_code == 200
     assert captured == {"account_id": "demo"}
+
+
+def test_api_preview_returns_batch_and_jobs_json(tmp_path, monkeypatch):
+    from app import main as main_module
+
+    csv_path = tmp_path / "links.csv"
+    csv_path.write_text("链接\nhttps://v.douyin.com/AAA111/\n", encoding="utf-8")
+
+    manager = JobManager()
+    previous_manager = main_module.job_manager
+    main_module.job_manager = manager
+    try:
+        client = TestClient(app)
+        with csv_path.open("rb") as handle:
+            response = client.post("/api/preview", files={"files": ("links.csv", handle, "text/csv")})
+    finally:
+        main_module.job_manager = previous_manager
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["batch_id"]
+    assert payload["common_columns"] == ["链接"]
+    assert len(payload["jobs"]) == 1
+    job = payload["jobs"][0]
+    assert job["job_id"]
+    assert job["columns"] == ["链接"]
+    assert job["row_count"] == 1
+
+
+def test_api_run_job_configures_and_starts_full_mode(monkeypatch):
+    manager = JobManager()
+    job = manager.create_session(
+        original_filename="1.csv",
+        upload_path=Path("dummy-a"),
+        columns=["链接"],
+        preview_rows=[],
+        row_count=10,
+    )
+
+    from app import main as main_module
+
+    previous_manager = main_module.job_manager
+    previous_worker = main_module.start_job_worker
+    captured: dict[str, str] = {}
+    main_module.job_manager = manager
+    main_module.start_job_worker = lambda job_id, mode="full": captured.update(job_id=job_id, mode=mode)
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/api/run/{job.job_id}",
+            json={"url_column": "链接", "download_only": True},
+        )
+    finally:
+        main_module.job_manager = previous_manager
+        main_module.start_job_worker = previous_worker
+
+    assert response.status_code == 200
+    assert captured == {"job_id": job.job_id, "mode": "full"}
+    payload = response.json()
+    assert payload["job_id"] == job.job_id
+    assert manager.require(job.job_id).download_only is True
+
+
+def test_api_run_job_rejects_unknown_url_column(monkeypatch):
+    manager = JobManager()
+    job = manager.create_session(
+        original_filename="1.csv",
+        upload_path=Path("dummy-a"),
+        columns=["链接"],
+        preview_rows=[],
+        row_count=10,
+    )
+
+    from app import main as main_module
+
+    previous_manager = main_module.job_manager
+    previous_worker = main_module.start_job_worker
+    main_module.job_manager = manager
+    main_module.start_job_worker = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("invalid input must not start a worker")
+    )
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/api/run/{job.job_id}",
+            json={"url_column": "不存在的列"},
+        )
+    finally:
+        main_module.job_manager = previous_manager
+        main_module.start_job_worker = previous_worker
+
+    assert response.status_code == 409
+    assert "不存在" in response.json()["detail"]
+
+
+def test_api_run_job_does_not_reset_job_when_worker_is_active(monkeypatch):
+    manager = JobManager()
+    job = manager.create_session(
+        original_filename="1.csv",
+        upload_path=Path("dummy-a"),
+        columns=["链接"],
+        preview_rows=[],
+        row_count=10,
+    )
+
+    from app import main as main_module
+
+    class _AliveWorker:
+        def is_alive(self):
+            return True
+
+    previous_manager = main_module.job_manager
+    previous_worker = main_module.start_job_worker
+    main_module.job_manager = manager
+    main_module._job_workers[job.job_id] = _AliveWorker()
+    main_module.start_job_worker = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("an active worker must not be started twice")
+    )
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/api/run/{job.job_id}",
+            json={"url_column": "链接", "download_only": True},
+        )
+    finally:
+        main_module._job_workers.pop(job.job_id, None)
+        main_module.job_manager = previous_manager
+        main_module.start_job_worker = previous_worker
+
+    assert response.status_code == 409
+    assert manager.require(job.job_id).status == "uploaded"
+
+
+def test_api_run_job_rejects_job_owned_by_running_batch(monkeypatch):
+    manager = JobManager()
+    job = manager.create_session(
+        original_filename="1.csv",
+        upload_path=Path("dummy-a"),
+        columns=["链接"],
+        preview_rows=[],
+        row_count=10,
+    )
+    batch = manager.create_batch([job], common_columns=["链接"])
+
+    from app import main as main_module
+
+    class _AliveWorker:
+        def is_alive(self):
+            return True
+
+    previous_manager = main_module.job_manager
+    previous_worker = main_module.start_job_worker
+    main_module.job_manager = manager
+    main_module._batch_workers[batch.batch_id] = _AliveWorker()
+    main_module.start_job_worker = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("a job inside a running batch must not start independently")
+    )
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/api/run/{job.job_id}",
+            json={"url_column": "链接", "download_only": True},
+        )
+    finally:
+        main_module._batch_workers.pop(batch.batch_id, None)
+        main_module.job_manager = previous_manager
+        main_module.start_job_worker = previous_worker
+
+    assert response.status_code == 409
+    assert "所属批次" in response.json()["detail"]
+    assert manager.require(job.job_id).status == "uploaded"
+
+
+def test_api_run_batch_rejects_unknown_url_column(monkeypatch):
+    manager = JobManager()
+    job = manager.create_session(
+        original_filename="1.csv",
+        upload_path=Path("dummy-a"),
+        columns=["链接"],
+        preview_rows=[],
+        row_count=10,
+    )
+    batch = manager.create_batch([job], common_columns=["链接"])
+
+    from app import main as main_module
+
+    previous_manager = main_module.job_manager
+    previous_worker = main_module.start_batch_worker
+    main_module.job_manager = manager
+    main_module.start_batch_worker = lambda batch_id, mode="full": None
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/api/batches/{batch.batch_id}/run",
+            json={"url_column": "不存在的列"},
+        )
+    finally:
+        main_module.job_manager = previous_manager
+        main_module.start_batch_worker = previous_worker
+
+    assert response.status_code == 409
+    assert "不在所有文件中都存在" in response.json()["detail"]
+
+
+def test_api_accounts_returns_pool_snapshot(monkeypatch):
+    from app import main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "build_cookie_pool_snapshot",
+        lambda current_account_id="": {"accounts": [], "current_account_id": ""},
+    )
+
+    client = TestClient(app)
+    response = client.get("/api/accounts")
+
+    assert response.status_code == 200
+    assert response.json() == {"accounts": [], "current_account_id": ""}
+
+
+def test_run_job_endpoint_configures_and_starts_full_mode(monkeypatch):
+    manager = JobManager()
+    job = manager.create_session(
+        original_filename="1.csv",
+        upload_path=Path("dummy-a"),
+        columns=["链接"],
+        preview_rows=[],
+        row_count=10,
+    )
+
+    from app import main as main_module
+
+    previous_manager = main_module.job_manager
+    previous_worker = main_module.start_job_worker
+    captured: dict[str, str] = {}
+    main_module.job_manager = manager
+    main_module.start_job_worker = lambda job_id, mode="full": captured.update(job_id=job_id, mode=mode)
+    try:
+        client = TestClient(app)
+        response = client.post(
+            f"/run/{job.job_id}",
+            data={
+                "url_column": "链接",
+                "transcript_column": "视频文本",
+                "model_names": "FunAudioLLM/SenseVoiceSmall",
+                "download_only": "true",
+            },
+        )
+    finally:
+        main_module.job_manager = previous_manager
+        main_module.start_job_worker = previous_worker
+
+    assert response.status_code == 200 or response.status_code == 303
+    assert captured == {"job_id": job.job_id, "mode": "full"}
+    configured = manager.require(job.job_id)
+    assert configured.download_only is True
+    assert configured.transcript_column == "视频文本"

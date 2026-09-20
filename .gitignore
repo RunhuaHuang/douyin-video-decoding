@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 output/
 tmp/
+.v2c/
+out/

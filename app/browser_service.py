@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import random
 import re
@@ -189,13 +191,19 @@ class PlaywrightFallback:
         audio_output_path: Path | None = None,
     ) -> BrowserDownloadResult:
         capture = self.capture_video(share_url)
-        urls = self._prioritize_video_urls([*capture.video_urls, *candidate_urls])
-        if not urls:
-            raise RuntimeError("浏览器兜底未捕获到可下载的视频地址")
+        all_urls = [*capture.video_urls, *candidate_urls]
+        # 网页端长视频是音视频分离流，音频流 URL 的 query 常带 mime_type=video_mp4，
+        # 必须按 media-audio 路径特征分流，否则纯音频会被当成视频存下来
+        video_candidates = self._prioritize_video_urls(
+            [url for url in all_urls if not self._is_audio_like_url(url)]
+        )
+        audio_candidates = self._dedupe_urls(
+            [url for url in all_urls if self._is_audio_like_url(url)]
+            + list(capture.audio_urls)
+        )
 
-        require_embedded_audio = audio_output_path is not None and not capture.audio_urls
-        source_url, attempts = self._download_candidate_urls(
-            urls=urls,
+        require_embedded_audio = audio_output_path is not None and not audio_candidates
+        download_kwargs = dict(
             output_path=output_path,
             referer=capture.page_url,
             accept="video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8",
@@ -203,17 +211,36 @@ class PlaywrightFallback:
             validator=self._looks_like_media_payload,
             empty_error="浏览器兜底未捕获到可下载的视频地址",
             fail_error_prefix="浏览器兜底下载失败",
-            post_validator=self._video_file_has_audio if require_embedded_audio else None,
-            post_validation_error="视频不含音轨",
         )
+        # 第一遍要求文件里有视频画面；全部失败再退回旧的宽松校验兜底。
+        # 两遍都只能尝试视频候选，音频流必须走下面独立的音频下载路径。
+        post_validator = self._video_file_has_audio if require_embedded_audio else self._video_file_has_stream
+        post_validation_error = "视频不含音轨" if require_embedded_audio else "下载结果不含视频画面"
+        try:
+            source_url, attempts = self._download_candidate_urls(
+                urls=video_candidates,
+                post_validator=post_validator,
+                post_validation_error=post_validation_error,
+                **download_kwargs,
+            )
+        except Exception:
+            source_url, attempts = self._download_candidate_urls(
+                urls=video_candidates,
+                post_validator=self._video_file_has_audio if require_embedded_audio else None,
+                post_validation_error="视频不含音轨",
+                **download_kwargs,
+            )
 
         audio_source_url = ""
         audio_attempts = 0
-        if audio_output_path is not None and capture.audio_urls:
+        if audio_candidates:
+            audio_target = audio_output_path or output_path.with_name(
+                f"{output_path.stem}_browser_audio.m4a"
+            )
             try:
                 audio_source_url, audio_attempts = self._download_candidate_urls(
-                    urls=capture.audio_urls,
-                    output_path=audio_output_path,
+                    urls=audio_candidates,
+                    output_path=audio_target,
                     referer=capture.page_url,
                     accept="audio/aac,audio/mp4,audio/*;q=0.9,*/*;q=0.8",
                     destination="audio",
@@ -221,10 +248,16 @@ class PlaywrightFallback:
                     empty_error="浏览器兜底未捕获到可下载的音频地址",
                     fail_error_prefix="浏览器兜底音频下载失败",
                 )
-            except Exception as exc:
-                audio_output_path.unlink(missing_ok=True)
+            except Exception:
+                audio_target.unlink(missing_ok=True)
                 audio_source_url = ""
                 audio_attempts = 0
+            else:
+                self._merge_audio_if_needed(
+                    output_path,
+                    audio_target,
+                    owns_audio_file=audio_output_path is None,
+                )
 
         return BrowserDownloadResult(
             source_url=source_url,
@@ -233,6 +266,26 @@ class PlaywrightFallback:
             audio_source_url=audio_source_url,
             audio_attempts=audio_attempts,
         )
+
+    def _merge_audio_if_needed(
+        self,
+        video_path: Path,
+        audio_path: Path,
+        *,
+        owns_audio_file: bool,
+    ) -> None:
+        """分流视频不含音轨时合并成单个 mp4；合并失败则保留原样由上层兜底。"""
+        if not video_path.exists() or not audio_path.exists():
+            return
+        try:
+            if not self._video_file_has_audio(video_path):
+                merged = FfmpegService()._merge_supplemental_audio(video_path, audio_path)
+                merged.replace(video_path)
+        except Exception:
+            return
+        finally:
+            if owns_audio_file:
+                audio_path.unlink(missing_ok=True)
 
     def status(self) -> str:
         try:
@@ -295,9 +348,21 @@ class PlaywrightFallback:
             self._playwright = None
 
     @staticmethod
-    def _looks_like_video(url: str, content_type: str) -> bool:
+    def _is_audio_like_url(url: str) -> bool:
+        lowered = (url or "").lower()
+        return (
+            "media-audio" in lowered
+            or "mime_type=audio" in lowered
+            or "audio_type" in lowered
+            or lowered.endswith((".m4a", ".mp3", ".aac"))
+        )
+
+    @classmethod
+    def _looks_like_video(cls, url: str, content_type: str) -> bool:
         lowered_type = (content_type or "").lower()
         lowered_url = url.lower()
+        if cls._is_audio_like_url(lowered_url):
+            return False
         return (
             "video" in lowered_type
             or "mime_type=video_mp4" in lowered_url
@@ -318,16 +383,10 @@ class PlaywrightFallback:
             or "tos-cn-ve" in lowered
         ) and not PlaywrightFallback._is_preview_video_url(lowered)
 
-    @staticmethod
-    def _looks_like_audio(url: str, content_type: str) -> bool:
+    @classmethod
+    def _looks_like_audio(cls, url: str, content_type: str) -> bool:
         lowered_type = (content_type or "").lower()
-        lowered_url = url.lower()
-        return (
-            "audio" in lowered_type
-            or "mime_type=audio" in lowered_url
-            or "audio_type" in lowered_url
-            or lowered_url.endswith((".m4a", ".mp3", ".aac"))
-        )
+        return "audio" in lowered_type or cls._is_audio_like_url(url)
 
     @staticmethod
     def _looks_like_media_payload(payload: bytes, content_type: str, url: str) -> bool:
@@ -471,6 +530,8 @@ class PlaywrightFallback:
     @staticmethod
     def _video_url_priority(url: str) -> tuple[int, int]:
         lowered = (url or "").lower()
+        if PlaywrightFallback._is_audio_like_url(lowered):
+            return (9, len(lowered))
         if "douyinvod.com" in lowered and "mime_type=video_mp4" in lowered:
             return (0, len(lowered))
         if "douyinvod.com" in lowered or "tos-cn-ve" in lowered:
@@ -602,10 +663,14 @@ class PlaywrightFallback:
         )
 
     @staticmethod
-    def _video_file_has_audio(path: Path) -> bool:
+    def _video_file_has_stream(path: Path, codec_type: str = "video") -> bool:
         try:
             probe = FfmpegService().probe_media(path)
         except Exception:
             return False
         streams = probe.get("streams") or []
-        return any(stream.get("codec_type") == "audio" for stream in streams)
+        return any(stream.get("codec_type") == codec_type for stream in streams)
+
+    @classmethod
+    def _video_file_has_audio(cls, path: Path) -> bool:
+        return cls._video_file_has_stream(path, "audio")

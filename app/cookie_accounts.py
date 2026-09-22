@@ -1,11 +1,15 @@
 import json
+import os
 import re
+import shutil
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
+from uuid import uuid4
 
+from .account_storage import account_storage_lock, deleted_marker_path
 from .config import (
     BROWSER_ACCOUNTS_DIR,
     COOKIE_INVALIDATION_STRIKE_THRESHOLD,
@@ -24,6 +28,10 @@ def _sanitize_account_id(label: str) -> str:
     normalized = re.sub(r"\s+", "-", normalized)
     normalized = normalized.strip("._-")
     return normalized or "cookie-account"
+
+
+class AccountMetadataError(RuntimeError):
+    """账号信息不可读；普通更新保留现场，显式重新登录才允许备份后重建。"""
 
 
 @dataclass(frozen=True)
@@ -50,11 +58,14 @@ class CookieAccount:
     cookie_count: int = 0
     has_state: bool = False
     has_usable_state: bool = False
+    metadata_error: str = ""
 
     @property
     def status_text(self) -> str:
         if self.relogin_in_progress:
             return "重新登录中"
+        if self.metadata_error:
+            return "信息损坏"
         if self.invalid:
             return "已剔除"
         if self.warning:
@@ -89,6 +100,7 @@ class CookieAccount:
             "cookie_count": self.cookie_count,
             "has_state": self.has_state,
             "has_usable_state": self.has_usable_state,
+            "metadata_error": self.metadata_error,
             "status_text": self.status_text,
             "is_current": is_current,
             "is_next": is_next,
@@ -128,18 +140,23 @@ class CookieAccountManager:
             base_account_id = _sanitize_account_id(normalized_label)
             account_id = base_account_id
             suffix = 2
-            while self._metadata_path(account_id).exists() or self._state_path(account_id).exists():
+            while (
+                self._metadata_path(account_id).exists()
+                or self._state_path(account_id).exists()
+                or deleted_marker_path(self._state_path(account_id)).exists()
+            ):
                 account_id = f"{base_account_id}-{suffix}"
                 suffix += 1
 
             metadata = self._default_metadata(account_id=account_id, label=normalized_label)
-            self._write_metadata(account_id, metadata)
+            if not self._write_metadata(account_id, metadata):
+                raise RuntimeError("该账号已删除，请重新新增账号")
             return self._load_account(account_id)
 
     def record_login(self, account_id: str, *, label: Optional[str] = None) -> CookieAccount:
         with self._lock:
             account = self._load_account(account_id)
-            metadata = self._read_metadata(account.metadata_path)
+            metadata = self._read_metadata_for_relogin(account)
             metadata["label"] = str(label or account.label).strip() or account.label
             metadata["updated_at"] = _utcnow_iso()
             metadata["invalid"] = False
@@ -152,7 +169,8 @@ class CookieAccountManager:
             metadata["last_issue_reason"] = ""
             metadata["last_issue_at"] = ""
             metadata["relogin_in_progress"] = False
-            self._write_metadata(account_id, metadata)
+            if not self._write_metadata(account_id, metadata):
+                raise RuntimeError("该账号已删除，登录会话未保存")
             return self._load_account(account_id)
 
     def list_accounts(self, *, include_legacy: bool = False) -> List[CookieAccount]:
@@ -162,6 +180,8 @@ class CookieAccountManager:
             for metadata_path in sorted(self.accounts_dir.glob("*.meta.json")):
                 account_id = metadata_path.name[: -len(".meta.json")]
                 state_path = self._state_path(account_id)
+                if deleted_marker_path(state_path).exists():
+                    continue
                 if account_id == "__legacy_default__" and (
                     not include_legacy or state_path != self.legacy_storage_state_path
                 ):
@@ -172,14 +192,22 @@ class CookieAccountManager:
             for state_path in sorted(self.accounts_dir.glob("*.json")):
                 if state_path.name.endswith(".meta.json"):
                     continue
+                # relogin 的中间产物（如 xxx.tmp.json）不是孤儿账号，不收养
+                if ".tmp" in state_path.name:
+                    continue
                 account_id = state_path.stem
-                if account_id in known_ids:
+                if account_id in known_ids or deleted_marker_path(state_path).exists():
                     continue
                 metadata = self._default_metadata(account_id=account_id, label=account_id)
-                self._write_metadata(account_id, metadata)
+                if not self._write_metadata(account_id, metadata):
+                    continue
                 accounts.append(self._load_account(account_id))
 
-            if include_legacy and self.legacy_storage_state_path.exists():
+            if (
+                include_legacy
+                and self.legacy_storage_state_path.exists()
+                and not deleted_marker_path(self.legacy_storage_state_path).exists()
+            ):
                 legacy_id = "__legacy_default__"
                 if legacy_id not in known_ids:
                     if not self._metadata_path(legacy_id).exists():
@@ -187,6 +215,10 @@ class CookieAccountManager:
                         self._write_metadata(legacy_id, metadata)
                     accounts.append(self._load_account(legacy_id))
 
+            accounts = [
+                account for account in accounts
+                if not deleted_marker_path(account.storage_state_path).exists()
+            ]
             accounts.sort(key=lambda account: (account.label.lower(), account.account_id.lower()))
             return accounts
 
@@ -248,6 +280,8 @@ class CookieAccountManager:
         with self._lock:
             metadata_path = self._metadata_path(account_id)
             state_path = self._state_path(account_id)
+            if deleted_marker_path(state_path).exists():
+                return None
             if not metadata_path.exists() and not state_path.exists():
                 return None
             return self._load_account(account_id)
@@ -294,35 +328,38 @@ class CookieAccountManager:
 
     def mark_success(self, account_id: str) -> Optional[CookieAccount]:
         now = _utcnow_iso()
-        account = self.get_account(account_id)
-        if account is None:
-            return None
-        updates = {
-            "last_used_at": now,
-            "last_success_at": now,
-            "updated_at": now,
-        }
-        if not account.warning:
-            updates["challenge_strikes"] = 0
-            updates["last_issue_reason"] = ""
-            updates["last_issue_at"] = ""
-        return self._update_account(account_id, updates)
+
+        def _updates(metadata: Dict[str, object]) -> Dict[str, object]:
+            updates = {
+                "last_used_at": now,
+                "last_success_at": now,
+                "updated_at": now,
+            }
+            if not metadata.get("warning"):
+                updates["challenge_strikes"] = 0
+                updates["last_issue_reason"] = ""
+                updates["last_issue_at"] = ""
+            return updates
+
+        return self._update_account(account_id, _updates)
 
     def note_issue(self, account_id: str, reason: str) -> Optional[CookieAccount]:
-        account = self.get_account(account_id)
-        if account is None:
-            return None
         now = _utcnow_iso()
-        return self._update_account(
-            account_id,
-            {
+        reason = str(reason or "").strip()
+
+        def _updates(metadata: Dict[str, object]) -> Dict[str, object]:
+            updates = {
                 "last_used_at": now,
                 "updated_at": now,
-                "last_issue_reason": str(reason or "").strip(),
+                "last_issue_reason": reason,
                 "last_issue_at": now,
-                "challenge_strikes": max(0, int(account.challenge_strikes)) + 1,
-            },
-        )
+            }
+            # 已预警账号只记录最近 issue，不再累加 strike，避免重复预警与计数失真
+            if not metadata.get("warning"):
+                updates["challenge_strikes"] = max(0, int(metadata.get("challenge_strikes") or 0)) + 1
+            return updates
+
+        return self._update_account(account_id, _updates)
 
     def mark_invalid(self, account_id: str, reason: str) -> Optional[CookieAccount]:
         now = _utcnow_iso()
@@ -378,6 +415,19 @@ class CookieAccountManager:
             },
         )
 
+    def delete_account(self, account_id: str) -> bool:
+        """先阻断旧写者，再删除账号文件；标记保留，新增同名账号会分配新 ID。"""
+        state_path = self._state_path(account_id)
+        with self._lock, account_storage_lock(state_path):
+            paths = [self._metadata_path(account_id), state_path]
+            existed = any(path.exists() for path in paths)
+            if not existed:
+                return False
+            deleted_marker_path(state_path).touch()
+            for path in paths:
+                path.unlink(missing_ok=True)
+            return existed
+
     def reset_account_status(self, account_id: str) -> Optional[CookieAccount]:
         return self._update_account(
             account_id,
@@ -403,6 +453,7 @@ class CookieAccountManager:
                 "updated_at": _utcnow_iso(),
                 "relogin_in_progress": bool(active),
             },
+            repair_metadata=active,
         )
 
     def _default_metadata(self, *, account_id: str, label: str, source: str = "managed") -> Dict[str, object]:
@@ -445,26 +496,69 @@ class CookieAccountManager:
         return None
 
     def _read_metadata(self, metadata_path: Path) -> Dict[str, object]:
+        # 严格读取：文件存在但解析失败时抛异常，调用方不得用默认 metadata 覆盖损坏文件
         if not metadata_path.exists():
             return {}
         try:
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        except Exception as exc:
+            raise AccountMetadataError(f"账号 metadata 文件损坏，未做修改：{metadata_path}") from exc
+        if not isinstance(payload, dict):
+            raise AccountMetadataError(f"账号 metadata 内容非法，未做修改：{metadata_path}")
+        try:
+            int(payload.get("challenge_strikes") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AccountMetadataError(f"账号 metadata 计数非法，未做修改：{metadata_path}") from exc
+        return payload
 
-    def _write_metadata(self, account_id: str, payload: Dict[str, object]) -> None:
+    def _read_metadata_for_relogin(self, account: CookieAccount) -> Dict[str, object]:
+        try:
+            return self._read_metadata(account.metadata_path)
+        except AccountMetadataError:
+            # 保留损坏原件用于排查；扫码成功前不把旧会话重新放回可用池。
+            backup = account.metadata_path.with_name(
+                f"{account.metadata_path.name}.{uuid4().hex}.corrupt"
+            )
+            shutil.copy2(account.metadata_path, backup)
+            metadata = self._default_metadata(
+                account_id=account.account_id, label=account.label, source=account.source
+            )
+            metadata.update(invalid=True, invalid_reason="账号信息损坏，等待重新登录修复")
+            return metadata
+
+    def _write_metadata(self, account_id: str, payload: Dict[str, object]) -> bool:
+        with account_storage_lock(self._state_path(account_id)):
+            if deleted_marker_path(self._state_path(account_id)).exists():
+                return False
+            self._write_metadata_unlocked(account_id, payload)
+        return True
+
+    def _write_metadata_unlocked(self, account_id: str, payload: Dict[str, object]) -> None:
+        # tmp + os.replace 原子写，避免读-改-写过程中崩溃留下半截文件
         metadata_path = self._metadata_path(account_id)
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
+        temp_path = metadata_path.with_name(
+            f"{metadata_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
+        try:
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, metadata_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _load_account(self, account_id: str) -> CookieAccount:
         metadata_path = self._metadata_path(account_id)
         state_path = self._state_path(account_id)
-        metadata = self._read_metadata(metadata_path)
+        metadata_error = ""
+        try:
+            metadata = self._read_metadata(metadata_path)
+        except AccountMetadataError as exc:
+            # 保留在页面中供重新登录修复，但隔离出可用池，避免未知风控状态被重置。
+            metadata = {}
+            metadata_error = str(exc)
         metadata = self._migrate_legacy_auto_invalid(account_id, metadata)
         label = str(metadata.get("label") or account_id).strip() or account_id
         cookie_count = self._cookie_count(state_path)
@@ -476,8 +570,8 @@ class CookieAccountManager:
             label=label,
             storage_state_path=state_path,
             metadata_path=metadata_path,
-            invalid=bool(metadata.get("invalid")),
-            invalid_reason=str(metadata.get("invalid_reason") or "").strip(),
+            invalid=bool(metadata_error or metadata.get("invalid")),
+            invalid_reason=metadata_error or str(metadata.get("invalid_reason") or "").strip(),
             invalidated_at=str(metadata.get("invalidated_at") or "").strip(),
             warning=bool(metadata.get("warning")),
             warning_reason=str(metadata.get("warning_reason") or "").strip(),
@@ -494,6 +588,7 @@ class CookieAccountManager:
             cookie_count=cookie_count,
             has_state=has_state,
             has_usable_state=has_usable_state,
+            metadata_error=metadata_error,
         )
 
     def _migrate_legacy_auto_invalid(self, account_id: str, metadata: Dict[str, object]) -> Dict[str, object]:
@@ -539,16 +634,30 @@ class CookieAccountManager:
             return 0
         return sum(1 for cookie in cookies if isinstance(cookie, dict) and str(cookie.get("name") or "").strip())
 
-    def _update_account(self, account_id: str, updates: Dict[str, object]) -> Optional[CookieAccount]:
+    def _update_account(
+        self,
+        account_id: str,
+        updates: Union[Dict[str, object], Callable[[Dict[str, object]], Dict[str, object]]],
+        *,
+        repair_metadata: bool = False,
+    ) -> Optional[CookieAccount]:
         with self._lock:
             account = self.get_account(account_id)
             if account is None:
                 return None
-            metadata = self._read_metadata(account.metadata_path)
+            metadata = (
+                self._read_metadata_for_relogin(account)
+                if repair_metadata else self._read_metadata(account.metadata_path)
+            )
             if not metadata:
                 metadata = self._default_metadata(account_id=account.account_id, label=account.label, source=account.source)
+            # callable 在锁内基于刚读到的 metadata 计算，消除 get→update 窗口（如 note_issue 丢 strike）
+            if callable(updates):
+                computed = updates(metadata)
+                updates = dict(computed) if computed else {}
             metadata.update(updates)
             if not metadata.get("label"):
                 metadata["label"] = account.label
-            self._write_metadata(account_id, metadata)
+            if not self._write_metadata(account_id, metadata):
+                return None
             return self._load_account(account_id)

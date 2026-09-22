@@ -8,7 +8,6 @@ class RequestCoordinator:
         self._next_request_at = 0.0
         self._cooldown_until = 0.0
         self._challenge_streak = 0
-        self._challenge_observed = False
         self._challenge_reasons: list[str] = []
 
     def wait(
@@ -44,7 +43,6 @@ class RequestCoordinator:
         with self._lock:
             now = monotonic_fn()
             self._challenge_streak = min(self._challenge_streak + 1, 6)
-            self._challenge_observed = True
             normalized_reason = str(reason or "").strip()
             if normalized_reason and normalized_reason not in self._challenge_reasons:
                 self._challenge_reasons.append(normalized_reason)
@@ -62,13 +60,11 @@ class RequestCoordinator:
 
     def reset_attempt_signal(self) -> None:
         with self._lock:
-            self._challenge_observed = False
             self._challenge_reasons.clear()
 
     def consume_attempt_signal_reasons(self) -> tuple[str, ...]:
         with self._lock:
             reasons = tuple(self._challenge_reasons)
-            self._challenge_observed = False
             self._challenge_reasons.clear()
             return reasons
 

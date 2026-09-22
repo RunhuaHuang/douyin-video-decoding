@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from app import login_session
+from app.cookie_accounts import CookieAccountManager
 
 
 class _DummyPage:
@@ -112,6 +115,45 @@ class _DummySyncPlaywright:
 
     def __call__(self):
         return self.instance
+
+
+def test_cli_relogin_repairs_corrupt_metadata_and_preserves_original(tmp_path, monkeypatch):
+    manager = CookieAccountManager(accounts_dir=tmp_path / "accounts")
+    account = manager.prepare_account("主号")
+    account.metadata_path.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(login_session, "CookieAccountManager", lambda: manager)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", _DummySyncPlaywright())
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    login_session.login_with_label("主号", wait_mode="enter", logger=lambda _: None)
+
+    repaired = manager.get_account(account.account_id)
+    assert repaired.has_usable_state
+    assert not repaired.invalid
+    assert not repaired.relogin_in_progress
+    backups = list(manager.accounts_dir.glob("*.corrupt"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{broken"
+
+
+def test_login_cannot_restore_account_deleted_while_browser_was_open(tmp_path, monkeypatch):
+    manager = CookieAccountManager(accounts_dir=tmp_path / "accounts")
+    account = manager.prepare_account("主号")
+    monkeypatch.setattr(login_session, "CookieAccountManager", lambda: manager)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", _DummySyncPlaywright())
+
+    def delete_before_save(prompt=""):
+        manager.delete_account(account.account_id)
+        return ""
+
+    monkeypatch.setattr("builtins.input", delete_before_save)
+    with pytest.raises(RuntimeError, match="该账号已删除"):
+        login_session.login_with_label("主号", wait_mode="enter", logger=lambda _: None)
+
+    assert manager.list_accounts() == []
+    assert not account.storage_state_path.exists()
+    assert not account.metadata_path.exists()
+    assert list(manager.accounts_dir.glob("*.tmp.json")) == []
 
 
 def test_login_session_starts_with_clean_context(tmp_path, monkeypatch):

@@ -1,0 +1,20 @@
+{% set checks = [
+  ("FFmpeg", health.ffmpeg),
+  ("MLX Whisper", health.mlx),
+  ("SenseVoice", health.sensevoice),
+] %}
+<div class="health-row" role="status" aria-label="环境健康">
+  {% for label, value in checks %}
+    {% set ok = value.startswith("已检测") %}
+    <span class="health-item{% if ok %} is-ok{% endif %}" title="{{ label }}: {{ value }}">
+      <span class="health-dot" aria-hidden="true"></span>
+      <span class="health-name">{{ label }}</span>
+      <span class="health-value">{{ value }}</span>
+    </span>
+  {% endfor %}
+  <span class="health-item" title="默认模型: {{ health.default_model }}">
+    <span class="health-dot" aria-hidden="true"></span>
+    <span class="health-name">默认模型</span>
+    <span class="health-value mono">{{ health.default_model }}</span>
+  </span>
+</div>

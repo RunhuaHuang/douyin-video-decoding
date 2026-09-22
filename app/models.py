@@ -55,6 +55,7 @@ class JobRecord:
     error_message: str = ""
     pause_requested: bool = False
     cooldown_active: bool = False
+    cooldown_ends_at: Optional[datetime] = None
     skip_cooldown_requested: bool = False
     current_cookie_account_id: str = ""
     current_cookie_label: str = ""
@@ -72,12 +73,22 @@ class JobRecord:
         data["upload_path"] = str(self.upload_path)
         data["output_path"] = str(self.output_path) if self.output_path else None
         data["resume_output_path"] = str(self.resume_output_path) if self.resume_output_path else None
-        data["resume_available"] = bool(self.resume_output_path)
+        data["resume_available"] = bool(self.resume_output_path and Path(self.resume_output_path).is_file())
         data["created_at"] = self.created_at.isoformat()
         data["started_at"] = self.started_at.isoformat() if self.started_at else None
         data["finished_at"] = self.finished_at.isoformat() if self.finished_at else None
+        data["cooldown_ends_at"] = (
+            self.cooldown_ends_at.isoformat() if (self.cooldown_active and self.cooldown_ends_at) else None
+        )
+        data["cooldown_remaining_seconds"] = self._cooldown_remaining_seconds()
         data["output_filename"] = self.output_path.name if self.output_path else None
         return data
+
+    def _cooldown_remaining_seconds(self) -> int:
+        if not self.cooldown_active or self.cooldown_ends_at is None:
+            return 0
+        remaining = (self.cooldown_ends_at - datetime.now(timezone.utc)).total_seconds()
+        return max(0, int(remaining))
 
 
 @dataclass
@@ -86,6 +97,7 @@ class BatchRecord:
     job_ids: List[str]
     common_columns: List[str]
     status: str = "uploaded"
+    run_mode: str = "full"
     current_job_id: Optional[str] = None
     current_file_index: int = 0
     current_message: str = ""
@@ -106,6 +118,7 @@ class BatchRecord:
     proactive_cooldown_seconds: int = PROACTIVE_COOLDOWN_SECONDS
     pause_requested: bool = False
     cooldown_active: bool = False
+    cooldown_ends_at: Optional[datetime] = None
     skip_cooldown_requested: bool = False
     current_cookie_account_id: str = ""
     current_cookie_label: str = ""
@@ -123,6 +136,10 @@ class BatchRecord:
         data["created_at"] = self.created_at.isoformat()
         data["started_at"] = self.started_at.isoformat() if self.started_at else None
         data["finished_at"] = self.finished_at.isoformat() if self.finished_at else None
+        data["cooldown_ends_at"] = (
+            self.cooldown_ends_at.isoformat() if (self.cooldown_active and self.cooldown_ends_at) else None
+        )
+        data["cooldown_remaining_seconds"] = self._cooldown_remaining_seconds()
         data["jobs"] = [job.to_dict() for job in jobs]
         data["total_files"] = len(jobs)
         data["resumable_files"] = sum(bool(job.resume_output_path) for job in jobs)
@@ -135,3 +152,9 @@ class BatchRecord:
         data["processed_rows"] = sum(job.processed_rows for job in jobs)
         data["total_rows"] = sum(job.total_rows or job.row_count for job in jobs)
         return data
+
+    def _cooldown_remaining_seconds(self) -> int:
+        if not self.cooldown_active or self.cooldown_ends_at is None:
+            return 0
+        remaining = (self.cooldown_ends_at - datetime.now(timezone.utc)).total_seconds()
+        return max(0, int(remaining))

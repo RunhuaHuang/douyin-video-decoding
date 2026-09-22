@@ -8,6 +8,7 @@ import time
 from contextlib import ExitStack
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -45,7 +46,13 @@ from .csv_service import (
     write_csv,
 )
 from .browser_service import PlaywrightFallback
-from .douyin_service import DouyinService, DownloadResult, ParsedVideo
+from .douyin_service import (
+    DouyinService,
+    DownloadForbiddenError,
+    DownloadResult,
+    NonVideoDownloadError,
+    ParsedVideo,
+)
 from .job_manager import JobManager
 from .media_service import FfmpegService
 from .transcription_service import TranscriptionService
@@ -612,7 +619,7 @@ class JobProcessor:
                 )
                 self.manager.append_log(
                     job_id,
-                    f"第 {task.csv_row_number} 行重试 3 轮后仍未成功，已标记为已删除",
+                    f"第 {task.csv_row_number} 行重试 {self.max_retries} 轮后仍未成功，已标记为已删除",
                 )
             self._persist_snapshot(job_id, dataframe, output_path)
             self._sync_progress(job_id, dataframe)
@@ -669,54 +676,110 @@ class JobProcessor:
         while download_futures or asr_futures:
             pending_futures = tuple(download_futures.keys()) + tuple(asr_futures.keys())
             done, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
-            for future in done:
-                if future in download_futures:
-                    download_futures.pop(future)
-                    result = future.result()
-                    if isinstance(result, PreparedRow):
-                        for message in result.log_messages:
-                            self.manager.append_log(job_id, message)
-                        self.manager.update_progress(
-                            job_id,
-                            current_row=result.plan.task.csv_row_number,
-                            current_url=result.plan.task.url_value,
-                            current_message=f"第 {result.plan.task.csv_row_number} 行进入转写队列",
-                        )
-                        asr_futures[
-                            asr_pool.submit(
-                                self._run_transcription_stage,
-                                result,
-                                output_columns,
-                                default_model,
-                            )
-                        ] = result
-                    else:
-                        self._handle_row_result(
-                            job_id=job_id,
-                            run_state=run_state,
-                            dataframe=dataframe,
-                            result=result,
-                            output_columns=output_columns,
-                            output_path=output_path,
-                            retry_queue=retry_queue,
-                        )
-                else:
-                    prepared = asr_futures.pop(future)
-                    result = future.result()
-                    self._handle_row_result(
+            try:
+                for future in done:
+                    self._collect_future_result(
+                        future=future,
                         job_id=job_id,
                         run_state=run_state,
                         dataframe=dataframe,
-                        result=result,
+                        download_futures=download_futures,
+                        asr_futures=asr_futures,
                         output_columns=output_columns,
                         output_path=output_path,
                         retry_queue=retry_queue,
+                        default_model=default_model,
+                        asr_pool=asr_pool,
                     )
+            except Exception:
+                # future.result() 抛错（worker 线程未兜底的崩溃）时，先把其余已完成的
+                # future 结果照常落盘，避免整批已完成的行随异常一起丢失，再向上抛出。
+                leftover = [
+                    future
+                    for future in tuple(download_futures.keys()) + tuple(asr_futures.keys())
+                    if future.done()
+                ]
+                for future in leftover:
+                    try:
+                        self._collect_future_result(
+                            future=future,
+                            job_id=job_id,
+                            run_state=run_state,
+                            dataframe=dataframe,
+                            download_futures=download_futures,
+                            asr_futures=asr_futures,
+                            output_columns=output_columns,
+                            output_path=output_path,
+                            retry_queue=retry_queue,
+                            default_model=default_model,
+                            asr_pool=asr_pool,
+                        )
+                    except Exception:
+                        continue
+                raise
 
         for future in download_futures:
             future.cancel()
         for future in asr_futures:
             future.cancel()
+
+    def _collect_future_result(
+        self,
+        *,
+        future: Future,
+        job_id: str,
+        run_state: RunControlState,
+        dataframe,
+        download_futures: Dict[Future, RowPlan],
+        asr_futures: Dict[Future, PreparedRow],
+        output_columns: Dict[str, str],
+        output_path: Path,
+        retry_queue: List[RowTask],
+        default_model: str,
+        asr_pool: ThreadPoolExecutor,
+    ) -> None:
+        if future in download_futures:
+            download_futures.pop(future)
+            result = future.result()
+            if isinstance(result, PreparedRow):
+                for message in result.log_messages:
+                    self.manager.append_log(job_id, message)
+                self.manager.update_progress(
+                    job_id,
+                    current_row=result.plan.task.csv_row_number,
+                    current_url=result.plan.task.url_value,
+                    current_message=f"第 {result.plan.task.csv_row_number} 行进入转写队列",
+                )
+                asr_futures[
+                    asr_pool.submit(
+                        self._run_transcription_stage,
+                        result,
+                        output_columns,
+                        default_model,
+                    )
+                ] = result
+            else:
+                self._handle_row_result(
+                    job_id=job_id,
+                    run_state=run_state,
+                    dataframe=dataframe,
+                    result=result,
+                    output_columns=output_columns,
+                    output_path=output_path,
+                    retry_queue=retry_queue,
+                )
+        else:
+            asr_futures.pop(future)
+            result = future.result()
+            self._handle_row_result(
+                job_id=job_id,
+                run_state=run_state,
+                dataframe=dataframe,
+                result=result,
+                output_columns=output_columns,
+                output_path=output_path,
+                retry_queue=retry_queue,
+            )
 
     def _plan_task(
         self,
@@ -882,7 +945,11 @@ class JobProcessor:
                         attempts=plan.attempt_number,
                         resets_anti_crawl_state=(delete_reason == "分享页未找到视频详情"),
                     ),
-                    transcripts={model_name: DELETED_TRANSCRIPT_TEXT for model_name in plan.pending_models},
+                    transcripts={
+                        model_name: DELETED_TRANSCRIPT_TEXT
+                        for model_name in plan.pending_models
+                        if model_name != DOWNLOAD_ONLY_MODEL
+                    },
                     log_messages=(
                         f"第 {plan.task.csv_row_number} 行{delete_reason}，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
                     ),
@@ -907,7 +974,7 @@ class JobProcessor:
                         if model_name != DOWNLOAD_ONLY_MODEL
                     },
                     log_messages=(
-                        f"第 {plan.task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                        f"第 {plan.task.csv_row_number} 行重试超过 {self.max_retries} 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
                     ),
                     cleanup_dir=row_dir,
                 )
@@ -922,6 +989,21 @@ class JobProcessor:
                     anti_crawl_suspected=bool(weak_signal_descriptions),
                     anti_crawl_strong_suspected=bool(strong_signal_descriptions),
                     anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
+                ),
+                cleanup_dir=row_dir,
+            )
+        except Exception as exc:
+            status, retryable = self._unexpected_error_status(plan.attempt_number)
+            return RowExecutionResult(
+                plan=plan,
+                outcome=RowOutcome(
+                    status=status,
+                    attempts=plan.attempt_number,
+                    error_message=self._format_error(exc),
+                    retryable=retryable,
+                ),
+                log_messages=(
+                    f"第 {plan.task.csv_row_number} 行处理时出现未预期错误（{exc.__class__.__name__}），按{status}处理",
                 ),
                 cleanup_dir=row_dir,
             )
@@ -964,7 +1046,8 @@ class JobProcessor:
                     cleanup_dir=prepared.row_dir,
                 )
 
-            status = "部分成功" if transcripts else "失败"
+            # 与串行路径同语义：本轮成功转写模型数 >0 且存在失败 → 部分成功；全部失败 → 失败
+            status = "部分成功" if transcripts and model_failures else "失败"
             return RowExecutionResult(
                 plan=prepared.plan,
                 outcome=RowOutcome(
@@ -989,6 +1072,23 @@ class JobProcessor:
                     anti_crawl_signal_descriptions=prepared.anti_crawl_signal_descriptions,
                 ),
                 log_messages=(),
+                cleanup_dir=prepared.row_dir,
+            )
+        except Exception as exc:
+            status, retryable = self._unexpected_error_status(prepared.plan.attempt_number)
+            return RowExecutionResult(
+                plan=prepared.plan,
+                outcome=RowOutcome(
+                    status=status,
+                    attempts=prepared.plan.attempt_number,
+                    error_message=self._format_error(exc),
+                    retryable=retryable,
+                    anti_crawl_strong_suspected=bool(prepared.anti_crawl_signal_descriptions),
+                    anti_crawl_signal_descriptions=prepared.anti_crawl_signal_descriptions,
+                ),
+                log_messages=(
+                    f"第 {prepared.plan.task.csv_row_number} 行转写时出现未预期错误（{exc.__class__.__name__}），按{status}处理",
+                ),
                 cleanup_dir=prepared.row_dir,
             )
 
@@ -1093,7 +1193,14 @@ class JobProcessor:
         if current_account is not None and (current_account.invalid or not current_account.has_usable_state):
             if not current_account.has_usable_state:
                 invalid_reason = "cookies 文件缺失或为空会话"
-                self.cookie_account_manager.mark_invalid(current_account.account_id, invalid_reason)
+                try:
+                    self.cookie_account_manager.mark_invalid(current_account.account_id, invalid_reason)
+                except RuntimeError as exc:
+                    # metadata 损坏时保留现场（不静默重置），但剔除标记未写入不应拖垮任务
+                    self.manager.append_log(
+                        job_id,
+                        f"账号 metadata 损坏，剔除标记未能写入：{exc}（可对该账号执行重新登录修复）",
+                    )
                 self.manager.append_log(
                     job_id,
                     f"cookies `{current_account.label}` 不可用，已从账号池剔除：{invalid_reason}",
@@ -1171,7 +1278,13 @@ class JobProcessor:
             else self.cookie_strong_signal_switch_threshold
         )
         if current_account is not None:
-            self.cookie_account_manager.mark_used(current_account.account_id)
+            try:
+                self.cookie_account_manager.mark_used(current_account.account_id)
+            except RuntimeError as exc:
+                self.manager.append_log(
+                    job_id,
+                    f"账号 metadata 损坏，使用记录未能写入：{exc}（请重新登录修复）",
+                )
 
         total_batches_processed = int(runtime.get("cookie_total_batches_processed") or 0) + 1
         batches_since_switch = int(runtime.get("cookie_batches_since_switch") or 0) + 1
@@ -1194,21 +1307,43 @@ class JobProcessor:
         if current_account is not None and run_state.current_batch_strong_issue:
             signal_text = "；".join(run_state.current_batch_strong_signal_descriptions[:3]) or "403/429/验证码"
             if run_state.strong_signal_batch_streak >= strong_signal_threshold:
-                updated_account = self.cookie_account_manager.note_issue(current_account.account_id, signal_text)
+                try:
+                    updated_account = self.cookie_account_manager.note_issue(current_account.account_id, signal_text)
+                except RuntimeError as exc:
+                    # metadata 损坏时保留现场，本次风控计数跳过但任务继续
+                    updated_account = None
+                    self.manager.append_log(
+                        job_id,
+                        f"账号 metadata 损坏，本次强信号计数未能写入：{exc}（可对该账号执行重新登录修复）",
+                    )
                 challenge_strikes = updated_account.challenge_strikes if updated_account is not None else 0
                 if challenge_strikes >= self.cookie_account_manager.invalidation_strike_threshold:
-                    warning_reason = (
-                        f"连续 {challenge_strikes} 次达到强信号预警阈值：{signal_text}"
-                    )
-                    warned_account = self.cookie_account_manager.mark_warning(
-                        current_account.account_id,
-                        warning_reason,
-                    )
-                    if warned_account is not None:
+                    if current_account.warning:
+                        # 账号此前已处于预警状态，不重复 mark_warning，也不重复记“已进入预警状态”日志
                         self.manager.append_log(
                             job_id,
-                            f"cookies `{warned_account.label}` 已进入预警状态：{warning_reason}",
+                            f"cookies `{current_account.label}` 维持预警状态：已累计 {challenge_strikes} 次强信号 strike",
                         )
+                    else:
+                        warning_reason = (
+                            f"连续 {challenge_strikes} 次达到强信号预警阈值：{signal_text}"
+                        )
+                        try:
+                            warned_account = self.cookie_account_manager.mark_warning(
+                                current_account.account_id,
+                                warning_reason,
+                            )
+                        except RuntimeError as exc:
+                            warned_account = None
+                            self.manager.append_log(
+                                job_id,
+                                f"账号 metadata 损坏，预警状态未能写入：{exc}",
+                            )
+                        if warned_account is not None:
+                            self.manager.append_log(
+                                job_id,
+                                f"cookies `{warned_account.label}` 已进入预警状态：{warning_reason}",
+                            )
                 else:
                     self.manager.append_log(
                         job_id,
@@ -1216,7 +1351,13 @@ class JobProcessor:
                     )
                 run_state.strong_signal_batch_streak = 0
         elif current_account is not None:
-            self.cookie_account_manager.mark_success(current_account.account_id)
+            try:
+                self.cookie_account_manager.mark_success(current_account.account_id)
+            except RuntimeError as exc:
+                self.manager.append_log(
+                    job_id,
+                    f"账号 metadata 损坏，成功计数未能写入：{exc}",
+                )
 
         if not switch_reason and runtime.get("cookie_switch_requested"):
             switch_reason = "用户手动切换 cookies"
@@ -1252,8 +1393,7 @@ class JobProcessor:
             self.manager.update_job_cookie_runtime(job_id, **fields)
 
     def _apply_cookie_account(self, job_id: str, account: CookieAccount, *, reason: str) -> CookieAccount:
-        runtime = self.manager.get_effective_cookie_runtime(job_id)
-        generation = int(runtime.get("cookie_service_generation") or 0) + 1
+        self.manager.advance_cookie_generation(job_id)
         self._set_cookie_runtime(
             job_id,
             current_cookie_account_id=account.account_id,
@@ -1261,7 +1401,6 @@ class JobProcessor:
             cookie_batches_since_switch=0,
             cookie_switch_requested=False,
             cookie_last_switch_reason=reason,
-            cookie_service_generation=generation,
         )
         self._close_job_douyin_services(job_id)
         self.manager.append_log(job_id, f"当前 cookies 已切换到 `{account.label}`：{reason}")
@@ -1516,9 +1655,10 @@ class JobProcessor:
             return
 
         job = self.manager.require(job_id)
-        self.manager.set_cooldown_state(job_id, active=True)
+        cooldown_ends_at = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+        self.manager.set_cooldown_state(job_id, active=True, ends_at=cooldown_ends_at)
         if job.batch_id:
-            self.manager.set_batch_cooldown_state(job.batch_id, active=True)
+            self.manager.set_batch_cooldown_state(job.batch_id, active=True, ends_at=cooldown_ends_at)
 
         skipped = False
         while remaining > 0 and not self.manager.is_pause_requested(job_id):
@@ -1856,8 +1996,10 @@ class JobProcessor:
                     anti_crawl_signal_descriptions=strong_signal_descriptions,
                 )
 
-            remaining_models = self._pending_models_for_row(dataframe, task.row_index, output_columns, overwrite)
-            status = "部分成功" if remaining_models and len(remaining_models) < len(output_columns) else "失败"
+            # 与并行路径同语义：本轮成功转写模型数 >0 且存在失败 → 部分成功；全部失败 → 失败。
+            # 不再用“剩余空列数”判断，避免 overwrite=True 时把已成功的行误判为失败。
+            succeeded_models = len(pending_models) - len(model_failures)
+            status = "部分成功" if succeeded_models > 0 and model_failures else "失败"
             return RowOutcome(
                 status=status,
                 attempts=attempt_number,
@@ -1920,7 +2062,7 @@ class JobProcessor:
                         dataframe.at[task.row_index, column_name] = DELETED_TRANSCRIPT_TEXT
                 self.manager.append_log(
                     job_id,
-                    f"第 {task.csv_row_number} 行重试超过 3 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
+                    f"第 {task.csv_row_number} 行重试超过 {self.max_retries} 次仍未成功，按已删除处理，已写入“{DELETED_TRANSCRIPT_TEXT}”",
                 )
                 return RowOutcome(
                     status="已删除",
@@ -1938,6 +2080,19 @@ class JobProcessor:
                 anti_crawl_suspected=bool(weak_signal_descriptions),
                 anti_crawl_strong_suspected=bool(strong_signal_descriptions),
                 anti_crawl_signal_descriptions=(*weak_signal_descriptions, *strong_signal_descriptions),
+            )
+        except Exception as exc:
+            # 行执行期未预期异常（service 构建期异常在 try 之外，仍按任务失败上抛）
+            status, retryable = self._unexpected_error_status(attempt_number)
+            self.manager.append_log(
+                job_id,
+                f"第 {task.csv_row_number} 行处理时出现未预期错误（{exc.__class__.__name__}），按{status}处理",
+            )
+            return RowOutcome(
+                status=status,
+                attempts=attempt_number,
+                error_message=self._format_error(exc),
+                retryable=retryable,
             )
         finally:
             shutil.rmtree(row_dir, ignore_errors=True)
@@ -1978,10 +2133,19 @@ class JobProcessor:
         if len(model_names) == 1:
             return {model_names[0]: transcript_column}
 
-        return {
-            model_name: f"{transcript_column}__{transcriber.model_alias(model_name)}"
-            for model_name in model_names
-        }
+        # 不同模型的别名可能相同（如不同仓库下的同名模型），列名冲突时自动加 _2/_3 后缀
+        output_columns: Dict[str, str] = {}
+        used_columns: set = set()
+        for model_name in model_names:
+            base_column = f"{transcript_column}__{transcriber.model_alias(model_name)}"
+            column_name = base_column
+            suffix = 2
+            while column_name in used_columns:
+                column_name = f"{base_column}_{suffix}"
+                suffix += 1
+            used_columns.add(column_name)
+            output_columns[model_name] = column_name
+        return output_columns
 
     @staticmethod
     def _set_row_meta(dataframe, row_index, *, status: str, error_message: str, attempts: int) -> None:
@@ -2040,22 +2204,24 @@ class JobProcessor:
             source_path = browser_audio_path
             suffix = DOWNLOAD_ONLY_AUDIO_SUFFIX
 
-        # 分流视频没合并上音轨（合并失败 / ffmpeg 不可用）时退回保存纯音频 .m4a。
-        # 关键是检查视频文件是否已经包含音轨；只检查视频流会把无声的 video-only
-        # 文件误认为合并成功，最后生成一个静音 mp4。
-        if (
-            source_path == video_path
-            and browser_audio_path.exists()
-            and browser_audio_path.stat().st_size > 0
-        ):
+        # 分流视频可能没合并上音轨（合并失败 / ffmpeg 不可用 / 直连接口只回了视频流），
+        # 一律 probe 音轨而不是只看 sidecar 是否存在：确认拿到无声视频且连 sidecar
+        # 都没有时按“无音轨”抛错，交给上层 NO_AUDIO 重试分类，避免产出静音 mp4 却判成功。
+        if source_path == video_path:
+            sidecar_available = browser_audio_path.exists() and browser_audio_path.stat().st_size > 0
             try:
                 streams = FfmpegService().probe_media(video_path).get("streams") or []
                 has_video_stream = any(stream.get("codec_type") == "video" for stream in streams)
                 has_audio_stream = any(stream.get("codec_type") == "audio" for stream in streams)
+                probe_ok = True
             except Exception:
+                # probe 不可用（如无 ffmpeg）时不臆断，退回旧行为
                 has_video_stream = False
                 has_audio_stream = False
-            if not (has_video_stream and has_audio_stream):
+                probe_ok = False
+            if probe_ok and has_video_stream and not has_audio_stream and not sidecar_available:
+                raise RowProcessingError("抽音频", NO_AUDIO_ERROR)
+            if (not probe_ok or not (has_video_stream and has_audio_stream)) and sidecar_available:
                 source_path = browser_audio_path
                 suffix = DOWNLOAD_ONLY_AUDIO_SUFFIX
 
@@ -2144,8 +2310,11 @@ class JobProcessor:
         if mode == "full":
             return job.upload_path
         if mode == "continue_existing":
-            if job.resume_output_path and Path(job.resume_output_path).exists():
-                return Path(job.resume_output_path)
+            source_path = job.output_path or job.resume_output_path
+            if source_path:
+                if not Path(source_path).is_file():
+                    raise RuntimeError("已有结果文件不存在，无法续跑；请恢复结果文件或选择重新运行")
+                return Path(source_path)
             return job.upload_path
         if job.output_path and Path(job.output_path).exists():
             return Path(job.output_path)
@@ -2154,7 +2323,8 @@ class JobProcessor:
     def _build_output_path(self, job) -> Path:
         if job.output_path:
             return Path(job.output_path)
-        return OUTPUT_DIR / build_processed_output_name(job.original_filename)
+        # 带 job_id 前缀命名，避免同名输入互相覆盖；job_id 为空时退化为 <stem>.processed.csv
+        return OUTPUT_DIR / build_processed_output_name(job.original_filename, job.job_id)
 
     def _build_tasks(self, dataframe, job) -> List[RowTask]:
         return [
@@ -2259,6 +2429,11 @@ class JobProcessor:
     def _max_attempts_per_row(self) -> int:
         return self.max_retries + 1
 
+    def _unexpected_error_status(self, attempt_number: int) -> Tuple[str, bool]:
+        # 未预期异常（非 RowProcessingError）统一按行失败归一：未到尝试上限前进入重试队列
+        retryable = attempt_number < self._max_attempts_per_row()
+        return (RETRY_PENDING_STATUS if retryable else "失败"), retryable
+
     @staticmethod
     def _is_preview_only_parse_error(exc: RowProcessingError) -> bool:
         return exc.stage == "解析" and PREVIEW_ONLY_DELETE_ERROR in exc.detail
@@ -2276,18 +2451,43 @@ class JobProcessor:
         return exc.stage == "解析" and NON_VIDEO_ERROR in exc.detail
 
     @staticmethod
+    def _error_chain_contains(exc: BaseException, error_type: type) -> bool:
+        # douyin_service 的结构化异常会被 _download_video 包进 RowProcessingError 的
+        # __cause__，沿异常链做 isinstance 判断；查不到再退回字符串指纹。
+        stack = [exc]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, error_type):
+                return True
+            stack.append(current.__cause__)
+            stack.append(current.__context__)
+        return False
+
+    @staticmethod
     def _is_download_forbidden_error(exc: RowProcessingError) -> bool:
         return exc.stage == "下载" and DOWNLOAD_FORBIDDEN_ERROR in exc.detail
 
     def _should_mark_download_unavailable(self, exc: RowProcessingError, attempt_number: int) -> bool:
-        return self._is_download_forbidden_error(exc) and attempt_number >= DOWNLOAD_UNAVAILABLE_ATTEMPTS
+        if attempt_number < DOWNLOAD_UNAVAILABLE_ATTEMPTS:
+            return False
+        if self._error_chain_contains(exc, DownloadForbiddenError):
+            return True
+        return self._is_download_forbidden_error(exc)
 
     @staticmethod
     def _is_non_video_download_404_error(exc: RowProcessingError) -> bool:
         return exc.stage == "下载" and NON_VIDEO_DOWNLOAD_404_ERROR in exc.detail
 
     def _should_mark_non_video_from_download_error(self, exc: RowProcessingError, attempt_number: int) -> bool:
-        return self._is_non_video_download_404_error(exc) and attempt_number >= NON_VIDEO_DOWNLOAD_404_ATTEMPTS
+        if attempt_number < NON_VIDEO_DOWNLOAD_404_ATTEMPTS:
+            return False
+        if self._error_chain_contains(exc, NonVideoDownloadError):
+            return True
+        return self._is_non_video_download_404_error(exc)
 
     def _should_mark_deleted_from_invalid_link(self, exc: RowProcessingError, attempt_number: int) -> bool:
         return self._is_invalid_link_parse_error(exc) and attempt_number >= INVALID_LINK_DELETE_ATTEMPTS
@@ -2303,9 +2503,9 @@ class JobProcessor:
             return "分享页未找到视频详情"
         return ""
 
-    @staticmethod
-    def _should_mark_deleted_after_retry_ceiling(exc: RowProcessingError, attempt_number: int) -> bool:
-        return exc.stage in {"解析", "下载", "抽音频"} and attempt_number > 3
+    def _should_mark_deleted_after_retry_ceiling(self, exc: RowProcessingError, attempt_number: int) -> bool:
+        # 原硬编码 3 等价于默认 max_retries；配置更大上限时按上限推导，小上限保持原行为
+        return exc.stage in {"解析", "下载", "抽音频"} and attempt_number > max(3, self.max_retries)
 
     @staticmethod
     def _dedupe_tasks(tasks: Sequence[RowTask]) -> List[RowTask]:

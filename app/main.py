@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import csv
+import shutil
 import threading
 from datetime import datetime
 from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -35,7 +38,12 @@ from .config import (
     ensure_directories,
 )
 from .cookie_accounts import CookieAccount, CookieAccountManager
-from .csv_service import inspect_csv, media_type_for_path, processed_output_path_for_filename
+from .csv_service import (
+    find_latest_processed_path,
+    inspect_csv,
+    media_type_for_path,
+    stringify_cell,
+)
 from .job_manager import JobManager
 from .login_session import login_with_label
 from .media_service import FfmpegService
@@ -59,9 +67,31 @@ MAX_ANTI_CRAWL_STREAK_THRESHOLD = 50
 MAX_COOLDOWN_MINUTES = 12 * 60
 MAX_PROACTIVE_COOLDOWN_BATCH_THRESHOLD = 500
 account_relogin_threads: Dict[str, threading.Thread] = {}
+_account_relogin_lock = threading.Lock()
 _worker_registry_lock = threading.RLock()
 _job_workers: Dict[str, threading.Thread] = {}
 _batch_workers: Dict[str, threading.Thread] = {}
+
+
+def _header_matches_host(value: str, host: str) -> bool:
+    try:
+        netloc = urlparse(value).netloc.lower()
+    except Exception:
+        return False
+    return bool(netloc) and netloc == host.lower()
+
+
+@app.middleware("http")
+async def reject_cross_site_posts(request: Request, call_next):
+    """防浏览器跨站盲发（CSRF）：POST 带 Origin/Referer 且与 Host 不一致即拒绝；不带这两个头的 curl/API 客户端放行。"""
+    if request.method == "POST":
+        host = request.headers.get("host", "")
+        if host:
+            for header_name in ("origin", "referer"):
+                header_value = request.headers.get(header_name)
+                if header_value and not _header_matches_host(header_value, host):
+                    return JSONResponse(status_code=403, content={"detail": "跨站请求被拒绝（Origin/Referer 与 Host 不一致）"})
+    return await call_next(request)
 
 
 def _worker_is_active(registry: Dict[str, threading.Thread], key: str) -> bool:
@@ -81,6 +111,14 @@ def _job_start_conflict(job_id: str) -> bool:
         return True
     job = job_manager.get(job_id)
     return bool(job and job.batch_id and _worker_is_active(_batch_workers, job.batch_id))
+
+
+def _batch_start_conflict(batch_id: str) -> bool:
+    """批次和其子任务共用一份执行权，所有启动入口都在 registry 锁内检查。"""
+    if _worker_is_active(_batch_workers, batch_id):
+        return True
+    batch = job_manager.require_batch(batch_id)
+    return any(_worker_is_active(_job_workers, job_id) for job_id in batch.job_ids)
 
 
 def _run_job_worker(job_id: str, mode: str) -> None:
@@ -105,7 +143,7 @@ def _run_batch_worker(batch_id: str, mode: str) -> None:
 
 def start_job_worker(job_id: str, mode: str = "full") -> bool:
     with _worker_registry_lock:
-        if _worker_is_active(_job_workers, job_id):
+        if _job_start_conflict(job_id):
             return False
         worker = threading.Thread(
             target=_run_job_worker,
@@ -120,7 +158,7 @@ def start_job_worker(job_id: str, mode: str = "full") -> bool:
 
 def start_batch_worker(batch_id: str, mode: str = "full") -> bool:
     with _worker_registry_lock:
-        if _worker_is_active(_batch_workers, batch_id):
+        if _batch_start_conflict(batch_id):
             return False
         worker = threading.Thread(
             target=_run_batch_worker,
@@ -135,6 +173,7 @@ def start_batch_worker(batch_id: str, mode: str = "full") -> bool:
 
 def process_batch(batch_id: str, mode: str = "full") -> None:
     batch = job_manager.require_batch(batch_id)
+    run_mode = job_manager.begin_batch_run(batch_id, mode)
     job_ids = batch.job_ids
     start_index = 0
     resume_current = False
@@ -165,9 +204,10 @@ def process_batch(batch_id: str, mode: str = "full") -> None:
 
             job_id = job_ids[index]
             job = job_manager.require(job_id)
-            job_mode = "resume" if resume_current and index == start_index and job.status == "paused" else "full"
-            if mode == "continue_existing" and job_mode == "full":
-                job_mode = "continue_existing"
+            job_mode = "resume" if resume_current and index == start_index and job.status == "paused" else run_mode
+            if job_mode == "retry_failed":
+                if job.failed_rows <= 0 or job.status == "running":
+                    continue
 
             if job_mode == "full" and job.status in {"completed", "failed"}:
                 continue
@@ -236,6 +276,8 @@ def _reconcile_account_relogin_state(account_id: str) -> CookieAccount | None:
         if not _is_relogin_thread_alive(account_id):
             account_relogin_threads.pop(account_id, None)
         return account
+    if _is_relogin_thread_alive(account_id):
+        return account
     if account.has_usable_state and account.updated_at:
         try:
             relogin_started_at = datetime.fromisoformat(account.updated_at).timestamp()
@@ -248,8 +290,6 @@ def _reconcile_account_relogin_state(account_id: str) -> CookieAccount | None:
         if storage_mtime >= relogin_started_at:
             account_relogin_threads.pop(account_id, None)
             return cookie_account_manager.record_login(account_id, label=account.label)
-    if _is_relogin_thread_alive(account_id):
-        return account
     account = cookie_account_manager.mark_relogin_in_progress(account_id, False)
     return account
 
@@ -269,6 +309,9 @@ def build_cookie_pool_snapshot(current_account_id: str = "") -> Dict[str, object
 def build_job_payload(job_id: str) -> Dict[str, object]:
     job = job_manager.require(job_id)
     payload = job.to_dict()
+    payload["batch_status"] = (
+        job_manager.get_batch(job.batch_id).status if job.batch_id else ""
+    )
     runtime = job_manager.get_effective_cookie_runtime(job_id)
     payload.update(runtime)
     payload["cookie_pool"] = build_cookie_pool_snapshot(payload.get("current_cookie_account_id", ""))
@@ -293,16 +336,14 @@ def _usable_cookie_pool() -> Dict[str, object]:
 
 
 def _apply_cookie_to_job(job_id: str, account: CookieAccount, reason: str) -> None:
-    runtime = job_manager.get_effective_cookie_runtime(job_id)
-    generation = int(runtime.get("cookie_service_generation") or 0) + 1
     job = job_manager.require(job_id)
+    job_manager.advance_cookie_generation(job_id)
     fields = {
         "current_cookie_account_id": account.account_id,
         "current_cookie_label": account.label,
         "cookie_batches_since_switch": 0,
         "cookie_switch_requested": False,
         "cookie_last_switch_reason": reason,
-        "cookie_service_generation": generation,
     }
     if job.batch_id:
         job_manager.update_batch_cookie_runtime(job.batch_id, **fields)
@@ -330,27 +371,31 @@ def switch_cookie_now_for_job(job_id: str, reason: str = "用户手动切换 coo
 
 
 def start_account_relogin(account_id: str) -> None:
-    account = _reconcile_account_relogin_state(account_id)
-    if account is None:
-        raise RuntimeError("cookies 账号不存在")
-    if account.relogin_in_progress and _is_relogin_thread_alive(account_id):
-        cookie_account_manager.mark_relogin_in_progress(account_id, False)
-        account_relogin_threads.pop(account_id, None)
-    cookie_account_manager.mark_relogin_in_progress(account_id, True)
+    with _account_relogin_lock:
+        account = _reconcile_account_relogin_state(account_id)
+        if account is None:
+            raise RuntimeError("cookies 账号不存在")
+        # 串行化同一账号的重新登录：线程仍存活则拒绝双开；仅线程已死（标记过期）才允许清标记重启
+        if _is_relogin_thread_alive(account_id):
+            raise RuntimeError("该账号正在重新登录中")
+        if cookie_account_manager.mark_relogin_in_progress(account_id, True) is None:
+            raise RuntimeError("cookies 账号已删除")
 
-    def worker() -> None:
-        try:
-            login_with_label(account.label, wait_mode="browser_close", logger=print)
-        finally:
-            account_relogin_threads.pop(account_id, None)
+        def worker() -> None:
+            try:
+                login_with_label(account.label, wait_mode="browser_close", logger=print)
+            finally:
+                with _account_relogin_lock:
+                    if account_relogin_threads.get(account_id) is threading.current_thread():
+                        account_relogin_threads.pop(account_id, None)
 
-    thread = threading.Thread(
-        target=worker,
-        daemon=True,
-        name=f"douyin-cookie-relogin-{account_id[:8]}",
-    )
-    account_relogin_threads[account_id] = thread
-    thread.start()
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"douyin-cookie-relogin-{account_id[:8]}",
+        )
+        account_relogin_threads[account_id] = thread
+        thread.start()
 
 
 def sanitize_worker_count(value: int, *, maximum: int) -> int:
@@ -448,6 +493,38 @@ def normalized_run_options(options) -> Dict[str, object]:
     }
 
 
+def _resume_output_path_for(safe_name: str) -> Optional[Path]:
+    """续跑入口统一走 csv_service 的同名产物定位（按 mtime 取最新一份）。"""
+    candidate = find_latest_processed_path(safe_name)
+    return candidate if candidate is not None and candidate.exists() else None
+
+
+def _has_existing_result(job) -> bool:
+    return any(
+        path is not None and Path(path).is_file()
+        for path in (job.output_path, job.resume_output_path)
+    )
+
+
+def _discard_created_uploads(
+    manager: JobManager,
+    session_ids: List[str],
+    batch_ids: List[str],
+    upload_dirs: List[Path],
+) -> None:
+    """回滚本次请求创建的 session/batch 记录与上传目录，避免失败请求遗留孤儿数据。"""
+    job_registry = getattr(manager, "_jobs", None)
+    if isinstance(job_registry, dict):
+        for session_id in session_ids:
+            job_registry.pop(session_id, None)
+    batch_registry = getattr(manager, "_batches", None)
+    if isinstance(batch_registry, dict):
+        for batch_id in batch_ids:
+            batch_registry.pop(batch_id, None)
+    for directory in upload_dirs:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def _configure_and_start_job(job_id: str, options, mode: str) -> bool:
     """Atomically claim a job worker before resetting/configuring the job."""
     with _worker_registry_lock:
@@ -461,7 +538,7 @@ def _configure_and_start_job(job_id: str, options, mode: str) -> bool:
 def _configure_and_start_batch(batch_id: str, options, mode: str) -> bool:
     """Atomically claim a batch worker before resetting/configuring the batch."""
     with _worker_registry_lock:
-        if _worker_is_active(_batch_workers, batch_id):
+        if _batch_start_conflict(batch_id):
             return False
         job_manager.configure_batch(batch_id=batch_id, **normalized_run_options(options))
         start_batch_worker(batch_id, mode=mode)
@@ -513,10 +590,13 @@ async def preview_csv(request: Request, files: List[UploadFile] = File(...)):
     jobs = []
     inspections = []
     errors = []
+    created_session_ids: List[str] = []
+    created_upload_dirs: List[Path] = []
     try:
         for file in valid_files:
             safe_name = Path(file.filename or "").name
             save_path = save_upload_file(file)
+            created_upload_dirs.append(save_path.parent)
             with save_path.open("wb") as output:
                 while True:
                     chunk = await file.read(1024 * 1024)
@@ -527,23 +607,22 @@ async def preview_csv(request: Request, files: List[UploadFile] = File(...)):
             try:
                 inspection = inspect_csv(save_path)
                 inspections.append(inspection)
-                jobs.append(
-                    job_manager.create_session(
-                        original_filename=safe_name,
-                        upload_path=save_path,
-                        columns=inspection.columns,
-                        preview_rows=inspection.preview_rows,
-                        row_count=inspection.row_count,
-                        file_type=inspection.file_type,
-                        resume_output_path=(
-                            processed_output_path_for_filename(safe_name)
-                            if processed_output_path_for_filename(safe_name).exists()
-                            else None
-                        ),
-                    )
+                job = job_manager.create_session(
+                    original_filename=safe_name,
+                    upload_path=save_path,
+                    columns=inspection.columns,
+                    preview_rows=inspection.preview_rows,
+                    row_count=inspection.row_count,
+                    file_type=inspection.file_type,
+                    resume_output_path=_resume_output_path_for(safe_name),
                 )
+                jobs.append(job)
+                created_session_ids.append(job.job_id)
             except Exception as exc:
                 errors.append(f"{safe_name}: {exc}")
+                shutil.rmtree(save_path.parent, ignore_errors=True)
+                if save_path.parent in created_upload_dirs:
+                    created_upload_dirs.remove(save_path.parent)
 
         if errors:
             raise RuntimeError(" | ".join(errors))
@@ -557,11 +636,68 @@ async def preview_csv(request: Request, files: List[UploadFile] = File(...)):
             build_index_context(request=request, batch=build_batch_payload(batch.batch_id)),
         )
     except Exception as exc:
+        _discard_created_uploads(job_manager, created_session_ids, [], created_upload_dirs)
         return templates.TemplateResponse(
             "index.html",
             build_index_context(request=request, page_error=str(exc)),
             status_code=400,
         )
+
+
+@app.post("/quick-download")
+async def quick_download(
+    request: Request,
+    links: str = Form(""),
+    transcribe: bool = Form(False),
+):
+    link_lines = [line.strip() for line in links.splitlines()]
+    link_lines = [line for line in link_lines if line]
+    if not link_lines:
+        return templates.TemplateResponse(
+            "index.html",
+            build_index_context(request=request, page_error="请至少粘贴一个链接"),
+            status_code=400,
+        )
+
+    upload_dir = UPLOAD_DIR / uuid4().hex
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"quick-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    save_path = upload_dir / safe_name
+    with save_path.open("w", encoding="utf-8-sig", newline="") as output:
+        writer = csv.writer(output)
+        writer.writerow(["链接"])
+        for line in link_lines:
+            writer.writerow([line])
+
+    inspection = inspect_csv(save_path)
+    job = job_manager.create_session(
+        original_filename=safe_name,
+        upload_path=save_path,
+        columns=inspection.columns,
+        preview_rows=inspection.preview_rows,
+        row_count=inspection.row_count,
+        file_type=inspection.file_type,
+    )
+    batch = job_manager.create_batch([job], common_columns=["链接"])
+    options = SimpleNamespace(
+        url_column="链接",
+        transcript_column=DEFAULT_TRANSCRIPT_COLUMN,
+        model_names=DEFAULT_MODEL,
+        overwrite=False,
+        download_only=not transcribe,
+        video_output_dir="",
+        download_workers=DEFAULT_DOWNLOAD_WORKERS,
+        asr_workers=DEFAULT_ASR_WORKERS,
+        batch_delay_seconds=DEFAULT_BATCH_DELAY_SECONDS,
+        anti_crawl_streak_threshold=ANTI_CRAWL_STREAK_THRESHOLD,
+        anti_crawl_cooldown_minutes=ANTI_CRAWL_COOLDOWN_SECONDS // 60,
+        proactive_cooldown_batch_threshold=PROACTIVE_COOLDOWN_BATCH_THRESHOLD,
+        proactive_cooldown_minutes=PROACTIVE_COOLDOWN_SECONDS // 60,
+    )
+    if not _configure_and_start_batch(batch.batch_id, options, mode="full"):
+        _discard_created_uploads(job_manager, [job.job_id], [batch.batch_id], [save_path.parent])
+        raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
+    return RedirectResponse(url=f"/batches/{batch.batch_id}", status_code=303)
 
 
 @app.post("/run/{job_id}")
@@ -696,8 +832,8 @@ async def resume_batch(batch_id: str):
         raise HTTPException(status_code=409, detail="当前批次不在暂停状态")
 
     with _worker_registry_lock:
-        if _worker_is_active(_batch_workers, batch_id):
-            raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
+        if _batch_start_conflict(batch_id):
+            raise HTTPException(status_code=409, detail="批次或其子任务已有 worker 在运行")
         job_manager.queue_existing_batch(batch_id, "批次已恢复")
         if batch.current_job_id:
             current_job = job_manager.get(batch.current_job_id)
@@ -722,6 +858,30 @@ async def skip_batch_cooldown(batch_id: str):
         if current_job and current_job.cooldown_active:
             job_manager.request_skip_cooldown(batch.current_job_id)
     return JSONResponse({"ok": True})
+
+
+@app.post("/batches/{batch_id}/retry-failed")
+async def retry_failed_batch(batch_id: str):
+    batch = job_manager.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    with _worker_registry_lock:
+        if _batch_start_conflict(batch_id):
+            raise HTTPException(status_code=409, detail="批次或其子任务已有 worker 在运行")
+        retryable_job_ids = []
+        for job_id in batch.job_ids:
+            job = job_manager.require(job_id)
+            if job.failed_rows <= 0 or job.status == "running":
+                continue
+            retryable_job_ids.append(job_id)
+        if not retryable_job_ids:
+            raise HTTPException(status_code=409, detail="当前批次没有可重试的失败项")
+
+        job_manager.queue_existing_batch(batch_id, "失败项重试中")
+        if not start_batch_worker(batch_id, mode="retry_failed"):
+            raise HTTPException(status_code=409, detail="批次已有 worker 在运行")
+    return JSONResponse({"ok": True, "jobs": len(retryable_job_ids)})
 
 
 @app.post("/batches/{batch_id}/switch-cookie")
@@ -750,18 +910,45 @@ async def switch_batch_cookie(batch_id: str):
     return JSONResponse({"ok": True, "scheduled": False, "account_label": account.label})
 
 
-@app.post("/accounts/{account_id}/exclude")
-async def exclude_cookie_account(account_id: str):
+@app.post("/accounts")
+async def add_cookie_account(label: str = Form("")):
+    normalized_label = str(label or "").strip()
+    if not normalized_label:
+        raise HTTPException(status_code=400, detail="请输入备注")
+    existing = next(
+        (account for account in cookie_account_manager.list_accounts() if account.label == normalized_label),
+        None,
+    )
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"备注 `{normalized_label}` 已存在，如需更新请使用「重新登录」")
+
+    account = cookie_account_manager.prepare_account(normalized_label)
+    try:
+        start_account_relogin(account.account_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(
+        {
+            "ok": True,
+            "account_id": account.account_id,
+            "message": f"已为 `{account.label}` 打开登录窗口，扫码完成登录后关闭该窗口即可保存。",
+        }
+    )
+
+
+@app.post("/accounts/{account_id}/delete")
+async def delete_cookie_account(account_id: str):
     account = _reconcile_account_relogin_state(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="cookies 账号不存在")
     if account.relogin_in_progress:
         raise HTTPException(status_code=409, detail="该账号正在重新登录中")
-    if account.invalid:
-        return JSONResponse({"ok": True, "status": "excluded"})
 
-    cookie_account_manager.mark_invalid(account_id, "用户手动剔除")
-    return JSONResponse({"ok": True, "status": "excluded"})
+    try:
+        cookie_account_manager.delete_account(account_id)
+    except OSError as exc:
+        raise HTTPException(status_code=409, detail=f"账号文件删除失败：{exc}") from exc
+    return JSONResponse({"ok": True, "status": "deleted"})
 
 
 @app.post("/accounts/{account_id}/reset")
@@ -892,11 +1079,61 @@ async def continue_job(
     if url_column not in job.columns:
         raise HTTPException(status_code=409, detail="所选链接列不存在于该文件")
 
+    if not _has_existing_result(job):
+        raise HTTPException(status_code=409, detail="没有可续跑的结果文件")
+
     if not _configure_and_start_job(
         job_id,
         _form_run_options(locals()),
         mode="continue_existing",
     ):
+        raise HTTPException(status_code=409, detail="任务或所属批次已有 worker 在运行")
+    return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
+
+
+@app.post("/jobs/{job_id}/start")
+async def start_job_with_stored_options(job_id: str, mode: str = Form("full")):
+    if mode not in {"full", "continue_existing"}:
+        raise HTTPException(status_code=400, detail="不支持的运行模式")
+
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if job.status == "running":
+        return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
+
+    source = job
+    if job.url_column is None and job.batch_id:
+        batch = job_manager.get_batch(job.batch_id)
+        if batch and batch.url_column is not None:
+            source = batch
+    if source.url_column is None:
+        raise HTTPException(
+            status_code=409,
+            detail="该任务还没有运行参数，请先在首页配置批次运行参数",
+        )
+
+    options = SimpleNamespace(
+        url_column=source.url_column,
+        transcript_column=source.transcript_column,
+        model_names=source.model_names_text,
+        overwrite=source.overwrite,
+        download_only=source.download_only,
+        video_output_dir=source.video_output_dir or "",
+        download_workers=source.download_workers,
+        asr_workers=source.asr_workers,
+        batch_delay_seconds=source.batch_delay_seconds,
+        anti_crawl_streak_threshold=source.anti_crawl_streak_threshold,
+        anti_crawl_cooldown_minutes=source.anti_crawl_cooldown_seconds // 60,
+        proactive_cooldown_batch_threshold=source.proactive_cooldown_batch_threshold,
+        proactive_cooldown_minutes=source.proactive_cooldown_seconds // 60,
+    )
+
+    if mode == "continue_existing" and not _has_existing_result(job):
+        raise HTTPException(status_code=409, detail="没有可续跑的结果文件")
+
+    if not _configure_and_start_job(job_id, options, mode=mode):
         raise HTTPException(status_code=409, detail="任务或所属批次已有 worker 在运行")
     return RedirectResponse(url=f"/jobs/{job_id}", status_code=303)
 
@@ -930,6 +1167,7 @@ async def job_detail(request: Request, job_id: str):
         {
             "request": request,
             "job": build_job_payload(job_id),
+            "health": build_health_snapshot(),
         },
     )
 
@@ -945,6 +1183,7 @@ async def batch_detail(request: Request, batch_id: str):
         {
             "request": request,
             "batch": build_batch_payload(batch_id),
+            "health": build_health_snapshot(),
         },
     )
 
@@ -955,6 +1194,38 @@ async def job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
     return JSONResponse(build_job_payload(job_id))
+
+
+@app.get("/api/jobs/{job_id}/rows")
+async def job_rows(job_id: str, offset: int = 0, limit: int = 50):
+    job = job_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    source_path = job.output_path
+    if not source_path or not Path(source_path).exists():
+        source_path = job.upload_path
+    try:
+        inspection = inspect_csv(Path(source_path))
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=f"结果文件不存在或暂不可读：{exc}")
+    dataframe = inspection.dataframe
+    total = len(dataframe)
+    offset = max(0, offset)
+    limit = max(1, min(int(limit), 200))
+    page_rows = [
+        {column: stringify_cell(value) for column, value in row.items()}
+        for row in dataframe.iloc[offset : offset + limit].to_dict(orient="records")
+    ]
+    return JSONResponse(
+        {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "columns": inspection.columns,
+            "rows": page_rows,
+        }
+    )
 
 
 @app.get("/api/batches/{batch_id}")
@@ -980,49 +1251,56 @@ async def api_preview_csv(files: List[UploadFile] = File(...)):
     jobs = []
     inspections = []
     jobs_payload = []
-    for file in valid_files:
-        safe_name = Path(file.filename or "").name
-        save_path = save_upload_file(file)
-        with save_path.open("wb") as output:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
+    created_session_ids: List[str] = []
+    created_upload_dirs: List[Path] = []
+    try:
+        for file in valid_files:
+            safe_name = Path(file.filename or "").name
+            save_path = save_upload_file(file)
+            created_upload_dirs.append(save_path.parent)
+            with save_path.open("wb") as output:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
 
-        try:
-            inspection = inspect_csv(save_path)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{safe_name}: {exc}")
+            try:
+                inspection = inspect_csv(save_path)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"{safe_name}: {exc}")
 
-        resume_output_path = processed_output_path_for_filename(safe_name)
-        job = job_manager.create_session(
-            original_filename=safe_name,
-            upload_path=save_path,
-            columns=inspection.columns,
-            preview_rows=inspection.preview_rows,
-            row_count=inspection.row_count,
-            file_type=inspection.file_type,
-            resume_output_path=resume_output_path if resume_output_path.exists() else None,
+            job = job_manager.create_session(
+                original_filename=safe_name,
+                upload_path=save_path,
+                columns=inspection.columns,
+                preview_rows=inspection.preview_rows,
+                row_count=inspection.row_count,
+                file_type=inspection.file_type,
+                resume_output_path=_resume_output_path_for(safe_name),
+            )
+            created_session_ids.append(job.job_id)
+            inspections.append(inspection)
+            jobs.append(job)
+            jobs_payload.append(
+                {
+                    "job_id": job.job_id,
+                    "original_filename": job.original_filename,
+                    "columns": inspection.columns,
+                    "row_count": inspection.row_count,
+                    "file_type": inspection.file_type,
+                    "preview_rows": inspection.preview_rows,
+                    "resume_output_path": str(job.resume_output_path) if job.resume_output_path else None,
+                }
+            )
+
+        batch = job_manager.create_batch(
+            jobs,
+            common_columns=compute_common_columns([inspection.columns for inspection in inspections]),
         )
-        inspections.append(inspection)
-        jobs.append(job)
-        jobs_payload.append(
-            {
-                "job_id": job.job_id,
-                "original_filename": job.original_filename,
-                "columns": inspection.columns,
-                "row_count": inspection.row_count,
-                "file_type": inspection.file_type,
-                "preview_rows": inspection.preview_rows,
-                "resume_output_path": str(job.resume_output_path) if job.resume_output_path else None,
-            }
-        )
-
-    batch = job_manager.create_batch(
-        jobs,
-        common_columns=compute_common_columns([inspection.columns for inspection in inspections]),
-    )
+    except Exception:
+        _discard_created_uploads(job_manager, created_session_ids, [], created_upload_dirs)
+        raise
     return JSONResponse(
         {
             "batch_id": batch.batch_id,
@@ -1038,6 +1316,8 @@ def _start_job_from_api(job_id: str, options: ApiRunOptions, mode: str) -> Dict[
         raise HTTPException(status_code=404, detail="任务不存在")
     if job.status == "running":
         return build_job_payload(job_id)
+    if mode == "continue_existing" and not _has_existing_result(job):
+        raise HTTPException(status_code=409, detail="没有可续跑的结果文件")
     if options.url_column not in job.columns:
         raise HTTPException(status_code=409, detail="所选链接列不存在于该文件")
     if not _configure_and_start_job(job_id, options, mode=mode):
@@ -1051,6 +1331,10 @@ def _start_batch_from_api(batch_id: str, options: ApiRunOptions, mode: str) -> D
         raise HTTPException(status_code=404, detail="批次不存在")
     if batch.status == "running":
         return build_batch_payload(batch_id)
+    if mode == "continue_existing" and not any(
+        _has_existing_result(job_manager.require(job_id)) for job_id in batch.job_ids
+    ):
+        raise HTTPException(status_code=409, detail="当前批次没有可续跑的结果文件")
     if not batch.common_columns:
         raise HTTPException(status_code=409, detail="这批文件没有共同表头，无法统一配置")
     if options.url_column not in batch.common_columns:
@@ -1105,8 +1389,19 @@ async def download_batch_results(batch_id: str):
 
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+        used_names = set()
         for job in ready_jobs:
-            archive.write(job.output_path, arcname=Path(job.output_path).name)
+            arcname = Path(job.output_path).name
+            if arcname in used_names:
+                # 正常命名已含 job_id 前 8 位不会撞名；此处兜底防同名文件在 zip 内互相覆盖
+                stem = Path(arcname).stem
+                suffix = Path(arcname).suffix
+                if stem.endswith(".processed"):
+                    arcname = f"{stem[: -len('.processed')]}-{job.job_id[:8]}.processed.csv"
+                else:
+                    arcname = f"{stem}-{job.job_id[:8]}{suffix}"
+            used_names.add(arcname)
+            archive.write(job.output_path, arcname=arcname)
 
     buffer.seek(0)
     filename = f"batch_{batch_id[:8]}.zip"

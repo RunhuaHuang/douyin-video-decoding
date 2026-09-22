@@ -5,6 +5,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
+# probe/抽取/合并遇到异常输入都可能挂住不返回，统一给子进程超时，避免占死工作线程
+FFMPEG_TIMEOUT_SECONDS = 300
+
 
 class FfmpegService:
     def __init__(self) -> None:
@@ -36,7 +39,10 @@ class FfmpegService:
             "json",
             str(video_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("媒体探测失败: 探测超时，请检查输入文件") from exc
         if result.returncode != 0:
             message = self._extract_error_message(result.stderr)
             raise RuntimeError(f"媒体探测失败: {message}")
@@ -85,7 +91,10 @@ class FfmpegService:
             "-y",
             str(output_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("音频提取失败: ffmpeg 执行超时") from exc
         if result.returncode != 0:
             message = self._extract_error_message(result.stderr)
             raise RuntimeError(f"音频提取失败: {message}")
@@ -100,6 +109,8 @@ class FfmpegService:
             raise RuntimeError("补充音频不是有效音轨")
 
         merged_path = video_path.with_name(f"{video_path.stem}_merged.mp4")
+        # 同源分离流音视频时长一致；不要加 -shortest：-c:v copy 下它会按关键帧
+        # 对齐截断，容易把片尾截掉丢内容
         command = [
             ffmpeg_path,
             "-i",
@@ -114,11 +125,13 @@ class FfmpegService:
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
             "-y",
             str(merged_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("音视频合并失败: ffmpeg 执行超时") from exc
         if result.returncode != 0:
             message = self._extract_error_message(result.stderr)
             raise RuntimeError(f"音视频合并失败: {message}")

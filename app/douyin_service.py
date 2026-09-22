@@ -97,6 +97,14 @@ class DownloadResult:
     audio_attempts: int = 0
 
 
+class DownloadForbiddenError(RuntimeError):
+    """下载被连续拒绝（403 限流）：直连候选与浏览器兜底均命中 403。"""
+
+
+class NonVideoDownloadError(RuntimeError):
+    """下载目标不是视频：图文 note 的地址返回 404/无效内容。"""
+
+
 class DouyinService:
     NON_VIDEO_NOTE_ERROR = "链接类型为图文 note，非视频内容"
 
@@ -307,14 +315,34 @@ class DouyinService:
                 errors.append("浏览器兜底不可用")
 
         summary = ", ".join(self._summarize_errors(errors))
-        raise RuntimeError(summary or "所有下载策略都失败了")
+        message = summary or "所有下载策略都失败了"
+        # 结构化指纹：message 与旧字符串逐字一致，仅异常类型区分，供 pipeline 做 isinstance 判断
+        direct_errors = [error for error in errors if "浏览器兜底" not in error]
+        browser_errors = [error for error in errors if "浏览器兜底" in error]
+        if direct_errors and all(error.startswith("HTTP 403") for error in direct_errors) and any(
+            "403" in error for error in browser_errors
+        ):
+            raise DownloadForbiddenError(message)
+        if (
+            any(error == "返回内容不是有效视频" for error in errors)
+            and any(error.startswith("HTTP 404") for error in errors)
+            and any("返回内容不是有效媒体" in error and "404" in error for error in browser_errors)
+        ):
+            raise NonVideoDownloadError(message)
+        raise RuntimeError(message)
 
     @staticmethod
     def extract_first_url(text: str) -> Optional[str]:
         matches = re.findall(r"http[s]?://[^\s]+", text)
         if not matches:
             return None
-        return matches[0].rstrip("，。！？；,!?;）)]")
+        douyin_matches = [
+            match
+            for match in matches
+            if any(domain in match for domain in ("v.douyin.com", "www.douyin.com", "iesdouyin.com"))
+        ]
+        target = douyin_matches[0] if douyin_matches else matches[0]
+        return target.rstrip("，。！？；,!?;）)]\"'“”‘’<>")
 
     @staticmethod
     def extract_video_id(url: str) -> Optional[str]:
@@ -548,13 +576,21 @@ class DouyinService:
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             with output_path.open("wb") as file_handle:
-                for chunk in response.iter_bytes():
-                    if chunk:
-                        if len(buffer) < 1024:
-                            remaining = 1024 - len(buffer)
-                            buffer.extend(chunk[:remaining])
-                        file_handle.write(chunk)
+                try:
+                    for chunk in response.iter_bytes():
+                        if chunk:
+                            if len(buffer) < 1024:
+                                remaining = 1024 - len(buffer)
+                                buffer.extend(chunk[:remaining])
+                            file_handle.write(chunk)
+                except Exception:
+                    # 中途异常时清理半成品文件，避免误用截断内容
+                    output_path.unlink(missing_ok=True)
+                    raise
         if not self._looks_like_media_payload(bytes(buffer), content_type, url):
+            # 流式响应未 read 时 .text 会抛 ResponseNotRead，前 1024 字节 buffer 判定 HTML 挑战页
+            if self._looks_like_challenge_page(bytes(buffer).decode("utf-8", errors="ignore")):
+                self._note_challenge("验证码挑战页")
             output_path.unlink(missing_ok=True)
             raise RuntimeError("返回内容不是有效视频")
 

@@ -5,7 +5,12 @@ from pathlib import Path
 import httpx
 
 from app.browser_service import BrowserCapture, BrowserDownloadResult
-from app.douyin_service import DouyinService, ParsedVideo
+from app.douyin_service import (
+    DouyinService,
+    DownloadForbiddenError,
+    NonVideoDownloadError,
+    ParsedVideo,
+)
 
 
 class FakeBrowserResolver:
@@ -626,3 +631,213 @@ def test_download_video_browser_first_prefers_browser(tmp_path):
     assert resolver.download_calls == 1
     assert output_path.read_bytes() == b"browser-video"
     assert seen_requests == []
+
+
+def test_stream_download_notes_challenge_when_html_captcha_page_unread(tmp_path):
+    # 迭代器 content 保持 _content 未加载，模拟真实流式响应下 .text 抛 ResponseNotRead 的场景
+    html_chunks = [
+        b"<html><head><script src=\"https://lf-cdn-tos.bytescm.com/obj/static/captcha/index.js\"></script></head>",
+        b"<body>sec_sdk_build</body></html>",
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/html; charset=utf-8"},
+            content=iter(html_chunks),
+        )
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        browser_fallback_enabled=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    output_path = tmp_path / "video.mp4"
+    try:
+        service._stream_download("https://cdn.example.com/play/video_a.mp4", output_path, {})
+    except RuntimeError as exc:
+        assert str(exc) == "返回内容不是有效视频"
+    else:
+        raise AssertionError("expected html captcha page to be rejected as invalid video")
+    finally:
+        reasons = service.consume_attempt_challenge_signal_reasons()
+        service.close()
+
+    assert not output_path.exists()
+    assert "验证码挑战页" in reasons
+
+
+def test_stream_download_removes_partial_file_when_stream_aborts(tmp_path):
+    def broken_stream():
+        yield b"partial-video-bytes"
+        raise RuntimeError("connection reset")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "video/mp4"},
+            content=broken_stream(),
+        )
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        browser_fallback_enabled=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    output_path = tmp_path / "video.mp4"
+    try:
+        service._stream_download("https://cdn.example.com/play/video_a.mp4", output_path, {})
+    except RuntimeError as exc:
+        assert "connection reset" in str(exc)
+    else:
+        raise AssertionError("expected mid-stream failure to propagate")
+    finally:
+        service.close()
+
+    assert not output_path.exists()
+
+
+def test_extract_first_url_prefers_douyin_domain():
+    text = "先看 https://example.com/intro 再复制 https://v.douyin.com/AbC123/ 到浏览器"
+
+    assert DouyinService.extract_first_url(text) == "https://v.douyin.com/AbC123/"
+
+
+def test_extract_first_url_falls_back_to_first_url_when_no_douyin_link():
+    text = "参考 https://example.com/a 和 https://another.example.com/b"
+
+    assert DouyinService.extract_first_url(text) == "https://example.com/a"
+
+
+def test_extract_first_url_strips_trailing_quote_and_bracket_chars():
+    text = '分享"<https://www.douyin.com/video/7411111111111111111>"'
+
+    assert DouyinService.extract_first_url(text) == "https://www.douyin.com/video/7411111111111111111"
+
+
+class DownloadForbiddenBrowserResolver(FakeBrowserResolver):
+    def download_video(self, share_url, output_path, candidate_urls, audio_output_path=None):
+        raise RuntimeError("浏览器兜底下载失败: HTTP 403 x2")
+
+
+class Download404BrowserResolver(FakeBrowserResolver):
+    def download_video(self, share_url, output_path, candidate_urls, audio_output_path=None):
+        raise RuntimeError("浏览器兜底下载失败: 返回内容不是有效媒体, HTTP 404")
+
+
+def test_download_video_raises_forbidden_error_when_all_paths_hit_403(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, request=request)
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        browser_resolver=DownloadForbiddenBrowserResolver(),
+        browser_first=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    video = ParsedVideo(
+        video_id="7411111111111111111",
+        title="demo",
+        author="tester",
+        download_urls=("https://cdn.example.com/playwm/video_a.mp4",),
+        share_url="https://v.douyin.com/example/",
+        page_url="https://www.douyin.com/video/7411111111111111111",
+        resolved_by="解析接口",
+    )
+
+    try:
+        service.download_video(video, tmp_path / "video.mp4")
+    except RuntimeError as exc:
+        assert type(exc) is DownloadForbiddenError
+        assert str(exc) == "HTTP 403 Forbidden x2, 浏览器兜底失败: 浏览器兜底下载失败: HTTP 403 x2"
+    else:
+        raise AssertionError("expected DownloadForbiddenError when all paths hit 403")
+    finally:
+        service.close()
+
+
+def test_download_video_raises_non_video_error_for_note_404_pattern(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "cdn.example.com/playwm/" in url:
+            return httpx.Response(404, request=request)
+        if "cdn.example.com/play/" in url:
+            return httpx.Response(200, request=request, text="<html><body>note page</body></html>")
+        return httpx.Response(200, request=request, text="<html></html>")
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        browser_resolver=Download404BrowserResolver(),
+        browser_first=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    video = ParsedVideo(
+        video_id="7411111111111111111",
+        title="demo",
+        author="tester",
+        download_urls=("https://cdn.example.com/playwm/video_a.mp4",),
+        share_url="https://v.douyin.com/example/",
+        page_url="https://www.douyin.com/video/7411111111111111111",
+        resolved_by="解析接口",
+    )
+
+    try:
+        service.download_video(video, tmp_path / "video.mp4")
+    except RuntimeError as exc:
+        assert type(exc) is NonVideoDownloadError
+        assert str(exc) == (
+            "返回内容不是有效视频, HTTP 404 Not Found, "
+            "浏览器兜底失败: 浏览器兜底下载失败: 返回内容不是有效媒体, HTTP 404"
+        )
+    else:
+        raise AssertionError("expected NonVideoDownloadError for note-style 404 pattern")
+    finally:
+        service.close()
+
+
+def test_download_video_keeps_plain_runtime_error_for_other_failures(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=request)
+
+    service = DouyinService(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        browser_fallback_enabled=False,
+        browser_first=False,
+        request_interval_range=(0.0, 0.0),
+        sleep_fn=lambda _: None,
+        jitter_fn=lambda a, b: 0.0,
+    )
+
+    video = ParsedVideo(
+        video_id="7411111111111111111",
+        title="demo",
+        author="tester",
+        download_urls=("https://cdn.example.com/play/video_a.mp4",),
+        share_url="https://v.douyin.com/example/",
+        page_url="https://www.douyin.com/video/7411111111111111111",
+        resolved_by="解析接口",
+    )
+
+    try:
+        service.download_video(video, tmp_path / "video.mp4")
+    except RuntimeError as exc:
+        assert type(exc) is RuntimeError
+        assert "HTTP 500 Internal Server Error" in str(exc)
+    else:
+        raise AssertionError("expected plain RuntimeError for unclassified failures")
+    finally:
+        service.close()

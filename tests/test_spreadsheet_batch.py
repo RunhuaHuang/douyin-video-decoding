@@ -37,7 +37,7 @@ def test_write_csv_writes_xlsx_when_output_suffix_is_xlsx(tmp_path):
     assert loaded.loc[0, "视频文本"] == "hello"
 
 
-def test_job_manager_can_create_batch_snapshot():
+def test_job_manager_can_create_batch_snapshot(tmp_path):
     manager = JobManager()
     job_a = manager.create_session(
         original_filename="1.csv",
@@ -45,7 +45,7 @@ def test_job_manager_can_create_batch_snapshot():
         columns=["链接", "标题"],
         preview_rows=[],
         row_count=10,
-        resume_output_path=Path("1.processed.csv"),
+        resume_output_path=tmp_path / "1.processed.csv",
     )
     job_b = manager.create_session(
         original_filename="2.xlsx",
@@ -54,6 +54,7 @@ def test_job_manager_can_create_batch_snapshot():
         preview_rows=[],
         row_count=20,
     )
+    job_a.resume_output_path.write_text("链接,处理状态\nhttps://example.com,成功\n", encoding="utf-8-sig")
 
     batch = manager.create_batch([job_a, job_b], common_columns=["链接", "标题"])
     snapshot = manager.batch_snapshot(batch.batch_id)
@@ -69,6 +70,10 @@ def test_job_manager_can_create_batch_snapshot():
 def test_build_processed_output_name_always_returns_csv():
     assert build_processed_output_name("1.csv") == "1.processed.csv"
     assert build_processed_output_name("2.xlsx") == "2.processed.csv"
+
+
+def test_build_processed_output_name_appends_job_id_prefix():
+    assert build_processed_output_name("1.csv", "abcd1234efgh5678") == "1.abcd1234.processed.csv"
 
 
 def test_batch_download_returns_zip_with_all_ready_outputs(tmp_path):
@@ -123,7 +128,9 @@ def test_preview_detects_existing_processed_output(tmp_path, monkeypatch):
 
     from app import main as main_module
 
-    monkeypatch.setattr(main_module, "processed_output_path_for_filename", lambda _: existing_output)
+    monkeypatch.setattr(
+        main_module, "find_latest_processed_path", lambda *args, **kwargs: existing_output, raising=False
+    )
 
     client = TestClient(app)
     response = client.post(

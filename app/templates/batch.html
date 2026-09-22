@@ -3,50 +3,217 @@
 {% block title %}批次 | 抖音文案提取{% endblock %}
 
 {% block content %}
+<style>
+  .batch-page .page-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin: 0 0 var(--space-4);
+  }
+  .batch-page .page-head-main {
+    min-width: 0;
+  }
+  .batch-page .page-title {
+    margin: 0;
+    font-size: var(--text-xl);
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    line-height: 1.35;
+  }
+  .batch-page .page-id {
+    margin-top: 2px;
+    color: var(--text-3);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
+  }
+  .batch-page .page-head-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex: 0 0 auto;
+    padding-top: 2px;
+  }
+  .batch-page .grid-2 {
+    margin-bottom: var(--space-4);
+  }
+  .batch-page .grid-2 > .card {
+    margin-bottom: 0;
+  }
+  .batch-page .param-list {
+    display: grid;
+    gap: 0 var(--space-5);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin: 0;
+  }
+  .batch-page .param-list > div {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-width: 0;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .batch-page .param-list > .span-2 {
+    grid-column: 1 / -1;
+  }
+  .batch-page .param-list dt {
+    color: var(--text-3);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .batch-page .param-list dd {
+    margin: 0;
+    color: var(--text-1);
+    font-size: var(--text-sm);
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+  .batch-page .cookie-table {
+    table-layout: fixed;
+  }
+  .batch-page .cookie-table th:nth-child(1) { width: 14%; }
+  .batch-page .cookie-table th:nth-child(2) { width: 15%; }
+  .batch-page .cookie-table th:nth-child(3) { width: 18%; }
+  .batch-page .cookie-table th:nth-child(4) { width: 11%; }
+  .batch-page .cookie-table th:nth-child(6) { width: 172px; }
+  .batch-page .cookie-table .file-name {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .batch-page .cookie-table .num-cell {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+  .batch-page .cookie-table .reason-cell {
+    color: var(--text-2);
+    font-size: var(--text-xs);
+    overflow-wrap: anywhere;
+  }
+  .batch-page .row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .batch-page .msg-cell {
+    max-width: 240px;
+    color: var(--text-2);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  @media (max-width: 900px) {
+    .batch-page .param-list {
+      grid-template-columns: 1fr;
+    }
+    .batch-page .page-head {
+      flex-direction: column;
+    }
+  }
+  .batch-page .cell-role {
+    color: var(--text-3);
+    font-size: var(--text-xs);
+    font-weight: 400;
+    white-space: nowrap;
+  }
+  .batch-page .live-label {
+    margin-left: 6px;
+    color: var(--text-3);
+    font-size: var(--text-xs);
+    font-weight: 400;
+    vertical-align: middle;
+  }
+  .batch-page #batch-job-table th:last-child,
+  .batch-page #batch-job-table td:last-child {
+    width: 132px;
+    white-space: nowrap;
+  }
+</style>
+
+{% set status_badges = {
+  "uploaded": "badge-neutral",
+  "queued": "badge-info",
+  "running": "badge-info",
+  "paused": "badge-warning",
+  "completed": "badge-success",
+  "failed": "badge-danger",
+} %}
+
+{% macro status_text(status) -%}
+  {%- if status == "completed" %}已完成{% elif status == "failed" %}失败{% elif status == "running" %}运行中{% elif status == "paused" %}已暂停{% elif status == "queued" %}排队中{% elif status == "uploaded" %}待配置{% else %}{{ status }}{% endif -%}
+{%- endmacro %}
+
+<div class="batch-page">
+  {% include "_health.html" %}
+
+  <div class="page-head">
+    <div class="page-head-main">
+      <h1 class="page-title">批次详情</h1>
+      <p class="page-id mono copyable" id="batch-id" title="点击复制">{{ batch.batch_id }}</p>
+    </div>
+    <div class="page-head-actions">
+      <a class="btn btn-ghost" href="/">返回</a>
+      <a
+        class="btn btn-primary {% if not (batch.jobs | selectattr('output_path') | list) %}is-disabled{% endif %}"
+        id="download-batch-link"
+        href="{% if batch.jobs | selectattr('output_path') | list %}/download/batches/{{ batch.batch_id }}{% else %}#{% endif %}"
+      >
+        打包下载
+      </a>
+    </div>
+  </div>
+
   <section class="card">
-    <div class="section-head">
-      <h2>批次</h2>
-      <p class="mono" id="batch-id">{{ batch.batch_id }}</p>
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">
+          处理状态
+          <span class="live-dot" title="实时刷新" style="display:inline-block; margin-left:6px; vertical-align:middle"></span>
+          <span class="live-label">实时</span>
+        </h2>
+        <p class="card-subtitle">每 2 秒自动刷新，操作即时生效。</p>
+      </div>
+      <div class="card-header-actions">
+        <span class="badge {{ status_badges.get(batch.status, "badge-neutral") }}" id="batch-status">{{ status_text(batch.status) }}</span>
+        <span
+          class="badge badge-warning {% if not (batch.cooldown_active and batch.cooldown_remaining_seconds) %}is-hidden{% endif %}"
+          id="batch-cooldown-countdown"
+        >
+          {%- if batch.cooldown_active and batch.cooldown_remaining_seconds -%}
+            {%- set remaining_minutes = batch.cooldown_remaining_seconds // 60 -%}
+            {%- set remaining_seconds = batch.cooldown_remaining_seconds % 60 -%}
+            冷却剩余 {{ "%02d" | format(remaining_minutes) }}:{{ "%02d" | format(remaining_seconds) }}
+          {%- endif -%}
+        </span>
+      </div>
     </div>
 
-    <div class="pill-row">
-      <span class="pill" id="batch-status">{{ batch.status }}</span>
-      <span class="pill pill-muted">{{ batch.total_files }} 个文件</span>
-      <span class="pill pill-muted">链接列 {{ batch.url_column or "-" }}</span>
-      <span class="pill pill-muted">文本列 {{ batch.transcript_column or "-" }}</span>
-      <span class="pill pill-muted">下载并发 {{ batch.download_workers }}</span>
-      <span class="pill pill-muted">ASR 并发 {{ batch.asr_workers }}</span>
-      <span class="pill pill-muted">批间等待 {{ batch.batch_delay_seconds }}s</span>
-      <span class="pill pill-muted">风控阈值 {{ batch.anti_crawl_streak_threshold }} 条</span>
-      <span class="pill pill-muted">风控冷却 {{ (batch.anti_crawl_cooldown_seconds // 60) }} 分钟</span>
-      <span class="pill pill-muted">主动冷却 {{ batch.proactive_cooldown_batch_threshold }} 批</span>
-      <span class="pill pill-muted">主动冷却时长 {{ (batch.proactive_cooldown_seconds // 60) }} 分钟</span>
-      <span class="pill pill-muted">{{ (batch.model_names or []) | join(" | ") }}</span>
-      <span class="pill pill-muted" id="batch-cookie-current">当前 cookies {{ batch.current_cookie_label or "-" }}</span>
-      <span class="pill pill-muted" id="batch-cookie-next">下一个 {{ batch.cookie_pool.next_label or "-" }}</span>
-      <span class="pill pill-muted" id="batch-cookie-batches">距上次切换 {{ batch.cookie_batches_since_switch }} 批</span>
-    </div>
-
-    <div class="metric-grid">
-      <div class="metric-card">
-        <span>文件总数</span>
-        <strong id="metric-total-files">{{ batch.total_files }}</strong>
+    <div class="grid-auto">
+      <div class="metric">
+        <span class="metric-label">文件总数</span>
+        <span class="metric-value" id="metric-total-files">{{ batch.total_files }}</span>
       </div>
-      <div class="metric-card">
-        <span>已完成</span>
-        <strong id="metric-completed-files">{{ batch.completed_files }}</strong>
+      <div class="metric">
+        <span class="metric-label">已完成</span>
+        <span class="metric-value" id="metric-completed-files">{{ batch.completed_files }}</span>
       </div>
-      <div class="metric-card">
-        <span>运行中</span>
-        <strong id="metric-running-files">{{ batch.running_files }}</strong>
+      <div class="metric">
+        <span class="metric-label">运行中</span>
+        <span class="metric-value" id="metric-running-files">{{ batch.running_files }}</span>
       </div>
-      <div class="metric-card">
-        <span>失败</span>
-        <strong id="metric-failed-files">{{ batch.failed_files }}</strong>
+      <div class="metric">
+        <span class="metric-label">失败</span>
+        <span class="metric-value" id="metric-failed-files">{{ batch.failed_files }}</span>
       </div>
-      <div class="metric-card">
-        <span>暂停</span>
-        <strong id="metric-paused-files">{{ batch.paused_files }}</strong>
+      <div class="metric">
+        <span class="metric-label">暂停</span>
+        <span class="metric-value" id="metric-paused-files">{{ batch.paused_files }}</span>
       </div>
     </div>
 
@@ -57,7 +224,7 @@
           {% if batch.current_file_index %}{{ batch.current_file_index }}/{{ batch.total_files }}{% endif %}
         </span>
       </div>
-      <div class="progress-track">
+      <div class="progress">
         {% set total = batch.total_rows or 1 %}
         {% set percent = (batch.processed_rows / total * 100) if total else 0 %}
         <div class="progress-fill" id="batch-progress-fill" style="width: {{ percent }}%;"></div>
@@ -65,83 +232,130 @@
     </div>
 
     <div id="batch-error-box" class="card-inline card-error {% if not batch.error_message %}is-hidden{% endif %}">
-      <strong>失败</strong>
+      <strong>批次失败</strong>
       <p id="batch-error-text">{{ batch.error_message }}</p>
     </div>
 
+    {% set retryable_jobs = batch.jobs | selectattr("failed_rows", "gt", 0) | selectattr("status", "ne", "running") | list %}
     <div class="action-row">
-      <a class="button button-secondary" href="/">返回</a>
-      <button class="button button-secondary {% if batch.status != 'running' %}is-disabled{% endif %}" id="pause-batch-button" type="button">
-        暂停批次
+      <button class="btn btn-accent {% if batch.status == 'running' or not retryable_jobs %}is-disabled{% endif %}" id="retry-batch-button" type="button">
+        重试所有失败项
       </button>
-      <button class="button button-secondary {% if batch.status != 'paused' %}is-disabled{% endif %}" id="resume-batch-button" type="button">
-        继续批次
+      <button class="btn btn-secondary {% if batch.status != 'running' %}is-disabled{% endif %}" id="pause-batch-button" type="button">
+        暂停
       </button>
-      <button class="button button-secondary {% if not batch.cooldown_active %}is-disabled{% endif %}" id="skip-batch-cooldown-button" type="button">
-        立即继续
+      <button class="btn btn-secondary {% if batch.status != 'paused' %}is-disabled{% endif %}" id="resume-batch-button" type="button">
+        继续
+      </button>
+      <button class="btn btn-secondary {% if not batch.cooldown_active %}is-disabled{% endif %}" id="skip-batch-cooldown-button" type="button">
+        跳过冷却
       </button>
       <button
-        class="button button-secondary {% if batch.cookie_pool.switchable_count <= 1 or batch.cookie_switch_requested %}is-disabled{% endif %}"
+        class="btn btn-secondary {% if batch.cookie_pool.switchable_count <= 1 or batch.cookie_switch_requested %}is-disabled{% endif %}"
         id="switch-batch-cookie-button"
         type="button"
       >
         {% if batch.cookie_switch_requested %}切换已排队{% else %}强制切换 cookies{% endif %}
       </button>
-      <a
-        class="button button-primary {% if not (batch.jobs | selectattr('output_path') | list) %}is-disabled{% endif %}"
-        id="download-batch-link"
-        href="{% if batch.jobs | selectattr('output_path') | list %}/download/batches/{{ batch.batch_id }}{% else %}#{% endif %}"
-      >
-        打包下载
-      </a>
     </div>
   </section>
 
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">运行参数</h2>
+          <p class="card-subtitle">批次启动时锁定，本批次内不变。</p>
+        </div>
+      </div>
+      <dl class="param-list">
+        <div><dt>文件数</dt><dd class="mono">{{ batch.total_files }}</dd></div>
+        <div><dt>链接列</dt><dd class="mono">{{ batch.url_column or "-" }}</dd></div>
+        <div><dt>文本列</dt><dd class="mono">{{ batch.transcript_column or "-" }}</dd></div>
+        <div><dt>下载并发</dt><dd class="mono">{{ batch.download_workers }}</dd></div>
+        <div><dt>ASR 并发</dt><dd class="mono">{{ batch.asr_workers }}</dd></div>
+        <div><dt>批间等待</dt><dd class="mono">{{ batch.batch_delay_seconds }}s</dd></div>
+        <div><dt>风控阈值</dt><dd class="mono">{{ batch.anti_crawl_streak_threshold }} 条</dd></div>
+        <div><dt>风控冷却</dt><dd class="mono">{{ (batch.anti_crawl_cooldown_seconds // 60) }} 分钟</dd></div>
+        <div><dt>主动冷却</dt><dd class="mono">{{ batch.proactive_cooldown_batch_threshold }} 批</dd></div>
+        <div><dt>冷却时长</dt><dd class="mono">{{ (batch.proactive_cooldown_seconds // 60) }} 分钟</dd></div>
+        <div class="span-2"><dt>模型</dt><dd class="mono">{{ (batch.model_names or []) | join(" | ") }}</dd></div>
+      </dl>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">Cookie 轮换</h2>
+          <p class="card-subtitle">会话切换与冷却状态实时更新。</p>
+        </div>
+      </div>
+      <dl class="param-list">
+        <div><dt>当前账号</dt><dd id="batch-cookie-current">{{ batch.current_cookie_label or "-" }}</dd></div>
+        <div><dt>下一个</dt><dd id="batch-cookie-next">{{ batch.cookie_pool.next_label or "-" }}</dd></div>
+        <div><dt>距上次切换</dt><dd class="mono" id="batch-cookie-batches">{{ batch.cookie_batches_since_switch or 0 }} 批</dd></div>
+        <div class="span-2"><dt>上次切换原因</dt><dd id="batch-cookie-last-reason">{{ batch.cookie_last_switch_reason or "—" }}</dd></div>
+      </dl>
+    </section>
+  </div>
+
   <section class="card">
-    <div class="section-head">
-      <h2>Cookies 状态</h2>
-      <p>账号剔除和自动切换状态会在这里更新。</p>
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">账号池</h2>
+        <p class="card-subtitle">账号状态与删除、重新登录操作。</p>
+      </div>
     </div>
-    <div class="table-shell">
-      <table class="account-table">
+    <div class="table-wrap">
+      <table class="cookie-table">
         <thead>
           <tr>
-            <th class="col-label nowrap">备注</th>
-            <th class="col-status nowrap">状态</th>
-            <th class="col-file nowrap">文件</th>
-            <th class="col-signal nowrap">强信号计数</th>
-            <th class="col-reason nowrap">最近原因</th>
-            <th class="col-actions nowrap">操作</th>
+            <th>备注</th>
+            <th>状态</th>
+            <th>文件</th>
+            <th>强信号计数</th>
+            <th>最近原因</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody id="batch-cookie-account-body">
           {% if batch.cookie_pool.accounts %}
             {% for account in batch.cookie_pool.accounts %}
               <tr>
-                <td class="account-label-cell">{{ account.label }}</td>
-                <td class="account-status-cell nowrap">
-                  {{ account.status_text }}
-                  {% if account.is_current %}(当前){% elif account.is_next %}(下一个){% endif %}
+                <td>
+                  {{ account.label }}
+                  {% if account.is_current %}<span class="cell-role">(当前)</span>{% elif account.is_next %}<span class="cell-role">(下一个)</span>{% endif %}
                 </td>
-                <td class="account-file-cell" title="{{ account.storage_state_path }}">
-                  <span class="account-file-name">{{ account.storage_state_name }}</span>
+                <td class="nowrap">
+                  {% if account.invalid %}
+                    <span class="badge badge-danger">{{ account.status_text }}</span>
+                  {% elif account.warning %}
+                    <span class="badge badge-warning">{{ account.status_text }}</span>
+                  {% elif account.relogin_in_progress %}
+                    <span class="badge badge-info">{{ account.status_text }}</span>
+                  {% else %}
+                    <span class="badge badge-success">{{ account.status_text }}</span>
+                  {% endif %}
                 </td>
-                <td class="account-signal-cell nowrap">{{ account.challenge_strikes }}</td>
-                <td class="account-reason-cell" title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}">
+                <td title="{{ account.storage_state_path }}">
+                  <span class="file-name">{{ account.storage_state_name }}</span>
+                </td>
+                <td class="num-cell">{{ account.challenge_strikes }}</td>
+                <td class="reason-cell" title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}">
                   {{ account.warning_reason or account.invalid_reason or account.last_issue_reason or "-" }}
                 </td>
-                <td class="account-actions-cell">
-                  <div class="account-actions">
+                <td>
+                  <div class="row-actions">
                     <button
-                      class="button button-secondary button-compact account-action-button {% if account.invalid or account.relogin_in_progress %}is-disabled{% endif %}"
+                      class="btn btn-danger btn-sm account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
                       type="button"
-                      data-action="exclude"
+                      data-action="delete"
                       data-account-id="{{ account.account_id }}"
                     >
-                      剔除
+                      删除
                     </button>
                     <button
-                      class="button button-accent button-compact account-action-button"
+                      class="btn btn-secondary btn-sm account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
                       type="button"
                       data-action="relogin"
                       data-account-id="{{ account.account_id }}"
@@ -149,7 +363,7 @@
                       重新登录
                     </button>
                     <button
-                      class="button button-ghost button-compact account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      class="btn btn-ghost btn-sm account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
                       type="button"
                       data-action="reset"
                       data-account-id="{{ account.account_id }}"
@@ -169,45 +383,68 @@
   </section>
 
   <section class="card">
-    <div class="section-head">
-      <h2>文件进度</h2>
-      <p>结果会持续更新，可随时下载当前进度文件。</p>
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">文件进度</h2>
+        <p class="card-subtitle">结果持续写入，可随时下载当前文件。</p>
+      </div>
     </div>
-    <div class="table-shell">
-      <table id="batch-job-table">
+    <div class="table-wrap">
+      <table class="table-compact" id="batch-job-table">
         <thead>
           <tr>
             <th>#</th>
             <th>文件</th>
             <th>状态</th>
             <th>进度</th>
-            <th>成功</th>
-            <th>失败</th>
-            <th>跳过</th>
+            <th class="td-num">成功</th>
+            <th class="td-num">失败</th>
+            <th class="td-num">跳过</th>
             <th>当前消息</th>
             <th>下载</th>
             <th>详情</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody id="batch-job-body">
           {% for job in batch.jobs %}
             <tr>
-              <td>{{ job.sequence }}</td>
+              <td class="mono nowrap">{{ job.sequence }}</td>
               <td>{{ job.original_filename }}</td>
-              <td>{{ job.status }}</td>
-              <td>{{ job.processed_rows }}/{{ job.total_rows or job.row_count }}</td>
-              <td>{{ job.succeeded_rows }}</td>
-              <td>{{ job.failed_rows }}</td>
-              <td>{{ job.skipped_rows }}</td>
-              <td>{{ job.current_message }}</td>
+              <td><span class="badge {{ status_badges.get(job.status, "badge-neutral") }}">{{ status_text(job.status) }}</span></td>
+              <td class="mono nowrap">{{ job.processed_rows }}/{{ job.total_rows or job.row_count }}</td>
+              <td class="td-num">{{ job.succeeded_rows }}</td>
+              <td class="td-num">{{ job.failed_rows }}</td>
+              <td class="td-num">{{ job.skipped_rows }}</td>
+              <td class="msg-cell" title="{{ job.current_message or '' }}">{{ job.current_message }}</td>
               <td>
                 {% if job.output_path %}
-                  <a class="button button-primary" href="/download/{{ job.job_id }}">下载</a>
+                  <a class="btn btn-primary btn-sm" href="/download/{{ job.job_id }}">下载</a>
                 {% else %}
-                  <span class="pill pill-muted">未生成</span>
+                  <span class="badge badge-neutral badge-plain">未生成</span>
                 {% endif %}
               </td>
-              <td><a class="button button-secondary" href="/jobs/{{ job.job_id }}">查看</a></td>
+              <td><a class="btn btn-secondary btn-sm" href="/jobs/{{ job.job_id }}">查看</a></td>
+              <td>
+                <form class="job-start-form" action="/jobs/{{ job.job_id }}/start" method="post">
+                  <input type="hidden" name="mode" value="full" />
+                  <button
+                    class="btn btn-secondary btn-sm {% if job.status in ['running', 'queued'] or batch.status == 'running' %}is-disabled{% endif %}"
+                    type="submit"
+                  >
+                    运行
+                  </button>
+                </form>
+                <form class="job-start-form" action="/jobs/{{ job.job_id }}/start" method="post">
+                  <input type="hidden" name="mode" value="continue_existing" />
+                  <button
+                    class="btn btn-secondary btn-sm {% if job.status in ['running', 'queued'] or batch.status == 'running' or not (job.resume_available or job.output_filename) %}is-disabled{% endif %}"
+                    type="submit"
+                  >
+                    续跑
+                  </button>
+                </form>
+              </td>
             </tr>
           {% endfor %}
         </tbody>
@@ -217,10 +454,33 @@
 
   <script>
     const batchId = "{{ batch.batch_id }}";
+    const POLL_INTERVAL_ACTIVE = 2000;
+    const POLL_INTERVAL_IDLE = 15000; // 终态降频：多标签页下仍能感知重试/恢复带来的状态变化
     let poller = null;
+    let pollInterval = POLL_INTERVAL_ACTIVE;
+
+    const STATUS_BADGE_CLASS = {
+      uploaded: "badge-neutral",
+      queued: "badge-info",
+      running: "badge-info",
+      paused: "badge-warning",
+      completed: "badge-success",
+      failed: "badge-danger",
+    };
+
+    function badgeClassForStatus(status) {
+      return STATUS_BADGE_CLASS[status] || "badge-neutral";
+    }
+
+    function statusBadgeHtml(status) {
+      return `<span class="badge ${badgeClassForStatus(status)}">${UI.esc(UI.statusLabel(status))}</span>`;
+    }
 
     function renderCookiePool(pool) {
       const tbody = document.getElementById("batch-cookie-account-body");
+      if (tbody.querySelector(".is-armed")) {
+        return; // 剔除确认进行中：本轮跳过重渲染，避免 armed 态被轮询刷新清除
+      }
       const accounts = pool?.accounts || [];
       if (accounts.length === 0) {
         tbody.innerHTML = '<tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "备注"</code>。</td></tr>';
@@ -228,25 +488,26 @@
       }
 
       tbody.innerHTML = accounts.map((account) => {
-        const suffix = account.is_current ? "(当前)" : (account.is_next ? "(下一个)" : "");
+        const suffix = account.is_current ? ' <span class="cell-role">(当前)</span>' : (account.is_next ? ' <span class="cell-role">(下一个)</span>' : "");
+        const badgeClass = account.invalid ? "badge-danger" : (account.warning ? "badge-warning" : (account.relogin_in_progress ? "badge-info" : "badge-success"));
         const reason = account.warning_reason || account.invalid_reason || account.last_issue_reason || "-";
-        const excludeDisabled = account.invalid || account.relogin_in_progress ? "is-disabled" : "";
-        const reloginDisabled = "";
+        const deleteDisabled = account.relogin_in_progress ? "is-disabled" : "";
+        const reloginDisabled = account.relogin_in_progress ? "is-disabled" : "";
         const resetDisabled = account.relogin_in_progress ? "is-disabled" : "";
         return `
           <tr>
-            <td class="account-label-cell">${account.label}</td>
-            <td class="account-status-cell nowrap">${account.status_text}${suffix ? ` ${suffix}` : ""}</td>
-            <td class="account-file-cell" title="${account.storage_state_path}">
-              <span class="account-file-name">${account.storage_state_name}</span>
+            <td>${UI.esc(account.label)}${suffix}</td>
+            <td class="nowrap"><span class="badge ${badgeClass}">${UI.esc(account.status_text)}</span></td>
+            <td title="${UI.esc(account.storage_state_path)}">
+              <span class="file-name">${UI.esc(account.storage_state_name)}</span>
             </td>
-            <td class="account-signal-cell nowrap">${account.challenge_strikes}</td>
-            <td class="account-reason-cell" title="${reason}">${reason}</td>
-            <td class="account-actions-cell">
-              <div class="account-actions">
-                <button class="button button-secondary button-compact account-action-button ${excludeDisabled}" type="button" data-action="exclude" data-account-id="${account.account_id}">剔除</button>
-                <button class="button button-accent button-compact account-action-button ${reloginDisabled}" type="button" data-action="relogin" data-account-id="${account.account_id}">重新登录</button>
-                <button class="button button-ghost button-compact account-action-button account-reset-button ${resetDisabled}" type="button" data-action="reset" data-account-id="${account.account_id}">清零</button>
+            <td class="num-cell">${UI.esc(account.challenge_strikes)}</td>
+            <td class="reason-cell" title="${UI.esc(reason)}">${UI.esc(reason)}</td>
+            <td>
+              <div class="row-actions">
+                <button class="btn btn-danger btn-sm account-action-button ${deleteDisabled}" type="button" data-action="delete" data-account-id="${account.account_id}">删除</button>
+                <button class="btn btn-secondary btn-sm account-action-button ${reloginDisabled}" type="button" data-action="relogin" data-account-id="${account.account_id}">重新登录</button>
+                <button class="btn btn-ghost btn-sm account-action-button account-reset-button ${resetDisabled}" type="button" data-action="reset" data-account-id="${account.account_id}">清零</button>
               </div>
             </td>
           </tr>
@@ -259,11 +520,17 @@
       const response = await fetch(`/accounts/${accountId}/${action}`, { method: "POST" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        alert(payload.detail || "操作失败");
+        UI.toast(payload.detail || "操作失败", "error");
         return;
       }
-      if (payload.message) {
-        alert(payload.message);
+      if (action === "delete") {
+        UI.toast("已删除", "success");
+      } else if (action === "reset") {
+        UI.toast("已清零", "success");
+      } else if (action === "relogin") {
+        UI.toast(payload.message || "已打开重新登录窗口", "success");
+      } else if (payload.message) {
+        UI.toast(payload.message, "success");
       }
       refreshBatch();
     }
@@ -272,30 +539,54 @@
       document.querySelectorAll(".account-action-button").forEach((button) => {
         button.onclick = () => {
           if (button.classList.contains("is-disabled")) return;
+          if (button.dataset.action === "delete") {
+            UI.confirm(button, () => postAccountAction(button.dataset.accountId, "delete"));
+            return;
+          }
           postAccountAction(button.dataset.accountId, button.dataset.action);
         };
       });
     }
 
-    function renderJobs(jobs) {
+    function renderJobs(jobs, batchStatus) {
       const tbody = document.getElementById("batch-job-body");
+      if (tbody.matches(":hover") || tbody.querySelector(":focus, .is-armed")) {
+        return; // 鼠标悬停/键盘焦点/确认 Armed 中：跳过本轮重渲染，避免整体重建 tbody 吞掉点击
+      }
       tbody.innerHTML = jobs.map((job) => {
         const total = job.total_rows || job.row_count || 0;
         const download = job.output_path
-          ? `<a class="button button-primary" href="/download/${job.job_id}">下载</a>`
-          : '<span class="pill pill-muted">未生成</span>';
+          ? `<a class="btn btn-primary btn-sm" href="/download/${job.job_id}">下载</a>`
+          : '<span class="badge badge-neutral badge-plain">未生成</span>';
+        const startDisabled =
+          job.status === "running" || job.status === "queued" || batchStatus === "running"
+            ? "is-disabled"
+            : "";
+        const continueDisabled =
+          startDisabled || !(job.resume_available || job.output_filename) ? "is-disabled" : "";
+        const currentMessage = job.current_message || "";
         return `
           <tr>
-            <td>${job.sequence}</td>
-            <td>${job.original_filename}</td>
-            <td>${job.status}</td>
-            <td>${job.processed_rows}/${total}</td>
-            <td>${job.succeeded_rows}</td>
-            <td>${job.failed_rows}</td>
-            <td>${job.skipped_rows}</td>
-            <td>${job.current_message || ""}</td>
+            <td class="mono nowrap">${UI.esc(job.sequence)}</td>
+            <td>${UI.esc(job.original_filename)}</td>
+            <td>${statusBadgeHtml(job.status)}</td>
+            <td class="mono nowrap">${UI.esc(job.processed_rows)}/${UI.esc(total)}</td>
+            <td class="td-num">${UI.esc(job.succeeded_rows)}</td>
+            <td class="td-num">${UI.esc(job.failed_rows)}</td>
+            <td class="td-num">${UI.esc(job.skipped_rows)}</td>
+            <td class="msg-cell" title="${UI.esc(currentMessage)}">${UI.esc(currentMessage)}</td>
             <td>${download}</td>
-            <td><a class="button button-secondary" href="/jobs/${job.job_id}">查看</a></td>
+            <td><a class="btn btn-secondary btn-sm" href="/jobs/${job.job_id}">查看</a></td>
+            <td>
+              <form class="job-start-form" action="/jobs/${job.job_id}/start" method="post">
+                <input type="hidden" name="mode" value="full" />
+                <button class="btn btn-secondary btn-sm ${startDisabled}" type="submit">运行</button>
+              </form>
+              <form class="job-start-form" action="/jobs/${job.job_id}/start" method="post">
+                <input type="hidden" name="mode" value="continue_existing" />
+                <button class="btn btn-secondary btn-sm ${continueDisabled}" type="submit">续跑</button>
+              </form>
+            </td>
           </tr>
         `;
       }).join("");
@@ -309,7 +600,10 @@
       const totalRows = Math.max(batch.total_rows || 0, 1);
       const percent = Math.min(100, Math.round((batch.processed_rows / totalRows) * 100));
 
-      document.getElementById("batch-status").textContent = batch.status;
+      const statusBadge = document.getElementById("batch-status");
+      statusBadge.classList.remove("badge-neutral", "badge-info", "badge-warning", "badge-success", "badge-danger");
+      statusBadge.classList.add(badgeClassForStatus(batch.status));
+      statusBadge.textContent = UI.statusLabel(batch.status);
       document.getElementById("metric-total-files").textContent = batch.total_files;
       document.getElementById("metric-completed-files").textContent = batch.completed_files;
       document.getElementById("metric-running-files").textContent = batch.running_files;
@@ -320,9 +614,9 @@
         ? `${batch.current_file_index}/${batch.total_files}`
         : "";
       document.getElementById("batch-progress-fill").style.width = `${percent}%`;
-      document.getElementById("batch-cookie-current").textContent = `当前 cookies ${batch.current_cookie_label || "-"}`;
-      document.getElementById("batch-cookie-next").textContent = `下一个 ${batch.cookie_pool?.next_label || "-"}`;
-      document.getElementById("batch-cookie-batches").textContent = `距上次切换 ${batch.cookie_batches_since_switch || 0} 批`;
+      document.getElementById("batch-cookie-current").textContent = batch.current_cookie_label || "-";
+      document.getElementById("batch-cookie-next").textContent = batch.cookie_pool?.next_label || "-";
+      document.getElementById("batch-cookie-batches").textContent = `${batch.cookie_batches_since_switch || 0} 批`;
 
       const errorBox = document.getElementById("batch-error-box");
       const errorText = document.getElementById("batch-error-text");
@@ -347,28 +641,57 @@
       downloadBatchLink.classList.toggle("is-disabled", !hasOutputs);
       downloadBatchLink.href = hasOutputs ? `/download/batches/${batchId}` : "#";
 
-      renderJobs(batch.jobs || []);
+      const retryBatchButton = document.getElementById("retry-batch-button");
+      retryBatchButton.classList.toggle(
+        "is-disabled",
+        batch.status === "running" ||
+          !(batch.jobs || []).some((job) => job.failed_rows > 0 && job.status !== "running")
+      );
+
+      document.getElementById("batch-cookie-last-reason").textContent =
+        batch.cookie_last_switch_reason || "—";
+
+      const batchCooldownCountdown = document.getElementById("batch-cooldown-countdown");
+      const remainingSeconds = batch.cooldown_active ? (batch.cooldown_remaining_seconds || 0) : 0;
+      if (remainingSeconds > 0) {
+        const minutes = Math.floor(remainingSeconds / 60);
+        const seconds = remainingSeconds % 60;
+        batchCooldownCountdown.textContent = `冷却剩余 ${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+        batchCooldownCountdown.classList.remove("is-hidden");
+      } else {
+        batchCooldownCountdown.classList.add("is-hidden");
+      }
+
+      renderJobs(batch.jobs || [], batch.status);
       renderCookiePool(batch.cookie_pool || {});
 
-      if (batch.status === "completed" || batch.status === "failed") {
-        stopPolling();
+      // 终态后降频轮询而非彻底停止：其他标签页的重试/恢复仍能被本页感知
+      if (isTerminalStatus(batch.status)) {
+        if (pollInterval !== POLL_INTERVAL_IDLE) startPolling(POLL_INTERVAL_IDLE);
+      } else if (pollInterval !== POLL_INTERVAL_ACTIVE) {
+        startPolling(POLL_INTERVAL_ACTIVE);
       }
     }
 
-    async function postAction(path) {
+    async function postAction(path, successMessage) {
       const response = await fetch(path, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        alert(payload.detail || "操作失败");
+        UI.toast(payload.detail || "操作失败", "error");
         return;
+      }
+      const message = typeof successMessage === "function" ? successMessage(payload) : successMessage;
+      if (message) {
+        UI.toast(message, "success");
       }
       startPolling();
       refreshBatch();
     }
 
-    function startPolling() {
+    function startPolling(interval = POLL_INTERVAL_ACTIVE) {
       stopPolling();
-      poller = setInterval(refreshBatch, 2000);
+      pollInterval = interval;
+      poller = setInterval(refreshBatch, pollInterval);
     }
 
     function stopPolling() {
@@ -378,32 +701,55 @@
       }
     }
 
+    function isTerminalStatus(status) {
+      return status === "completed" || status === "failed";
+    }
+
     document.getElementById("pause-batch-button").addEventListener("click", () => {
       if (!document.getElementById("pause-batch-button").classList.contains("is-disabled")) {
-        postAction(`/batches/${batchId}/pause`);
+        postAction(`/batches/${batchId}/pause`, "已请求暂停");
       }
     });
 
     document.getElementById("resume-batch-button").addEventListener("click", () => {
       if (!document.getElementById("resume-batch-button").classList.contains("is-disabled")) {
-        postAction(`/batches/${batchId}/resume`);
+        postAction(`/batches/${batchId}/resume`, "批次已恢复");
       }
     });
 
     document.getElementById("skip-batch-cooldown-button").addEventListener("click", () => {
       if (!document.getElementById("skip-batch-cooldown-button").classList.contains("is-disabled")) {
-        postAction(`/batches/${batchId}/skip-cooldown`);
+        postAction(`/batches/${batchId}/skip-cooldown`, "已跳过冷却");
       }
     });
 
     document.getElementById("switch-batch-cookie-button").addEventListener("click", () => {
       if (!document.getElementById("switch-batch-cookie-button").classList.contains("is-disabled")) {
-        postAction(`/batches/${batchId}/switch-cookie`);
+        postAction(`/batches/${batchId}/switch-cookie`, (payload) =>
+          payload.scheduled ? "切换已排队" : `已切换到 ${payload.account_label}`
+        );
       }
     });
+
+    document.getElementById("retry-batch-button").addEventListener("click", () => {
+      if (!document.getElementById("retry-batch-button").classList.contains("is-disabled")) {
+        postAction(`/batches/${batchId}/retry-failed`, "已开始重试失败项");
+      }
+    });
+
+    document.addEventListener("submit", (event) => {
+      const form = event.target.closest("form.job-start-form");
+      if (form && form.querySelector("button").classList.contains("is-disabled")) {
+        event.preventDefault();
+      }
+    });
+
+    const batchIdElement = document.getElementById("batch-id");
+    batchIdElement.addEventListener("click", () => UI.copy(batchIdElement.textContent.trim()));
 
     bindAccountActionButtons();
     startPolling();
     refreshBatch();
   </script>
+</div>
 {% endblock %}

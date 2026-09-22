@@ -5,4 +5,5 @@ __pycache__/
 output/
 tmp/
 .v2c/
+.video_agent/
 out/

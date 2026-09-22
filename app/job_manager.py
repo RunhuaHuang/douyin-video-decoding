@@ -141,6 +141,9 @@ class JobManager:
             job.skipped_rows = 0
             job.current_row = None
             job.current_url = ""
+            # 单任务和批次重配都保留本任务最新快照，供续跑使用。
+            if job.output_path is not None and Path(job.output_path).is_file():
+                job.resume_output_path = job.output_path
             job.output_path = None
             job.output_preview_rows = []
             job.pause_requested = False
@@ -239,6 +242,15 @@ class JobManager:
             job.cooldown_active = False
             job.skip_cooldown_requested = False
 
+    def begin_batch_run(self, batch_id: str, mode: str) -> str:
+        with self._lock:
+            batch = self.require_batch(batch_id)
+            if mode != "resume":
+                batch.run_mode = mode
+                batch.current_job_id = None
+                batch.current_file_index = 0
+            return batch.run_mode
+
     def mark_batch_running(self, batch_id: str) -> None:
         with self._lock:
             batch = self.require_batch(batch_id)
@@ -330,6 +342,14 @@ class JobManager:
     def request_batch_cookie_switch(self, batch_id: str) -> None:
         self.update_batch_cookie_runtime(batch_id, cookie_switch_requested=True)
 
+    def advance_cookie_generation(self, job_id: str) -> int:
+        # 锁内读+增+写，供 pipeline/main 切换 cookies 时替代 get→+1→set 的非原子序列
+        with self._lock:
+            job = self.require(job_id)
+            source = self.require_batch(job.batch_id) if job.batch_id else job
+            source.cookie_service_generation = int(source.cookie_service_generation or 0) + 1
+            return source.cookie_service_generation
+
     def update_batch_progress(
         self,
         batch_id: str,
@@ -377,10 +397,17 @@ class JobManager:
             job = self.require(job_id)
             job.pause_requested = False
 
-    def set_cooldown_state(self, job_id: str, *, active: bool) -> None:
+    def set_cooldown_state(
+        self,
+        job_id: str,
+        *,
+        active: bool,
+        ends_at: Optional[datetime] = None,
+    ) -> None:
         with self._lock:
             job = self.require(job_id)
             job.cooldown_active = active
+            job.cooldown_ends_at = ends_at if active else None
             if not active:
                 job.skip_cooldown_requested = False
 
@@ -405,10 +432,17 @@ class JobManager:
             batch = self.require_batch(batch_id)
             batch.pause_requested = False
 
-    def set_batch_cooldown_state(self, batch_id: str, *, active: bool) -> None:
+    def set_batch_cooldown_state(
+        self,
+        batch_id: str,
+        *,
+        active: bool,
+        ends_at: Optional[datetime] = None,
+    ) -> None:
         with self._lock:
             batch = self.require_batch(batch_id)
             batch.cooldown_active = active
+            batch.cooldown_ends_at = ends_at if active else None
             if not active:
                 batch.skip_cooldown_requested = False
 

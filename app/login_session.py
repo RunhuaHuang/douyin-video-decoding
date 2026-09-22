@@ -4,7 +4,9 @@ import json
 import threading
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
+from .account_storage import write_storage_state
 from .browser_service import CHROME_USER_AGENT
 from .config import PLAYWRIGHT_INSTALL_HINT, ensure_directories
 from .cookie_accounts import CookieAccountManager
@@ -124,7 +126,10 @@ def login_with_label(
                 pass
 
             account.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_storage_path = account.storage_state_path.with_suffix(".tmp.json")
+            # 唯一后缀防并发重新登录时两个写者互踩同一 tmp 文件
+            temp_storage_path = account.storage_state_path.with_name(
+                f"{account.storage_state_path.stem}.{uuid4().hex[:8]}.tmp.json"
+            )
             temp_storage_path.unlink(missing_ok=True)
 
             if wait_mode == "browser_close":
@@ -188,7 +193,13 @@ def login_with_label(
                 browser.close()
 
             if _storage_state_has_cookies(temp_storage_path):
-                temp_storage_path.replace(account.storage_state_path)
+                try:
+                    if not write_storage_state(
+                        account.storage_state_path, temp_storage_path.read_text(encoding="utf-8")
+                    ):
+                        raise RuntimeError("该账号已删除，登录会话未保存；请重新新增账号")
+                finally:
+                    temp_storage_path.unlink(missing_ok=True)
                 account_manager.record_login(account.account_id, label=account.label)
                 login_recorded = True
                 logger(f"登录会话已保存到 `{account.storage_state_path.name}`。后续运行 WebUI 会自动纳入 cookies 池。")

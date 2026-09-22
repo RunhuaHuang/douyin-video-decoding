@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+from .account_storage import write_storage_state
 from .media_service import FfmpegService
 from .config import (
     DOUYIN_CHALLENGE_BASE_COOLDOWN_SECONDS,
@@ -18,6 +19,8 @@ from .config import (
     DOUYIN_REQUEST_MIN_INTERVAL_SECONDS,
     PLAYWRIGHT_AFTER_LOAD_WAIT_MS,
     PLAYWRIGHT_AFTER_PLAY_WAIT_MS,
+    PLAYWRIGHT_DASH_AUDIO_GRACE_MS,
+    PLAYWRIGHT_DOWNLOAD_TIMEOUT_MS,
     PLAYWRIGHT_HEADLESS,
     PLAYWRIGHT_INSTALL_HINT,
     PLAYWRIGHT_NAVIGATION_TIMEOUT_MS,
@@ -68,6 +71,8 @@ class PlaywrightFallback:
         video_wait_timeout_ms: int = PLAYWRIGHT_VIDEO_WAIT_TIMEOUT_MS,
         after_load_wait_ms: int = PLAYWRIGHT_AFTER_LOAD_WAIT_MS,
         after_play_wait_ms: int = PLAYWRIGHT_AFTER_PLAY_WAIT_MS,
+        download_timeout_ms: int = PLAYWRIGHT_DOWNLOAD_TIMEOUT_MS,
+        dash_audio_grace_ms: int = PLAYWRIGHT_DASH_AUDIO_GRACE_MS,
         headless: bool = PLAYWRIGHT_HEADLESS,
         storage_state_path: Path = PLAYWRIGHT_STORAGE_STATE_PATH,
         request_coordinator: Optional[RequestCoordinator] = None,
@@ -77,6 +82,8 @@ class PlaywrightFallback:
         self.video_wait_timeout_ms = video_wait_timeout_ms
         self.after_load_wait_ms = after_load_wait_ms
         self.after_play_wait_ms = after_play_wait_ms
+        self.download_timeout_ms = download_timeout_ms
+        self.dash_audio_grace_ms = dash_audio_grace_ms
         self.headless = headless
         self.storage_state_path = Path(storage_state_path)
         self.request_coordinator = request_coordinator
@@ -88,7 +95,7 @@ class PlaywrightFallback:
         self._reset_runtime()
 
     def capture_video(self, share_url: str) -> BrowserCapture:
-        page = self._ensure_context().new_page()
+        page = None
         video_urls: List[str] = []
         audio_urls: List[str] = []
         preview_urls: List[str] = []
@@ -111,8 +118,9 @@ class PlaywrightFallback:
                 seen_urls.add(response.url)
                 video_urls.append(response.url)
 
-        page.on("response", handle_response)
         try:
+            page = self._ensure_context().new_page()
+            page.on("response", handle_response)
             self._throttle()
             page.goto(share_url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
             try:
@@ -142,7 +150,9 @@ class PlaywrightFallback:
                     )
                 except Exception:
                     pass
-                self._wait_for_preferred_video_urls(page, video_locator, video_urls, preview_urls, seen_urls)
+                self._wait_for_preferred_video_urls(
+                    page, video_locator, video_urls, preview_urls, seen_urls, audio_urls
+                )
             except Exception:
                 pass
 
@@ -178,10 +188,11 @@ class PlaywrightFallback:
             self._reset_runtime()
             raise RuntimeError(self._format_browser_error(exc)) from exc
         finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def download_video(
         self,
@@ -224,10 +235,14 @@ class PlaywrightFallback:
                 **download_kwargs,
             )
         except Exception:
+            if require_embedded_audio:
+                # 第二遍的 URL 集合和校验与第一遍完全相同（都要求内嵌音轨），
+                # 注定得到同样结果，直接按无内嵌音轨报错，不再重复下载
+                raise
             source_url, attempts = self._download_candidate_urls(
                 urls=video_candidates,
-                post_validator=self._video_file_has_audio if require_embedded_audio else None,
-                post_validation_error="视频不含音轨",
+                post_validator=None,
+                post_validation_error=post_validation_error,
                 **download_kwargs,
             )
 
@@ -472,10 +487,12 @@ class PlaywrightFallback:
         for position, url in enumerate(urls, start=1):
             try:
                 self._throttle()
+                # Playwright 请求超时覆盖整个响应（含 body 读取），整文件下载
+                # 必须用独立大超时，不能沿用 15s 导航超时
                 response = request_context.get(
                     url,
                     headers=self._build_media_headers(referer, accept=accept, destination=destination),
-                    timeout=float(self.navigation_timeout_ms),
+                    timeout=float(self.download_timeout_ms),
                     fail_on_status_code=False,
                     max_retries=0,
                 )
@@ -549,11 +566,13 @@ class PlaywrightFallback:
         video_urls: List[str],
         preview_urls: List[str],
         seen_urls: set[str],
+        audio_urls: List[str],
     ) -> None:
         deadline = time.monotonic() + max(
             self.after_play_wait_ms / 1000.0,
             3.0,
         )
+        dash_seen_at: Optional[float] = None
         while time.monotonic() < deadline:
             src = self._read_video_src(video_locator)
             if src and src not in seen_urls:
@@ -563,7 +582,18 @@ class PlaywrightFallback:
                 elif self._looks_like_video(src, ""):
                     video_urls.insert(0, src)
             if any(self._is_preferred_video_url(url) for url in video_urls):
-                return
+                if dash_seen_at is None and any(
+                    "media-video" in url.lower() for url in video_urls
+                ):
+                    # 分流长视频的音频流请求可能滞后于视频流，见到 media-video 特征后
+                    # 再给有界宽限等 audio 候选出现，避免提前退出丢音轨
+                    dash_seen_at = time.monotonic()
+                if dash_seen_at is None:
+                    return
+                if any(self._is_audio_like_url(url) for url in audio_urls):
+                    return
+                if time.monotonic() - dash_seen_at >= self.dash_audio_grace_ms / 1000.0:
+                    return
             page.wait_for_timeout(500)
 
     @staticmethod
@@ -605,11 +635,15 @@ class PlaywrightFallback:
         if self._context is None:
             return
         try:
-            self.storage_state_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._storage_state_lock:
-                self._context.storage_state(path=str(self.storage_state_path))
+            state = self._context.storage_state()
+            payload = json.dumps(state, ensure_ascii=False)
         except Exception:
             return
+        try:
+            with self._storage_state_lock:
+                write_storage_state(self.storage_state_path, payload)
+        except Exception:
+            pass
 
     def _load_persisted_cookies(self) -> List[dict]:
         if not self.storage_state_path.exists():

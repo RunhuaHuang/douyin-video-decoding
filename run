@@ -18,6 +18,32 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
+pid_belongs_to_project() {
+  local pid="$1"
+  local exe="" command_line="" cwd=""
+  exe="$(ps -p "$pid" -o comm= 2>/dev/null | xargs 2>/dev/null || true)"
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
+
+  # uv 包装进程：可执行文件是 uv，参数是运行本工具的入口命令
+  if [[ "$(basename "$exe" 2>/dev/null)" == "uv" && "$command_line" == *"douyin-csv-webui"* && "$cwd" == "$ROOT_DIR" ]]; then
+    return 0
+  fi
+  # uv 在本项目 .venv 下拉起的解释器
+  if [[ "$exe" == "$ROOT_DIR"/.venv/* ]]; then
+    return 0
+  fi
+  # comm 被截断时的兜底：命令行包含本项目 venv 内的入口脚本绝对路径
+  if [[ "$command_line" == *"$ROOT_DIR/.venv/bin/douyin-csv-webui"* ]]; then
+    return 0
+  fi
+  # 直接执行项目内可执行文件：cwd 与可执行路径都属于本项目
+  if [[ -n "$cwd" && "$cwd" == "$ROOT_DIR" && "$exe" == "$ROOT_DIR"/* ]]; then
+    return 0
+  fi
+  return 1
+}
+
 stop_existing_server() {
   local existing_pids=()
   while IFS= read -r pid; do
@@ -26,12 +52,25 @@ stop_existing_server() {
     fi
   done < <(pgrep -f "douyin-csv-webui" || true)
 
-  if (( ${#existing_pids[@]} == 0 )); then
+  local project_pids=()
+  local skipped_pids=()
+  for pid in "${existing_pids[@]}"; do
+    if pid_belongs_to_project "$pid"; then
+      project_pids+=("$pid")
+    else
+      skipped_pids+=("$pid")
+    fi
+  done
+
+  if (( ${#skipped_pids[@]} > 0 )); then
+    echo "跳过不属于本项目的进程（避免 pgrep 误杀）: ${skipped_pids[*]}"
+  fi
+  if (( ${#project_pids[@]} == 0 )); then
     return
   fi
 
   echo "检测到已有 WebUI 进程，正在停止旧服务..."
-  kill "${existing_pids[@]}" 2>/dev/null || true
+  kill "${project_pids[@]}" 2>/dev/null || true
   sleep 1
 }
 

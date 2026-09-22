@@ -1,8 +1,11 @@
 from dataclasses import dataclass
 import csv
 import mimetypes
+import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
+from uuid import uuid4
 
 import pandas as pd
 
@@ -58,14 +61,25 @@ def inspect_csv(path: Path) -> CSVInspection:
 
 def inspect_xlsx(path: Path) -> CSVInspection:
     try:
-        dataframe = pd.read_excel(
-            path,
-            dtype=str,
-            keep_default_na=False,
-            engine="openpyxl",
-        )
+        workbook = pd.ExcelFile(path, engine="openpyxl")
     except Exception as exc:
         raise RuntimeError(f"XLSX 读取失败: {exc}") from exc
+
+    sheet_names = list(workbook.sheet_names)
+    if len(sheet_names) > 1:
+        workbook.close()
+        raise RuntimeError(
+            "XLSX 文件包含多个工作表: "
+            + ", ".join(sheet_names)
+            + "。当前只支持单工作表文件，请拆分后重新上传。"
+        )
+
+    try:
+        dataframe = workbook.parse(sheet_names[0], dtype=str, keep_default_na=False)
+    except Exception as exc:
+        raise RuntimeError(f"XLSX 读取失败: {exc}") from exc
+    finally:
+        workbook.close()
 
     dataframe = dataframe.fillna("")
     preview_rows = [
@@ -115,10 +129,17 @@ def sniff_delimiter(raw_sample: bytes, encoding: str) -> Optional[str]:
 def write_csv(dataframe: pd.DataFrame, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.lower()
-    if suffix == ".xlsx":
-        dataframe.to_excel(output_path, index=False, engine="openpyxl")
-        return
-    dataframe.to_csv(output_path, index=False, encoding="utf-8-sig")
+    # 先写同目录临时文件再原子替换，避免崩溃截断已积累的整份结果
+    temp_path = output_path.with_name(f".{output_path.name}.{uuid4().hex}.tmp")
+    try:
+        if suffix == ".xlsx":
+            dataframe.to_excel(temp_path, index=False, engine="openpyxl")
+        else:
+            dataframe.to_csv(temp_path, index=False, encoding="utf-8-sig")
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def ensure_text_column(dataframe: pd.DataFrame, column_name: str) -> None:
@@ -133,13 +154,36 @@ def stringify_cell(value: object) -> str:
     return str(value)
 
 
-def build_processed_output_name(original_filename: str) -> str:
-    path = Path(original_filename)
-    return f"{path.stem}.processed.csv"
+def build_processed_output_name(original_filename: str, job_id: str = "") -> str:
+    stem = Path(original_filename).stem
+    if job_id:
+        return f"{stem}.{job_id[:8]}.processed.csv"
+    return f"{stem}.processed.csv"
 
 
-def processed_output_path_for_filename(original_filename: str) -> Path:
-    return OUTPUT_DIR / build_processed_output_name(original_filename)
+def processed_output_path_for_filename(original_filename: str, job_id: str = "") -> Path:
+    return OUTPUT_DIR / build_processed_output_name(original_filename, job_id)
+
+
+_PROCESSED_OUTPUT_NAME_RE = r"{stem}(\.[0-9a-fA-F]{{8}})?\.processed\.csv"
+
+
+def find_latest_processed_path(original_filename: str) -> Optional[Path]:
+    # 同名输入允许多份产物共存（<stem>.processed.csv 与 <stem>.<jobid8>.processed.csv），
+    # 按 mtime 取最新一份；正则兜底防止 "1" 的前缀 glob 误匹配 "10.processed.csv"
+    stem = Path(original_filename).stem
+    pattern = re.compile(_PROCESSED_OUTPUT_NAME_RE.format(stem=re.escape(stem)))
+    if not OUTPUT_DIR.exists():
+        return None
+    # 用目录扫描配合正则，避免用户文件名里的 glob 元字符导致漏匹配。
+    candidates = [
+        path
+        for path in OUTPUT_DIR.iterdir()
+        if path.is_file() and pattern.fullmatch(path.name)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def media_type_for_path(path: Path) -> str:

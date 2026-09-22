@@ -4,8 +4,10 @@
 音视频分离流自动合并。适合单个/少量视频的快速下载和脚本调用。
 """
 import argparse
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -50,42 +52,51 @@ def download_one(service: DouyinService, share_text: str, out_dir: Path) -> Path
         raise RuntimeError("未解析到可下载地址")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_path = out_dir / "_cli_source.mp4"
-    audio_path = out_dir / "_cli_audio.m4a"
-    video_path.unlink(missing_ok=True)
-    audio_path.unlink(missing_ok=True)
-    service.download_video(video, video_path, audio_path)
+    # 临时文件名唯一化：固定名会让并发 CLI/多进程互踩半成品，失败残留也分不清归属
+    fd, video_name = tempfile.mkstemp(prefix="_cli_", suffix=".mp4", dir=out_dir)
+    os.close(fd)
+    fd, audio_name = tempfile.mkstemp(prefix="_cli_", suffix=".m4a", dir=out_dir)
+    os.close(fd)
+    video_path = Path(video_name)
+    audio_path = Path(audio_name)
+    try:
+        # 下载前清掉 mkstemp 建出的空文件，保持“文件存在即下载产物”的原语义
+        video_path.unlink(missing_ok=True)
+        audio_path.unlink(missing_ok=True)
+        service.download_video(video, video_path, audio_path)
 
-    source = None
-    if video_path.exists() and audio_path.exists():
-        try:
-            streams = FfmpegService().probe_media(video_path).get("streams") or []
-            has_video = any(stream.get("codec_type") == "video" for stream in streams)
-            has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
-        except Exception:
-            has_video = False
-            has_audio = False
-        source = video_path if has_video and has_audio else audio_path
-    elif video_path.exists():
-        source = video_path
-    elif audio_path.exists():
-        source = audio_path
-    if source is None or not source.exists():
-        raise RuntimeError("下载完成但没有产出文件")
-    suffix = source.suffix or ".mp4"
-    base = sanitize_title(video.title)
-    final_path = out_dir / f"{base}{suffix}"
-    if final_path.exists():
-        # 同名标题（或截断后同名）不覆盖，改用 标题_视频ID
-        final_path = out_dir / f"{base}_{video.video_id}{suffix}"
-        counter = 2
-        while final_path.exists():
-            final_path = out_dir / f"{base}_{video.video_id}_{counter}{suffix}"
-            counter += 1
-    source.replace(final_path)
-    for leftover in (video_path, audio_path):
-        leftover.unlink(missing_ok=True)
-    return final_path
+        source = None
+        if video_path.exists() and audio_path.exists():
+            try:
+                streams = FfmpegService().probe_media(video_path).get("streams") or []
+                has_video = any(stream.get("codec_type") == "video" for stream in streams)
+                has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+            except Exception:
+                has_video = False
+                has_audio = False
+            source = video_path if has_video and has_audio else audio_path
+        elif video_path.exists():
+            source = video_path
+        elif audio_path.exists():
+            source = audio_path
+        if source is None or not source.exists():
+            raise RuntimeError("下载完成但没有产出文件")
+        suffix = source.suffix or ".mp4"
+        base = sanitize_title(video.title)
+        final_path = out_dir / f"{base}{suffix}"
+        if final_path.exists():
+            # 同名标题（或截断后同名）不覆盖，改用 标题_视频ID
+            final_path = out_dir / f"{base}_{video.video_id}{suffix}"
+            counter = 2
+            while final_path.exists():
+                final_path = out_dir / f"{base}_{video.video_id}_{counter}{suffix}"
+                counter += 1
+        source.replace(final_path)
+        return final_path
+    finally:
+        # 半成品与未选中的下载文件统一清理，失败路径也不残留
+        for leftover in (video_path, audio_path):
+            leftover.unlink(missing_ok=True)
 
 
 def main(

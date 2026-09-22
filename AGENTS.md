@@ -15,16 +15,17 @@ uv run douyin-dl --list-accounts                # 账号池必须有可用会话
 uv run pytest                                   # 全量测试应全部通过
 ```
 
-**账号池为空 → 停下来找人**：让用户人工执行 `./login "备注"`（扫码 + 回车），这一步无法自动化。空池状态下浏览器无登录态，绝大多数视频解析会失败。
+**账号池为空 → 停下来找人**：让用户在 WebUI 首页账号池点「新增账号」扫码，或人工执行 `./login "备注"`（扫码 + 回车），登录这一步无法自动化。空池状态下浏览器无登录态，绝大多数视频解析会失败。
 
 ## 任务 → 最短命令
 
 | 任务 | 做法 |
 |---|---|
 | 下载 1~几个视频 | `uv run douyin-dl "链接1" "链接2" -o <目录>`，默认存 `output/downloads/`，退出码 0/1 对应全成功/有失败 |
+| 粘贴链接快速下载 | WebUI 首页「快速下载」卡片，或 `POST /quick-download`（`links` 每行一个链接，`transcribe` 勾选同时转写），直接建批次并跳转批次页 |
 | 批量（无人值守） | 见下面 API 四步 |
 | 批量（有人在旁边） | `./run` 起 WebUI 让人点，agent 只负责起服务和看日志 |
-| 加/换账号会话 | 人来做（`./login`）；agent 只能用 `GET /api/accounts` 查看池状态 |
+| 加/换账号会话 | WebUI 账号池「新增账号」按钮（人扫码）或 `./login "备注"`；agent 可用 `GET /api/accounts` 查看池状态 |
 | 跑测试 | `uv run pytest` |
 
 ## 无头批量四步（服务需在跑：`uv run douyin-csv-webui`）
@@ -38,7 +39,8 @@ curl -sO http://127.0.0.1:8000/download/batches/<bid>                  # 完成�
 ```
 
 - status 流转：`uploaded → running → completed / failed / paused`；行级状态是中文（成功/失败/已删除/非视频/无法下载/待重试），看 `/api/jobs/<id>` 的 `logs`
-- 长任务先干别的，隔段时间再轮询；`paused` 时可 `POST /jobs/<id>/resume`
+- 长任务先干别的，隔段时间再轮询；`paused` 时可 `POST /jobs/<id>/resume` 或 `POST /batches/<id>/resume`
+- 批次有失败行时可 `POST /batches/<id>/retry-failed` 一键重试所有失败项（单文件对应 `POST /jobs/<id>/retry-failed`）
 - 转写模式把 `download_only` 去掉并给 `model_names`（默认 SenseVoiceSmall；首次跑模型要下载，慢）
 
 ## 关键行为（改代码/排查前先知道）
@@ -51,3 +53,5 @@ curl -sO http://127.0.0.1:8000/download/batches/<bid>                  # 完成�
 ## 输出位置
 
 CLI 下载 `output/downloads/`；批量视频 `output/videos/<表名>/`；结果表格 `output/spreadsheet/`；会话 `tmp/browser/accounts/`。`output/`、`tmp/` 均被 gitignore，不要往里放需要提交的东西。
+
+结果表格命名 `<原名去扩展名>.<任务ID前8位>.processed.csv`（`csv_service.build_processed_output_name`，job_id 为空时退化为 `<原名去扩展名>.processed.csv`），同名输入各写各的、互不覆盖；续跑定位已有产物用 `csv_service.find_latest_processed_path` 按同名前缀取 mtime 最新一份。

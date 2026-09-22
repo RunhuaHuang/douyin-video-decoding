@@ -3,105 +3,243 @@
 {% block title %}抖音文案提取{% endblock %}
 
 {% block content %}
-  <section class="card card-tight">
-    <div class="status-grid status-grid-home">
-      <div class="status-item">
-        <span class="status-label">FFmpeg</span>
-        <strong>{{ health.ffmpeg }}</strong>
-      </div>
-      <div class="status-item">
-        <span class="status-label">MLX Whisper</span>
-        <strong>{{ health.mlx }}</strong>
-      </div>
-      <div class="status-item">
-        <span class="status-label">SenseVoice</span>
-        <strong>{{ health.sensevoice }}</strong>
-      </div>
-      <div class="status-item status-item-model">
-        <span class="status-label">默认模型</span>
-        <strong class="mono long-value">{{ health.default_model }}</strong>
-      </div>
-    </div>
-  </section>
+  <style>
+    /* 页面特有：标题区与卡内堆叠间距（设计系统未覆盖的部分） */
+    .index-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: var(--space-4);
+      margin: 0 0 var(--space-5);
+    }
+    .index-head h1 {
+      margin: 0;
+      font-size: var(--text-2xl);
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      line-height: 1.25;
+    }
+    .index-head p {
+      margin: 6px 0 0;
+      color: var(--text-2);
+      font-size: var(--text-sm);
+      line-height: 1.6;
+    }
+    .index-head .index-head-actions {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      flex: 0 0 auto;
+    }
+    .index-pool-metrics {
+      margin-bottom: var(--space-4);
+    }
+    .card-inline + .form-stack {
+      margin-top: var(--space-4);
+    }
+    /* 选择文件降为次级风格：白底发丝边框，让「开始下载」是唯一实心主按钮 */
+    .file-picker-button {
+      background: var(--surface);
+      color: var(--text-1);
+      border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow-xs);
+    }
+    /* 新增账号内联表单（is-hidden 需要更高优先级压过 display:flex） */
+    .add-account-form {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--space-2);
+      margin: 0 0 var(--space-4);
+    }
+    .add-account-form.is-hidden {
+      display: none;
+    }
+    .add-account-form .add-account-field {
+      margin: 0;
+      flex: 0 1 240px;
+    }
+    .add-account-form .field-help {
+      flex-basis: 100%;
+    }
+  </style>
 
-  <section class="card">
-    <div class="section-head">
-      <h2>导入表格</h2>
-      <p>支持批量上传，按顺序逐个处理。</p>
+  <header class="index-head">
+    <div>
+      <h1>工作台</h1>
+      <p>导入链接表格批量处理，或直接粘贴抖音链接快速下载。</p>
     </div>
-    <form class="stack-form" action="/preview" method="post" enctype="multipart/form-data">
-      <label class="field file-upload-field">
-        <div class="file-picker">
-          <input
-            class="file-input-native"
-            id="upload-files"
-            type="file"
-            name="files"
-            accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            multiple
+    <div class="index-head-actions">
+      {% if cookie_pool.usable_count %}
+        <span class="badge badge-success">账号池正常</span>
+      {% else %}
+        <span class="badge badge-warning">暂无可用账号</span>
+      {% endif %}
+    </div>
+  </header>
+
+  {% include "_health.html" %}
+
+  <div class="grid-2">
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">快速下载</h2>
+          <p class="card-subtitle">粘贴抖音链接或分享口令，每行一个，无需准备表格。</p>
+        </div>
+      </div>
+      <form class="form-stack" action="/quick-download" method="post" autocomplete="off">
+        <label class="field">
+          <textarea
+            name="links"
+            rows="6"
             required
-          />
-          <div class="file-picker-copy">
-            <span class="file-picker-button">选择文件</span>
-            <div class="file-picker-meta">
+            placeholder="https://v.douyin.com/xxxx/ 或整段分享口令，每行一个"
+          ></textarea>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="transcribe" />
+          <span>同时提取文案（SenseVoice 转写）</span>
+        </label>
+        <div class="action-row">
+          <button class="btn btn-primary" type="submit">开始下载</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">导入表格</h2>
+          <p class="card-subtitle">支持 CSV / XLSX，多个表格按上传顺序逐个处理。</p>
+        </div>
+      </div>
+      <form class="form-stack" action="/preview" method="post" enctype="multipart/form-data">
+        <label class="field file-upload-field">
+          <div class="dropzone">
+            <input
+              class="file-input-native"
+              id="upload-files"
+              type="file"
+              name="files"
+              accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              multiple
+              required
+            />
+            <div class="dropzone-copy">
+              <span class="file-picker-button">选择文件</span>
               <strong id="upload-file-summary">支持 CSV / XLSX 批量上传</strong>
-              <span id="upload-file-detail">点击这里选择文件，或一次选中多个表格一起导入。</span>
+              <span class="dropzone-hint" id="upload-file-detail">点击这里选择文件，或一次选中多个表格一起导入。</span>
             </div>
           </div>
+        </label>
+        <div class="action-row">
+          <button class="btn btn-secondary" type="submit">读取表头</button>
         </div>
-      </label>
-      <button class="button button-primary" type="submit">读取表头</button>
-    </form>
-  </section>
+      </form>
+    </section>
+  </div>
 
-  <section class="card">
-    <div class="section-head">
-      <h2>Cookies 账号池</h2>
-      <p>通过终端运行 <code>./login "备注"</code> 添加或替换账号。</p>
+  {% if page_error %}
+    <div class="alert alert-danger">
+      <div>
+        <strong>处理失败</strong>
+        <p>{{ page_error }}</p>
+      </div>
     </div>
-    <div class="pill-row">
-      <span class="pill">正常 {{ cookie_pool.active_count }}</span>
-      <span class="pill pill-muted">预警 {{ cookie_pool.warning_count }}</span>
-      <span class="pill pill-muted">已剔除 {{ cookie_pool.excluded_count }}</span>
-      <span class="pill pill-muted">30 批自动切换</span>
+  {% endif %}
+
+  <section class="card" id="cookie-pool">
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">Cookies 账号池</h2>
+        <p class="card-subtitle">点「新增账号」扫码即可添加，登录状态保存在本机。</p>
+      </div>
+      <div class="card-header-actions">
+        <span class="badge badge-plain badge-neutral">{{ cookie_pool.switch_batch_threshold }} 批自动切换</span>
+        <button class="btn btn-secondary btn-sm" id="add-account-toggle" type="button">新增账号</button>
+      </div>
     </div>
-    <div class="table-shell">
-      <table class="account-table">
-        <thead>
-          <tr>
-            <th class="col-label nowrap">备注</th>
-            <th class="col-status nowrap">状态</th>
-            <th class="col-file nowrap">文件</th>
-            <th class="col-signal nowrap">强信号计数</th>
-            <th class="col-reason nowrap">最近原因</th>
-            <th class="col-actions nowrap">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% if cookie_pool.accounts %}
+
+    <form class="add-account-form is-hidden" id="add-account-form" autocomplete="off">
+      <label class="field add-account-field">
+        <input
+          id="add-account-label"
+          name="label"
+          type="text"
+          maxlength="30"
+          placeholder="备注，例如：小号 A"
+        />
+      </label>
+      <button class="btn btn-primary btn-sm" type="submit">打开登录窗口</button>
+      <span class="field-help">提交后会在本机打开浏览器窗口，扫码登录后关闭窗口即完成添加。</span>
+    </form>
+
+    <div class="grid-auto index-pool-metrics">
+      <div class="metric">
+        <span class="metric-label">正常</span>
+        <span class="metric-value">{{ cookie_pool.active_count }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">预警</span>
+        <span class="metric-value">{{ cookie_pool.warning_count }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">已剔除</span>
+        <span class="metric-value">{{ cookie_pool.excluded_count }}</span>
+      </div>
+    </div>
+
+    {% if cookie_pool.accounts %}
+      <div class="table-wrap">
+        <table class="table-compact">
+          <thead>
+            <tr>
+              <th>备注</th>
+              <th>状态</th>
+              <th>文件</th>
+              <th class="td-num">强信号</th>
+              <th>最近原因</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
             {% for account in cookie_pool.accounts %}
               <tr>
-                <td class="account-label-cell">{{ account.label }}</td>
-                <td class="account-status-cell nowrap">{{ account.status_text }}</td>
-                <td class="account-file-cell" title="{{ account.storage_state_path }}">
-                  <span class="account-file-name">{{ account.storage_state_name }}</span>
+                <td class="nowrap">{{ account.label }}</td>
+                <td class="nowrap">
+                  {% if account.invalid %}
+                    <span class="badge badge-danger">{{ account.status_text }}</span>
+                  {% elif account.warning %}
+                    <span class="badge badge-warning">{{ account.status_text }}</span>
+                  {% elif account.relogin_in_progress %}
+                    <span class="badge badge-info">{{ account.status_text }}</span>
+                  {% else %}
+                    <span class="badge badge-success">{{ account.status_text }}</span>
+                  {% endif %}
                 </td>
-                <td class="account-signal-cell nowrap">{{ account.challenge_strikes }}</td>
-                <td class="account-reason-cell" title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}">
+                <td title="{{ account.storage_state_path }}">
+                  <span class="text-mono">{{ account.storage_state_name }}</span>
+                </td>
+                <td class="td-num">{{ account.challenge_strikes }}</td>
+                <td
+                  class="long-value"
+                  title="{{ account.warning_reason or account.invalid_reason or account.last_issue_reason or '-' }}"
+                >
                   {{ account.warning_reason or account.invalid_reason or account.last_issue_reason or "-" }}
                 </td>
-                <td class="account-actions-cell">
-                  <div class="account-actions">
+                <td>
+                  <div class="btn-group">
                     <button
-                      class="button button-secondary button-compact account-action-button {% if account.invalid or account.relogin_in_progress %}is-disabled{% endif %}"
+                      class="btn btn-danger btn-sm account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
                       type="button"
-                      data-action="exclude"
+                      data-action="delete"
                       data-account-id="{{ account.account_id }}"
                     >
-                      剔除
+                      删除
                     </button>
                     <button
-                      class="button button-accent button-compact account-action-button"
+                      class="btn btn-secondary btn-sm account-action-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
                       type="button"
                       data-action="relogin"
                       data-account-id="{{ account.account_id }}"
@@ -109,7 +247,7 @@
                       重新登录
                     </button>
                     <button
-                      class="button button-ghost button-compact account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
+                      class="btn btn-ghost btn-sm account-action-button account-reset-button {% if account.relogin_in_progress %}is-disabled{% endif %}"
                       type="button"
                       data-action="reset"
                       data-account-id="{{ account.account_id }}"
@@ -120,38 +258,39 @@
                 </td>
               </tr>
             {% endfor %}
-          {% else %}
-            <tr><td colspan="6">还没有可用账号。先在终端运行 <code>./login "主号"</code> 或 <code>./login "小号A"</code>。</td></tr>
-          {% endif %}
-        </tbody>
-      </table>
-    </div>
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state">
+        <strong>暂无账号</strong>
+        点上方「新增账号」扫码添加，登录状态保存在本机
+      </div>
+    {% endif %}
   </section>
-
-  {% if page_error %}
-    <section class="card card-error">
-      <strong>处理失败</strong>
-      <p>{{ page_error }}</p>
-    </section>
-  {% endif %}
 
   {% if batch %}
     <section class="card">
-      <div class="section-head">
-        <h2>批次配置</h2>
-        <p>{{ batch.total_files }} 个文件 · {{ batch.total_rows }} 行</p>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">批次配置</h2>
+          <p class="card-subtitle">{{ batch.total_files }} 个文件 · {{ batch.total_rows }} 行</p>
+        </div>
       </div>
 
       {% if batch.resumable_files %}
-        <div class="card-inline card-error">
+        <div class="card-inline">
           <strong>检测到已有进度</strong>
-          <p>{{ batch.resumable_files }} 个文件存在同名 `*.processed.csv`，可直接继续处理，已完成的“成功 / 已删除 / 非视频”行会自动跳过。</p>
+          <p>
+            {{ batch.resumable_files }} 个文件存在同名 <code>*.processed.csv</code>
+            ，可直接继续处理，已完成的“成功 / 已删除 / 非视频”行会自动跳过。
+          </p>
         </div>
       {% endif %}
 
       {% if batch.common_columns %}
-        <form class="stack-form" action="/batches/{{ batch.batch_id }}/run" method="post" autocomplete="off">
-          <div class="field-grid">
+        <form class="form-stack" action="/batches/{{ batch.batch_id }}/run" method="post" autocomplete="off">
+          <div class="field-row">
             <label class="field">
               <span>链接列</span>
               <select name="url_column" required>
@@ -173,7 +312,7 @@
             </label>
           </div>
 
-          <div class="field-grid">
+          <div class="field-row">
             <label class="field">
               <span>下载并发</span>
               <input
@@ -199,9 +338,11 @@
                 required
               />
             </label>
+          </div>
 
+          <div class="grid-3">
             <label class="field">
-              <span>批间等待</span>
+              <span>批间等待（秒）</span>
               <input
                 type="number"
                 name="batch_delay_seconds"
@@ -212,9 +353,7 @@
                 required
               />
             </label>
-          </div>
 
-          <div class="field-grid">
             <label class="field">
               <span>风控连续阈值</span>
               <input
@@ -229,7 +368,7 @@
             </label>
 
             <label class="field">
-              <span>风控冷却(分钟)</span>
+              <span>风控冷却（分钟）</span>
               <input
                 type="number"
                 name="anti_crawl_cooldown_minutes"
@@ -242,7 +381,7 @@
             </label>
           </div>
 
-          <div class="field-grid">
+          <div class="field-row">
             <label class="field">
               <span>主动冷却批次</span>
               <input
@@ -257,7 +396,7 @@
             </label>
 
             <label class="field">
-              <span>主动冷却(分钟)</span>
+              <span>主动冷却（分钟）</span>
               <input
                 type="number"
                 name="proactive_cooldown_minutes"
@@ -278,10 +417,11 @@
               required
               placeholder="每行一个模型名"
             >{{ default_model_names_text }}</textarea>
+            <p class="field-help">按顺序依次尝试，首次运行会自动下载模型。</p>
           </label>
 
           <div class="preset-box">
-            <span class="preset-title">快速选择</span>
+            <span class="preset-title">预设</span>
             <div class="preset-list">
               {% for preset in model_presets %}
                 <button
@@ -301,7 +441,7 @@
           </div>
 
           <label class="field" id="video-output-dir-field">
-            <span>视频保存目录（仅下载模式生效，留空则用 output/videos/）</span>
+            <span>视频保存目录</span>
             <input
               type="text"
               name="video_output_dir"
@@ -309,6 +449,7 @@
               placeholder="/Volumes/电影/test"
               disabled
             />
+            <p class="field-help">仅“仅下载视频”模式生效，留空保存到 <code>output/videos/</code>。</p>
           </label>
 
           <label class="checkbox">
@@ -322,9 +463,9 @@
           </label>
 
           <div class="action-row">
-            <button class="button button-accent" type="submit">开始批量处理</button>
+            <button class="btn btn-accent" type="submit">开始批量处理</button>
             {% if batch.resumable_files %}
-              <button class="button button-secondary" type="submit" formaction="/batches/{{ batch.batch_id }}/continue">
+              <button class="btn btn-secondary" type="submit" formaction="/batches/{{ batch.batch_id }}/continue">
                 继续已有结果
               </button>
             {% endif %}
@@ -339,18 +480,20 @@
     </section>
 
     <section class="card">
-      <div class="section-head">
-        <h2>文件列表</h2>
-        <p>按上传顺序处理</p>
+      <div class="card-header">
+        <div>
+          <h2 class="card-title">文件列表</h2>
+          <p class="card-subtitle">按上传顺序处理</p>
+        </div>
       </div>
-      <div class="table-shell">
-        <table>
+      <div class="table-wrap">
+        <table class="table-compact">
           <thead>
             <tr>
-              <th>#</th>
+              <th class="td-num">#</th>
               <th>文件</th>
               <th>格式</th>
-              <th>行数</th>
+              <th class="td-num">行数</th>
               <th>已有结果</th>
               <th>表头</th>
             </tr>
@@ -358,18 +501,18 @@
           <tbody>
             {% for job in batch.jobs %}
               <tr>
-                <td>{{ job.sequence }}</td>
-                <td>{{ job.original_filename }}</td>
-                <td>{{ job.file_type }}</td>
-                <td>{{ job.row_count }}</td>
+                <td class="td-num">{{ job.sequence }}</td>
+                <td><span class="text-mono">{{ job.original_filename }}</span></td>
+                <td><span class="text-mono">{{ job.file_type }}</span></td>
+                <td class="td-num">{{ job.row_count }}</td>
                 <td>
                   {% if job.resume_available %}
-                    <span class="pill">可继续</span>
+                    <span class="badge badge-success">可继续</span>
                   {% else %}
-                    <span class="pill pill-muted">无</span>
+                    <span class="badge badge-neutral">无</span>
                   {% endif %}
                 </td>
-                <td>{{ job.columns | join(" / ") }}</td>
+                <td class="long-value">{{ job.columns | join(" / ") }}</td>
               </tr>
             {% endfor %}
           </tbody>
@@ -445,20 +588,60 @@
       const response = await fetch(`/accounts/${accountId}/${action}`, { method: "POST" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        alert(payload.detail || "操作失败");
+        UI.toast(payload.detail || "操作失败", "error");
         return;
       }
-      if (payload.message) {
-        alert(payload.message);
-      }
+      const successMessages = {
+        delete: "已删除",
+        reset: "已清零",
+        relogin: payload.message || "已打开重新登录窗口",
+      };
+      UI.toast(successMessages[action] || payload.message || "操作已执行", "success");
       window.location.reload();
     }
 
     document.querySelectorAll(".account-action-button").forEach((button) => {
       button.addEventListener("click", () => {
         if (button.classList.contains("is-disabled")) return;
+        if (button.dataset.action === "delete") {
+          UI.confirm(button, () => postAccountAction(button.dataset.accountId, "delete"));
+          return;
+        }
         postAccountAction(button.dataset.accountId, button.dataset.action);
       });
+    });
+
+    const addAccountToggle = document.getElementById("add-account-toggle");
+    const addAccountForm = document.getElementById("add-account-form");
+    const addAccountLabel = document.getElementById("add-account-label");
+
+    addAccountToggle.addEventListener("click", () => {
+      addAccountForm.classList.toggle("is-hidden");
+      if (!addAccountForm.classList.contains("is-hidden")) {
+        addAccountLabel.focus();
+      }
+    });
+
+    addAccountForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!addAccountLabel.value.trim()) {
+        UI.toast("请输入备注", "error");
+        return;
+      }
+      const submitButton = addAccountForm.querySelector("button[type=submit]");
+      submitButton.disabled = true;
+      try {
+        const response = await fetch("/accounts", { method: "POST", body: new FormData(addAccountForm) });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          UI.toast(payload.detail || "添加失败", "error");
+          return;
+        }
+        UI.toast(payload.message || "已打开登录窗口", "success");
+        setTimeout(() => window.location.reload(), 1600);
+      } finally {
+        submitButton.disabled = false;
+      }
     });
   </script>
 {% endblock %}

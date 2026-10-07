@@ -14,6 +14,7 @@ import pandas as pd
 
 from .cookie_accounts import CookieAccountManager
 from .browser_service import PlaywrightFallback
+from .config import DOUYIN_PREFLIGHT_CHALLENGE
 from .douyin_service import DouyinService
 from .media_service import FFMPEG_TIMEOUT_SECONDS
 from .request_coordinator import RequestCoordinator
@@ -79,6 +80,7 @@ class VideoDownloader:
         self.recycle_interval = recycle_interval
         self.request_coordinator = request_coordinator
         self._active_downloads = 0
+        self._douyin_service: Optional[DouyinService] = None
 
     def recycle_browser(self) -> None:
         """周期性释放 Chromium 进程与 Playwright 驱动缓冲区，防止长时间运行导致内存堆积。"""
@@ -92,8 +94,25 @@ class VideoDownloader:
         self._active_downloads = 0
 
     def close(self) -> None:
+        if self._douyin_service:
+            try:
+                self._douyin_service.close()
+            except Exception:
+                pass
+            self._douyin_service = None
         if self.browser_resolver:
             self.browser_resolver.close()
+
+    def _get_douyin_service(self) -> DouyinService:
+        if self._douyin_service is None:
+            coordinator = self.request_coordinator or RequestCoordinator()
+            self.request_coordinator = coordinator
+            self.browser_resolver.request_coordinator = coordinator
+            self._douyin_service = DouyinService(
+                browser_resolver=self.browser_resolver,
+                request_coordinator=coordinator,
+            )
+        return self._douyin_service
 
     @staticmethod
     def _note_url_for_video(url: str) -> Optional[str]:
@@ -107,7 +126,66 @@ class VideoDownloader:
         lowered = (html or "").lower()
         return "__ac_signature" in lowered and (
             "byted_acrawler" in lowered or "window.location.reload" in lowered
-        )
+        ) or "验证码中间页" in lowered or "captcha/index.js" in lowered
+
+    def _download_video_with_capture(
+        self,
+        share_url: str,
+        out_dir: Path,
+        *,
+        skip_existing: bool,
+        allow_note_fallback: bool,
+    ) -> Tuple[bool, Path, str]:
+        """Use the shared parse/download chain used by the Mac WebUI path."""
+        note_url = self._note_url_for_video(share_url) if allow_note_fallback else None
+        service = self._get_douyin_service()
+        try:
+            video = service.parse_share_text(share_url)
+            if video.is_deleted:
+                return False, out_dir, f"[失败] {share_url}: 视频已删除"
+        except Exception as exc:
+            if note_url:
+                note_ok, note_path, note_message = self.download_url(
+                    note_url,
+                    out_dir,
+                    skip_existing=skip_existing,
+                    _allow_note_fallback=False,
+                    _is_note_fallback=True,
+                )
+                if note_ok:
+                    return True, note_path, f"[视频转图文重试] {note_message}"
+                return False, out_dir, f"[失败] {share_url}: {exc}; note 重试: {note_message}"
+            return False, out_dir, f"[失败] {share_url}: {exc}"
+
+        video_id = video.video_id or DouyinService.extract_video_id(share_url) or "unknown"
+        final_file = out_dir / f"视频-{video_id}.mp4"
+        if skip_existing and final_file.exists() and final_file.stat().st_size > 1024:
+            return True, final_file, f"[视频已存在，跳过] {final_file.name}"
+
+        temp_vid = out_dir / f"_tmp_{video_id}.mp4"
+        temp_aud = out_dir / f"_tmp_{video_id}.m4a"
+        try:
+            service.download_video(video, temp_vid, temp_aud)
+            if not temp_vid.exists() or temp_vid.stat().st_size <= 0:
+                raise RuntimeError("视频流下载未产出文件")
+            temp_vid.replace(final_file)
+            return True, final_file, f"[视频成功] {final_file.name} ({final_file.stat().st_size:,} 字节)"
+        except Exception as exc:
+            if note_url:
+                note_ok, note_path, note_message = self.download_url(
+                    note_url,
+                    out_dir,
+                    skip_existing=skip_existing,
+                    _allow_note_fallback=False,
+                    _is_note_fallback=True,
+                )
+                if note_ok:
+                    return True, note_path, f"[视频转图文重试] {note_message}"
+                return False, out_dir, f"[失败] {share_url}: {exc}; note 重试: {note_message}"
+            return False, out_dir, f"[失败] {share_url}: {exc}"
+        finally:
+            temp_vid.unlink(missing_ok=True)
+            temp_aud.unlink(missing_ok=True)
 
     def _preflight_challenge(self, ctx, share_url: str) -> bool:
         """Probe the HTML without executing JavaScript before opening a page.
@@ -165,6 +243,37 @@ class VideoDownloader:
                     if candidate_path.exists() and candidate_path.stat().st_size > 1024:
                         prefix = "视频" if candidate_name.startswith("视频") else "图文"
                         return True, candidate_path, f"[{prefix}已存在，跳过] {candidate_path.name}"
+
+        # The original NAS path loaded the video page once to inspect detail
+        # JSON and then loaded it again inside PlaywrightFallback.  That second
+        # navigation is enough to trigger Douyin's captcha shell.  Video pages
+        # now use one BrowserCapture and pass it through to the downloader;
+        # note pages keep the dedicated image path below.
+        if not _is_note_fallback and not re.search(r"/note/\d+", share_url):
+            if self._active_downloads >= self.recycle_interval:
+                self.recycle_browser()
+            self._active_downloads += 1
+            ctx = self.browser_resolver._ensure_context()
+            if DOUYIN_PREFLIGHT_CHALLENGE and self._preflight_challenge(ctx, share_url):
+                note_url = self._note_url_for_video(share_url) if _allow_note_fallback else None
+                if note_url:
+                    note_ok, note_path, note_message = self.download_url(
+                        note_url,
+                        out_dir,
+                        skip_existing=skip_existing,
+                        _allow_note_fallback=False,
+                        _is_note_fallback=True,
+                    )
+                    if note_ok:
+                        return True, note_path, f"[视频转图文重试] {note_message}"
+                    return False, out_dir, f"[失败] {share_url}: note 重试: {note_message}"
+                return False, out_dir, f"[失败] {share_url}: 检测到抖音验证码挑战页"
+            return self._download_video_with_capture(
+                share_url,
+                out_dir,
+                skip_existing=skip_existing,
+                allow_note_fallback=_allow_note_fallback,
+            )
 
         # 达到回收周期时主动重置 Chromium 进程。A note fallback belongs
         # to the same logical item and must not consume another recycle slot.

@@ -18,6 +18,7 @@ services:
       DOUYIN_STORAGE_ROOT: /nas/videos
       DOUYIN_BATCH_OUTPUT_ROOT: /nas/videos/视频下载
       PLAYWRIGHT_HEADLESS: "true"
+      DOUYIN_PREFLIGHT_CHALLENGE: "true"
       TZ: Asia/Shanghai
     ports:
       - "127.0.0.1:8000:8000"

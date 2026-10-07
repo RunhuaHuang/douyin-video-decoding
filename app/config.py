@@ -21,6 +21,17 @@ def _int_from_env(name: str, default: int) -> int:
         raise RuntimeError(f"环境变量 {name} 必须是整数，当前值: {value!r}") from exc
 
 
+def _bool_from_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"环境变量 {name} 必须是布尔值，当前值: {value!r}")
+
+
 APP_DIR = PROJECT_ROOT / "app"
 TMP_DIR = PROJECT_ROOT / "tmp" / "spreadsheets"
 UPLOAD_DIR = TMP_DIR / "uploads"
@@ -62,6 +73,9 @@ DOUYIN_REQUEST_TIMEOUT_SECONDS = 25.0
 DOUYIN_DOWNLOAD_TIMEOUT_SECONDS = 90.0
 DOUYIN_BROWSER_FALLBACK_ENABLED = True
 DOUYIN_BROWSER_FIRST = True
+# NAS 无头环境需要先用无脚本请求识别验证码页；本机交互式浏览器默认关闭，
+# 避免把可由 Chromium 解决的中间页误判成不可下载。
+DOUYIN_PREFLIGHT_CHALLENGE = _bool_from_env("DOUYIN_PREFLIGHT_CHALLENGE", False)
 DOUYIN_CHALLENGE_BASE_COOLDOWN_SECONDS = 0.0
 DOUYIN_CHALLENGE_MAX_COOLDOWN_SECONDS = 0.0
 PLAYWRIGHT_HEADLESS = True

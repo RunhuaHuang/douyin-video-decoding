@@ -54,6 +54,7 @@ def test_challenge_navigation_uses_commit_wait_until(tmp_path):
                 "https://www.douyin.com/video/1",
                 out_dir=tmp_path,
                 skip_existing=False,
+                _is_note_fallback=True,
             )
         page.goto.assert_called_once_with(
             "https://www.douyin.com/video/1",
@@ -88,6 +89,7 @@ def test_challenge_page_routes_to_note_after_commit(tmp_path):
                 "https://www.douyin.com/video/1",
                 out_dir=tmp_path,
                 skip_existing=False,
+                _is_note_fallback=True,
             )
 
         assert ok is False
@@ -107,7 +109,43 @@ def test_challenge_page_routes_to_note_after_commit(tmp_path):
         downloader.close()
 
 
-def test_preflight_challenge_routes_to_note_before_page_navigation(tmp_path):
+def test_video_uses_shared_douyin_service_download_chain(tmp_path):
+    downloader = VideoDownloader()
+    try:
+        service = MagicMock()
+        service.parse_share_text.return_value = MagicMock(
+            video_id="7683110075418310314",
+            is_deleted=False,
+        )
+
+        def write_video(video, output_path, audio_output_path=None):
+            output_path.write_bytes(b"video" * 512)
+
+        service.download_video.side_effect = write_video
+        with patch.object(downloader, "_get_douyin_service", return_value=service), patch.object(
+            downloader.browser_resolver, "_ensure_context", return_value=MagicMock()
+        ), patch.object(downloader.browser_resolver, "download_video") as browser_download:
+            ok, path, message = downloader.download_url(
+                "https://www.douyin.com/video/7683110075418310314",
+                out_dir=tmp_path,
+                skip_existing=False,
+            )
+
+        assert ok is True
+        assert path == tmp_path / "视频-7683110075418310314.mp4"
+        assert path.read_bytes() == b"video" * 512
+        assert "视频成功" in message
+        service.parse_share_text.assert_called_once_with(
+            "https://www.douyin.com/video/7683110075418310314"
+        )
+        service.download_video.assert_called_once()
+        browser_download.assert_not_called()
+    finally:
+        downloader.close()
+
+
+def test_preflight_challenge_routes_to_note_before_page_navigation(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.video_downloader.DOUYIN_PREFLIGHT_CHALLENGE", True)
     downloader = VideoDownloader()
     try:
         note_page = MagicMock()

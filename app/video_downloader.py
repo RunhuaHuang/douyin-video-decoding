@@ -109,6 +109,33 @@ class VideoDownloader:
             "byted_acrawler" in lowered or "window.location.reload" in lowered
         )
 
+    def _preflight_challenge(self, ctx, share_url: str) -> bool:
+        """Probe the HTML without executing JavaScript before opening a page.
+
+        The challenge shell reloads forever in Chromium, so even a bounded
+        ``page.goto(..., wait_until='commit')`` can remain inside Playwright's
+        navigation call.  BrowserContext.request receives the same cookies
+        without running that script and lets the caller route to ``/note``
+        before creating a page.
+        """
+        try:
+            self.browser_resolver._throttle()
+            response = ctx.request.get(
+                share_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Referer": "https://www.douyin.com/",
+                },
+                timeout=min(float(self.browser_resolver.navigation_timeout_ms), 10000.0),
+                fail_on_status_code=False,
+                max_retries=0,
+            )
+            return self._is_douyin_challenge_html(response.text())
+        except Exception:
+            # A failed probe must not reject a valid browser navigation. The
+            # normal page path still has its own bounded navigation timeout.
+            return False
+
     def download_url(
         self,
         raw_url: str,
@@ -147,6 +174,22 @@ class VideoDownloader:
             self._active_downloads += 1
 
         ctx = self.browser_resolver._ensure_context()
+
+        if self._preflight_challenge(ctx, share_url):
+            note_url = self._note_url_for_video(share_url) if _allow_note_fallback else None
+            if note_url:
+                note_ok, note_path, note_message = self.download_url(
+                    note_url,
+                    out_dir,
+                    skip_existing=skip_existing,
+                    _allow_note_fallback=False,
+                    _is_note_fallback=True,
+                )
+                if note_ok:
+                    return True, note_path, f"[视频转图文重试] {note_message}"
+                return False, out_dir, f"[失败] {share_url}: note 重试: {note_message}"
+            return False, out_dir, f"[失败] {share_url}: 检测到抖音反爬挑战页"
+
         page = ctx.new_page()
 
         audio_urls: List[str] = []

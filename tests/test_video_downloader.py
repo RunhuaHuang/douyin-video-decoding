@@ -107,6 +107,41 @@ def test_challenge_page_routes_to_note_after_commit(tmp_path):
         downloader.close()
 
 
+def test_preflight_challenge_routes_to_note_before_page_navigation(tmp_path):
+    downloader = VideoDownloader()
+    try:
+        note_page = MagicMock()
+        note_page.content.return_value = "<html>note</html>"
+        note_page.url = "https://www.douyin.com/note/1"
+        note_page.is_closed.return_value = False
+        note_page.wait_for_selector.side_effect = RuntimeError("no images")
+        note_page.evaluate.return_value = []
+
+        context = MagicMock()
+        context.request.get.side_effect = [
+            MagicMock(text=lambda: '<script>window.location.reload(); var __ac_signature="x"</script>'),
+            MagicMock(text=lambda: "<html>note</html>"),
+        ]
+        context.new_page.return_value = note_page
+        with patch.object(downloader.browser_resolver, "_ensure_context", return_value=context):
+            ok, _, message = downloader.download_url(
+                "https://www.douyin.com/video/1",
+                out_dir=tmp_path,
+                skip_existing=False,
+            )
+
+        assert ok is False
+        assert "note 重试" in message
+        assert context.new_page.call_count == 1
+        note_page.goto.assert_called_once_with(
+            "https://www.douyin.com/note/1",
+            wait_until="commit",
+            timeout=downloader.browser_resolver.navigation_timeout_ms,
+        )
+    finally:
+        downloader.close()
+
+
 def test_cli_list_accounts(capsys):
     ret = main(["--list-accounts"])
     assert ret == 0

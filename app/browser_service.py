@@ -129,7 +129,10 @@ class PlaywrightFallback:
             page = self._ensure_context().new_page()
             page.on("response", handle_response)
             self._throttle()
-            page.goto(share_url, wait_until="domcontentloaded", timeout=self.navigation_timeout_ms)
+            # A Douyin challenge shell may reload forever before
+            # DOMContentLoaded.  Commit is enough to inspect the response and
+            # keeps browser fallback from waiting inside the reload loop.
+            page.goto(share_url, wait_until="commit", timeout=self.navigation_timeout_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=self.network_idle_timeout_ms)
             except Exception:

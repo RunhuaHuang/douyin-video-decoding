@@ -172,7 +172,11 @@ class VideoDownloader:
 
         try:
             self.browser_resolver._throttle()
-            page.goto(share_url, wait_until="domcontentloaded", timeout=self.browser_resolver.navigation_timeout_ms)
+            # Challenge pages can execute window.location.reload() forever and
+            # never reach DOMContentLoaded.  Wait for the response commit so
+            # the HTML can be inspected and routed to /note before the reload
+            # loop traps this worker.
+            page.goto(share_url, wait_until="commit", timeout=self.browser_resolver.navigation_timeout_ms)
             page.wait_for_timeout(2500)
 
             # A challenge page can keep reloading without raising a Playwright

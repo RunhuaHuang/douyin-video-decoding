@@ -33,6 +33,80 @@ def test_video_url_can_be_converted_to_note_route():
     assert not VideoDownloader._is_douyin_challenge_html("<html><body>normal</body></html>")
 
 
+def test_challenge_navigation_uses_commit_wait_until(tmp_path):
+    downloader = VideoDownloader()
+    try:
+        page = MagicMock()
+        page.goto.return_value = None
+        page.wait_for_timeout.return_value = None
+        page.content.return_value = "<html>normal</html>"
+        page.url = "https://www.douyin.com/video/1"
+        page.is_closed.return_value = False
+        context = MagicMock()
+        context.new_page.return_value = page
+        def write_video(**kwargs):
+            kwargs["output_path"].write_bytes(b"video" * 512)
+
+        with patch.object(downloader.browser_resolver, "_ensure_context", return_value=context), patch.object(
+            downloader.browser_resolver, "download_video", side_effect=write_video
+        ):
+            downloader.download_url(
+                "https://www.douyin.com/video/1",
+                out_dir=tmp_path,
+                skip_existing=False,
+            )
+        page.goto.assert_called_once_with(
+            "https://www.douyin.com/video/1",
+            wait_until="commit",
+            timeout=downloader.browser_resolver.navigation_timeout_ms,
+        )
+    finally:
+        downloader.close()
+
+
+def test_challenge_page_routes_to_note_after_commit(tmp_path):
+    downloader = VideoDownloader()
+    try:
+        challenge_page = MagicMock()
+        challenge_page.content.return_value = (
+            '<script>window.location.reload(); var __ac_signature="x"</script>'
+        )
+        challenge_page.url = "https://www.douyin.com/video/1"
+        challenge_page.is_closed.return_value = False
+
+        note_page = MagicMock()
+        note_page.content.return_value = "<html>note</html>"
+        note_page.url = "https://www.douyin.com/note/1"
+        note_page.is_closed.return_value = False
+        note_page.wait_for_selector.side_effect = RuntimeError("no images")
+        note_page.evaluate.return_value = []
+
+        context = MagicMock()
+        context.new_page.side_effect = [challenge_page, note_page]
+        with patch.object(downloader.browser_resolver, "_ensure_context", return_value=context):
+            ok, _, message = downloader.download_url(
+                "https://www.douyin.com/video/1",
+                out_dir=tmp_path,
+                skip_existing=False,
+            )
+
+        assert ok is False
+        assert "note 重试" in message
+        assert context.new_page.call_count == 2
+        challenge_page.goto.assert_called_once_with(
+            "https://www.douyin.com/video/1",
+            wait_until="commit",
+            timeout=downloader.browser_resolver.navigation_timeout_ms,
+        )
+        note_page.goto.assert_called_once_with(
+            "https://www.douyin.com/note/1",
+            wait_until="commit",
+            timeout=downloader.browser_resolver.navigation_timeout_ms,
+        )
+    finally:
+        downloader.close()
+
+
 def test_cli_list_accounts(capsys):
     ret = main(["--list-accounts"])
     assert ret == 0

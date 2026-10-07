@@ -18,7 +18,9 @@ services:
       DOUYIN_STORAGE_ROOT: /nas/videos
       DOUYIN_BATCH_OUTPUT_ROOT: /nas/videos/视频下载
       PLAYWRIGHT_HEADLESS: "true"
-      DOUYIN_PREFLIGHT_CHALLENGE: "true"
+      # Let headless Chromium solve the challenge with the logged-in session;
+      # the preflight probe rejects this same valid session on NAS.
+      DOUYIN_PREFLIGHT_CHALLENGE: "false"
       TZ: Asia/Shanghai
     ports:
       - "127.0.0.1:8000:8000"

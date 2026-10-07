@@ -169,10 +169,92 @@ uv run pytest
 
 ## NAS 视频下载部署
 
-项目包含面向 NAS 的视频下载 Compose，默认把 NAS 宿主机 `/volume5/视频下载` 映射为容器 `/nas/videos`，并将它设为仅下载模式的默认保存目录。完整的 SSH、账号会话复制、启动和更新步骤见 [`deploy/nas/README.md`](deploy/nas/README.md)。
+项目包含面向 NAS 的视频下载 Compose。部署时使用 `nasopencode` 中已经配置好的 SSH 别名连接 NAS，再把本仓库同步到 NAS 后构建容器。
 
-本机默认仍监听 `127.0.0.1:8000`；NAS Compose 通过 `DOUYIN_WEBUI_HOST=0.0.0.0` 和 `DOUYIN_WEBUI_PORT=8000` 对外提供 WebUI。视频保存目录也可以用 `DOUYIN_VIDEO_OUTPUT_DIR` 覆盖，留空时保持本机的 `output/videos/` 默认值。
+固定路径映射如下：
 
-以后需要下载 NAS 上的某个 Excel 时，直接执行 `douyin-batch-download`；它会把 `视频链接` 列下载到 `/volume5/视频下载/视频下载/<Excel 文件名>/`，重复执行会跳过已完成文件并继续失败或中断的行。
+| 用途 | Mac / NAS 宿主机 | 容器内 |
+|---|---|---|
+| 项目目录 | `/home/a/Agents/projects/抖音文案提取工具` | `/app` |
+| 视频存储 | `/volume5/视频下载` | `/nas/videos` |
+| 账号池、任务状态 | 项目目录下的 `tmp/` | `/app/tmp` |
+| WebUI 结果 | 项目目录下的 `output/` | `/app/output` |
 
-下载命令会输出 `PROGRESS` JSON 进度行；运行中的任务也可用 `douyin-batch-download --status <Excel路径>` 查询。
+### 连接 NAS
+
+`nasopencode` 的 `config/nas.env` 应该已经配置 `nas`（局域网）和 `nas-tailscale`（Tailscale）两个 SSH 别名。先做只读检查：
+
+```bash
+ssh nas 'echo NAS SSH OK; uname -m; test -d "/volume5/视频下载"'
+# 不在局域网时使用：
+ssh nas-tailscale 'echo NAS SSH OK; uname -m'
+```
+
+### 首次部署或更新代码
+
+不要直接在 NAS 手动复制零散文件。使用 `ocprojectsync.sh` 将整个项目同步到 NAS，再由 Compose 构建镜像：
+
+```bash
+NAS_HOST_OVERRIDE=nas \
+  "/Users/runhua/Runhua MBP/Python/nasopencode/scripts/ocprojectsync.sh" \
+  push "/Users/runhua/Runhua MBP/Python/抖音文案提取工具"
+
+ssh nas 'cd "/home/a/Agents/projects/抖音文案提取工具/deploy/nas" && sudo docker compose up -d --build'
+ssh nas 'sudo docker compose -f "/home/a/Agents/projects/抖音文案提取工具/deploy/nas/docker-compose.yml" ps'
+```
+
+Compose 会启动 `douyin-video` 容器，默认监听 NAS 的 `8000` 端口：局域网访问 `http://192.168.100.188:8000`，Tailscale 访问 `http://100.68.215.29:8000`。容器是无头 Chromium，视频下载可以直接运行，但不能在 NAS 上弹出扫码窗口。
+
+### 复制账号会话
+
+先在 Mac 上人工扫码登录并确认账号池可用：
+
+```bash
+./login "主号"
+uv run douyin-dl --list-accounts
+```
+
+然后用 `tar + SSH` 将账号 JSON 复制到容器；中文路径下不要改用普通 `scp`：
+
+```bash
+COPYFILE_DISABLE=1 tar --no-xattrs -czf - \
+  -C "/Users/runhua/Runhua MBP/Python/抖音文案提取工具/tmp/browser/accounts" . \
+  | ssh nas 'sudo docker exec -i douyin-video tar xzf - -C /app/tmp/browser/accounts'
+ssh nas 'sudo docker compose -f "/home/a/Agents/projects/抖音文案提取工具/deploy/nas/docker-compose.yml" restart'
+```
+
+账号 JSON 是登录凭据，不要提交 Git、写入 Docker 镜像或粘贴到聊天中。账号池为空时，先在 Mac 完成扫码，再执行复制步骤。
+
+### 手动启动 Excel 下载
+
+NAS 任务不会自动监控目录。指定 Excel 后，程序读取其中的 `视频链接` 列，将结果写到 `/volume5/视频下载/视频下载/<Excel 文件名>/`，重复执行会跳过已有完整文件并继续剩余行：
+
+```bash
+ssh nas 'sudo docker exec douyin-video douyin-batch-download \
+  "/volume5/视频下载/目标视频列表/分享总榜.xlsx"'
+```
+
+默认使用 2 个下载线程，每个线程使用不同 cookies；可按账号池和 NAS 负载调整为 1～8：
+
+```bash
+ssh nas 'sudo docker exec douyin-video douyin-batch-download --workers 2 \
+  "/volume5/视频下载/目标视频列表/分享总榜.xlsx"'
+```
+
+查询任务进度、容器健康状态和日志：
+
+```bash
+ssh nas 'sudo docker exec douyin-video douyin-batch-download --status \
+  "/volume5/视频下载/目标视频列表/分享总榜.xlsx"'
+ssh nas 'sudo docker compose -f "/home/a/Agents/projects/抖音文案提取工具/deploy/nas/docker-compose.yml" ps'
+ssh nas 'sudo docker logs douyin-video --tail 80'
+```
+
+单链接下载器在容器内使用 `/nas/videos`，不要把 NAS 宿主机路径传给容器命令：
+
+```bash
+ssh nas 'sudo docker exec douyin-video douyin-video-dl \
+  "https://www.douyin.com/video/视频ID" -o /nas/videos'
+```
+
+更完整的 Compose 参数和故障排查见 [`deploy/nas/README.md`](deploy/nas/README.md)。

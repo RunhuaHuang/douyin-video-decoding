@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .browser_service import CHROME_USER_AGENT, PlaywrightFallback
+from .browser_service import BrowserCapture, CHROME_USER_AGENT, PlaywrightFallback
 from .config import (
     DOUYIN_BROWSER_FALLBACK_ENABLED,
     DOUYIN_BROWSER_FIRST,
@@ -82,6 +82,9 @@ class ParsedVideo:
     comments: int = 0
     shares: int = 0
     cover_url: str = ""
+    # Browser-first parsing already captured signed media URLs. Reuse that
+    # capture for the immediately following download.
+    browser_capture: Optional[BrowserCapture] = None
 
     @property
     def download_url(self) -> str:
@@ -168,6 +171,8 @@ class DouyinService:
     def parse_share_text(self, share_text: str) -> ParsedVideo:
         share_url = self.extract_first_url(share_text)
         if not share_url:
+            raise RuntimeError("未在单元格中找到有效的抖音链接")
+        if not self.is_douyin_url(share_url):
             raise RuntimeError("未在单元格中找到有效的抖音链接")
         if self.is_note_url(share_url):
             raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
@@ -345,6 +350,23 @@ class DouyinService:
         return target.rstrip("，。！？；,!?;）)]\"'“”‘’<>")
 
     @staticmethod
+    def is_douyin_url(url: str) -> bool:
+        """Accept only official Douyin hosts before browser navigation."""
+        try:
+            parsed = urlparse((url or "").strip())
+        except Exception:
+            return False
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        hostname = parsed.hostname.lower().rstrip(".")
+        return (
+            hostname == "douyin.com"
+            or hostname.endswith(".douyin.com")
+            or hostname == "iesdouyin.com"
+            or hostname.endswith(".iesdouyin.com")
+        )
+
+    @staticmethod
     def extract_video_id(url: str) -> Optional[str]:
         patterns = (
             r"/video/(\d+)",
@@ -467,41 +489,40 @@ class DouyinService:
         if resolver is None:
             return None
 
-        try:
-            capture = resolver.capture_video(share_url)
-            if self.is_note_url(capture.page_url):
-                raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
-            self._sync_client_cookies_from_browser()
-            browser_urls = tuple(self._candidate_download_urls(capture.media_urls))
-            if not browser_urls and capture.preview_urls:
-                raise RuntimeError("浏览器兜底命中通用页，仅捕获到预览片段")
-            if not browser_urls:
-                if self._looks_like_deleted_title(capture.title):
-                    video_id = self.extract_video_id(capture.page_url) or self.extract_video_id(share_url) or "browser"
-                    return ParsedVideo(
-                        video_id=video_id,
-                        title=capture.title,
-                        author=capture.author,
-                        download_urls=(),
-                        share_url=share_url,
-                        page_url=capture.page_url,
-                        resolved_by="浏览器兜底",
-                        is_deleted=True,
-                    )
-                raise RuntimeError("浏览器兜底没有捕获到真实视频地址")
+        capture = resolver.capture_video(share_url)
+        if self.is_note_url(capture.page_url):
+            raise RuntimeError(self.NON_VIDEO_NOTE_ERROR)
+        self._sync_client_cookies_from_browser()
+        browser_urls = tuple(self._candidate_download_urls(capture.media_urls))
+        if not browser_urls and capture.preview_urls:
+            raise RuntimeError("浏览器兜底命中通用页，仅捕获到预览片段")
+        if not browser_urls:
+            if self._looks_like_deleted_title(capture.title):
+                video_id = self.extract_video_id(capture.page_url) or self.extract_video_id(share_url) or "browser"
+                return ParsedVideo(
+                    video_id=video_id,
+                    title=capture.title,
+                    author=capture.author,
+                    download_urls=(),
+                    share_url=share_url,
+                    page_url=capture.page_url,
+                    resolved_by="浏览器兜底",
+                    is_deleted=True,
+                    browser_capture=capture,
+                )
+            raise RuntimeError("浏览器兜底没有捕获到真实视频地址")
 
-            video_id = self.extract_video_id(capture.page_url) or self.extract_video_id(share_url) or "browser"
-            return ParsedVideo(
-                video_id=video_id,
-                title=capture.title,
-                author=capture.author,
-                download_urls=browser_urls,
-                share_url=share_url,
-                page_url=capture.page_url,
-                resolved_by="浏览器兜底",
-            )
-        finally:
-            self._recycle_browser_resolver(resolver)
+        video_id = self.extract_video_id(capture.page_url) or self.extract_video_id(share_url) or "browser"
+        return ParsedVideo(
+            video_id=video_id,
+            title=capture.title,
+            author=capture.author,
+            download_urls=browser_urls,
+            share_url=share_url,
+            page_url=capture.page_url,
+            resolved_by="浏览器兜底",
+            browser_capture=capture,
+        )
 
     def _try_parse_with_browser(self, share_url: str) -> Tuple[Optional[ParsedVideo], str]:
         try:
@@ -536,11 +557,17 @@ class DouyinService:
             return None
 
         try:
+            if video.browser_capture is not None:
+                return resolver.download_video(
+                    source_url,
+                    output_path,
+                    video.download_urls,
+                    audio_output_path,
+                    capture=video.browser_capture,
+                )
             return resolver.download_video(source_url, output_path, video.download_urls, audio_output_path)
         except Exception as exc:
             raise RuntimeError(f"浏览器兜底失败: {exc}") from exc
-        finally:
-            self._recycle_browser_resolver(resolver)
 
     def _get_browser_resolver(self) -> Optional[PlaywrightFallback]:
         if not self.browser_fallback_enabled:
@@ -548,13 +575,6 @@ class DouyinService:
         if self.browser_resolver is None:
             self.browser_resolver = PlaywrightFallback(request_coordinator=self.request_coordinator)
         return self.browser_resolver
-
-    @staticmethod
-    def _recycle_browser_resolver(resolver: PlaywrightFallback) -> None:
-        try:
-            resolver.close()
-        except Exception:
-            return
 
     def _get(self, url: str, *, headers: Dict[str, str]) -> httpx.Response:
         self._throttle()

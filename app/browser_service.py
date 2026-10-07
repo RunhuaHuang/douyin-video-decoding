@@ -207,8 +207,9 @@ class PlaywrightFallback:
         output_path: Path,
         candidate_urls: Sequence[str],
         audio_output_path: Path | None = None,
+        capture: BrowserCapture | None = None,
     ) -> BrowserDownloadResult:
-        capture = self.capture_video(share_url)
+        capture = capture or self.capture_video(share_url)
         all_urls = [*capture.video_urls, *candidate_urls]
         # 网页端长视频是音视频分离流，音频流 URL 的 query 常带 mime_type=video_mp4，
         # 必须按 media-audio 路径特征分流，否则纯音频会被当成视频存下来

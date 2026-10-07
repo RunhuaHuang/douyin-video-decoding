@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -3008,6 +3009,22 @@ def test_pipeline_parallel_asr_workers_transcribe_multiple_rows(tmp_path, monkey
     result = pd.read_csv(job.output_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
     assert all(result["处理状态"] == "成功")
     assert all(result["视频文本"].str.startswith("transcript:"))
+
+
+def test_parallel_asr_workers_share_transcriber_service():
+    created = []
+
+    def factory(default_model):
+        service = FakeTranscriptionService(default_model)
+        created.append(service)
+        return service
+
+    processor = JobProcessor(object(), transcription_service_factory=factory)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        services = list(pool.map(lambda _: processor._get_thread_transcriber("model"), range(2)))
+
+    assert len(created) == 1
+    assert services[0] is services[1]
 
 
 def test_pipeline_pause_then_resume_completes_remaining_rows(tmp_path, monkeypatch):

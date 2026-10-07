@@ -15,6 +15,8 @@ import pandas as pd
 from .cookie_accounts import CookieAccountManager
 from .browser_service import PlaywrightFallback
 from .douyin_service import DouyinService
+from .media_service import FFMPEG_TIMEOUT_SECONDS
+from .request_coordinator import RequestCoordinator
 
 
 DEFAULT_VIDEO_OUTPUT_DIR = Path("output/downloads")
@@ -59,6 +61,7 @@ class VideoDownloader:
         account_manager: Optional[CookieAccountManager] = None,
         storage_state_path: Optional[Path] = None,
         recycle_interval: int = 10,
+        request_coordinator: Optional[RequestCoordinator] = None,
     ) -> None:
         self.account_manager = account_manager or CookieAccountManager()
         if storage_state_path is None:
@@ -71,8 +74,10 @@ class VideoDownloader:
 
         self.browser_resolver = PlaywrightFallback(
             storage_state_path=self.storage_state_path or Path("tmp/browser/storage_state.json"),
+            request_coordinator=request_coordinator,
         )
         self.recycle_interval = recycle_interval
+        self.request_coordinator = request_coordinator
         self._active_downloads = 0
 
     def recycle_browser(self) -> None:
@@ -119,6 +124,8 @@ class VideoDownloader:
         share_url = DouyinService.extract_first_url(raw_url) or raw_url.strip()
         if not share_url:
             raise ValueError(f"无效的链接: {raw_url}")
+        if not DouyinService.is_douyin_url(share_url):
+            raise ValueError(f"不是有效的抖音链接: {share_url}")
 
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -287,6 +294,7 @@ class VideoDownloader:
                             check=True,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
+                            timeout=FFMPEG_TIMEOUT_SECONDS,
                         )
                         local_pngs.append(png_img)
 
@@ -326,7 +334,13 @@ class VideoDownloader:
                         "-t", str(dur),
                         str(temp_out),
                     ])
-                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(
+                        cmd,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=FFMPEG_TIMEOUT_SECONDS,
+                    )
                     # The temporary directory may be on a different mount
                     # from a NAS bind volume; Path.replace() then fails with
                     # EXDEV. Stage the copy on the destination filesystem so
@@ -402,7 +416,11 @@ class VideoDownloader:
             df = pd.read_excel(table_path)
 
         url_col = detect_url_column(df, url_column)
-        urls = df[url_col].dropna().astype(str).tolist()
+        urls = [
+            str(value).strip()
+            for value in df[url_col].tolist()
+            if pd.notna(value) and str(value).strip()
+        ]
 
         print(f"开始批量下载表格: {table_path.name}")
         print(f"  匹配链接列: [{url_col}], 共 {len(urls)} 条链接")
@@ -417,7 +435,9 @@ class VideoDownloader:
                     matched_accounts.append(avail_map[acc_name])
                 else:
                     print(f"  [警告] 指定账号 '{acc_name}' 不在可用账号池中或已失效", file=sys.stderr)
-            worker_accounts = matched_accounts[:workers] if matched_accounts else available_accounts[:workers]
+            if not matched_accounts:
+                raise RuntimeError("指定的账号均不可用，已拒绝静默切换到其他账号")
+            worker_accounts = matched_accounts[:workers]
         else:
             worker_accounts = available_accounts[:workers]
 
@@ -440,10 +460,16 @@ class VideoDownloader:
         success_count = 0
         fail_count = 0
 
-        tasks = [(i, u) for i, u in enumerate(urls, 1) if i >= start_row]
+        tasks = [(index, url) for index, url in enumerate(urls, 1) if index >= start_row]
         if not tasks:
             print("没有需要处理的链接。", flush=True)
             return 0, 0
+
+        # One coordinator is shared by every browser worker in this batch so
+        # parallel accounts still respect a single request cadence.
+        request_coordinator = self.request_coordinator or RequestCoordinator()
+        self.request_coordinator = request_coordinator
+        self.browser_resolver.request_coordinator = request_coordinator
 
         # Prevent duplicate rows for the same item ID from writing the same
         # output file concurrently while keeping unrelated links parallel.
@@ -497,6 +523,7 @@ class VideoDownloader:
                     account_manager=self.account_manager,
                     storage_state_path=account.storage_state_path,
                     recycle_interval=self.recycle_interval,
+                    request_coordinator=request_coordinator,
                 )
                 try:
                     while True:

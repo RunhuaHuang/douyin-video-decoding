@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 
 from app.browser_service import BrowserCapture, BrowserDownloadResult
 from app.douyin_service import (
@@ -18,6 +19,7 @@ class FakeBrowserResolver:
         self.capture_calls = 0
         self.download_calls = 0
         self.close_calls = 0
+        self.received_captures = []
 
     def capture_video(self, share_url: str) -> BrowserCapture:
         self.capture_calls += 1
@@ -34,8 +36,10 @@ class FakeBrowserResolver:
         output_path: Path,
         candidate_urls,
         audio_output_path: Path | None = None,
+        capture: BrowserCapture | None = None,
     ) -> BrowserDownloadResult:
         self.download_calls += 1
+        self.received_captures.append(capture)
         output_path.write_bytes(b"browser-video")
         if audio_output_path is not None:
             audio_output_path.write_bytes(b"browser-audio")
@@ -504,18 +508,19 @@ def test_parse_with_browser_marks_deleted_only_without_media():
     assert parsed.download_urls == ()
 
 
-def test_parse_with_browser_recycles_resolver_after_each_use():
+def test_parse_with_browser_keeps_resolver_for_following_download():
     resolver = FakeBrowserResolver()
     service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
     try:
         parsed = service._parse_with_browser("https://www.douyin.com/video/7336856430550601010")
         assert parsed is not None
-        assert resolver.close_calls == 1
+        assert resolver.close_calls == 0
     finally:
         service.close()
+    assert resolver.close_calls == 1
 
 
-def test_download_via_browser_recycles_resolver_after_each_use(tmp_path):
+def test_download_via_browser_keeps_resolver_until_service_close(tmp_path):
     resolver = FakeBrowserResolver()
     service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
     video = ParsedVideo(
@@ -531,7 +536,21 @@ def test_download_via_browser_recycles_resolver_after_each_use(tmp_path):
     try:
         result = service._download_via_browser(video, tmp_path / "video.mp4", tmp_path / "audio.m4a")
         assert result is not None
-        assert resolver.close_calls == 1
+        assert resolver.close_calls == 0
+    finally:
+        service.close()
+    assert resolver.close_calls == 1
+
+
+def test_browser_capture_is_reused_for_following_download(tmp_path):
+    resolver = FakeBrowserResolver()
+    service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
+    try:
+        video = service._parse_with_browser("https://www.douyin.com/video/7336856430550601010")
+        assert video is not None
+        service._download_via_browser(video, tmp_path / "video.mp4", tmp_path / "audio.m4a")
+        assert resolver.capture_calls == 1
+        assert resolver.received_captures == [video.browser_capture]
     finally:
         service.close()
 
@@ -715,6 +734,17 @@ def test_extract_first_url_falls_back_to_first_url_when_no_douyin_link():
     text = "参考 https://example.com/a 和 https://another.example.com/b"
 
     assert DouyinService.extract_first_url(text) == "https://example.com/a"
+
+
+def test_parse_share_text_rejects_non_douyin_url_before_browser_navigation():
+    resolver = FakeBrowserResolver()
+    service = DouyinService(browser_resolver=resolver, browser_fallback_enabled=True)
+    try:
+        with pytest.raises(RuntimeError, match="有效的抖音链接"):
+            service.parse_share_text("https://example.com/internal")
+        assert resolver.capture_calls == 0
+    finally:
+        service.close()
 
 
 def test_extract_first_url_strips_trailing_quote_and_bracket_chars():

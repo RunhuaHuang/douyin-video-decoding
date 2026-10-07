@@ -15,7 +15,7 @@ class FfmpegService:
         self.ffprobe_path = shutil.which("ffprobe")
 
     def is_available(self) -> bool:
-        return bool(self.ffmpeg_path)
+        return bool(self.ffmpeg_path and self.ffprobe_path)
 
     def require(self) -> str:
         if not self.ffmpeg_path:

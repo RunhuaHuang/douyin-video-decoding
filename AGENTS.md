@@ -10,7 +10,7 @@
 ## 上手前自检（按顺序）
 
 ```bash
-uv sync && uv run playwright install chromium   # 依赖（一次性）
+uv sync --extra dev && uv run playwright install chromium   # 依赖（一次性）
 uv run douyin-dl --list-accounts                # 账号池必须有可用会话
 uv run pytest                                   # 全量测试应全部通过
 ```
@@ -28,7 +28,7 @@ uv run pytest                                   # 全量测试应全部通过
 | 批量（无人值守） | 见下面 API 四步 |
 | 批量（有人在旁边） | `./run` 起 WebUI 让人点，agent 只负责起服务和看日志 |
 | 加/换账号会话 | WebUI 账号池「新增账号」按钮（人扫码）或 `./login "备注"`；agent 可用 `GET /api/accounts` 查看池状态 |
-| 跑测试 | `uv run pytest` |
+| 跑测试 | `uv sync --extra dev && uv run pytest` |
 
 ## 无头批量四步（服务需在跑：`uv run douyin-csv-webui`）
 
@@ -50,7 +50,7 @@ curl -sO http://127.0.0.1:8000/download/batches/<bid>                  # 完成�
 - **浏览器优先**：`app/config.py` 的 `DOUYIN_BROWSER_FIRST=True`，解析和下载直接走 Playwright + 账号池会话，不尝试直连接口（直连基本 403）
 - **分流视频**：约 5 分钟以上的长视频网页端是音视频分离流（URL 路径带 `media-video-` / `media-audio-`），下载层会分别取两条流再用 ffmpeg 合并；音频流 URL 的 query 带 `mime_type=video_mp4`，分类必须看路径特征（`app/browser_service.py` 的 `_is_audio_like_url`）
 - 反风控/cookies 轮换逻辑都在 `app/pipeline.py`，任务实际执行与其渲染分离，改下载行为不要动 pipeline
-- 修改下载/解析相关代码后：`uv run pytest` 必跑；有真实链接时用 `douyin-dl` 各验一条长视频和一条短视频
+- 修改下载/解析相关代码后：`uv sync --extra dev && uv run pytest` 必跑；有真实链接时用 `douyin-dl` 各验一条长视频和一条短视频
 
 ## 输出位置
 

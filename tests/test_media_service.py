@@ -10,6 +10,15 @@ class _Result:
         self.stderr = stderr
 
 
+def test_is_available_requires_ffmpeg_and_ffprobe():
+    service = FfmpegService()
+    service.ffmpeg_path = "ffmpeg"
+    service.ffprobe_path = None
+    assert service.is_available() is False
+    service.ffprobe_path = "ffprobe"
+    assert service.is_available() is True
+
+
 def test_extract_audio_merges_supplemental_audio_when_video_has_no_audio(tmp_path, monkeypatch):
     video_path = tmp_path / "source.mp4"
     audio_sidecar_path = tmp_path / "fallback_audio.m4a"

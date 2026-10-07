@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import csv
 import shutil
+import tempfile
 import threading
 from datetime import datetime
 from types import SimpleNamespace
-from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -13,10 +13,12 @@ from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from .config import (
     ANTI_CRAWL_COOLDOWN_SECONDS,
@@ -252,7 +254,7 @@ def compute_common_columns(column_sets: List[List[str]]) -> List[str]:
 def build_health_snapshot() -> Dict[str, str]:
     runtime = transcription_service.runtime_status()
     return {
-        "ffmpeg": "已检测" if ffmpeg_service.is_available() else "未检测到",
+        "ffmpeg": "已检测" if ffmpeg_service.is_available() else "未检测到 ffmpeg/ffprobe",
         "mlx": runtime["mlx"],
         "sensevoice": runtime["sensevoice"],
         "default_model": DEFAULT_MODEL,
@@ -607,7 +609,7 @@ async def preview_csv(request: Request, files: List[UploadFile] = File(...)):
                     output.write(chunk)
 
             try:
-                inspection = inspect_csv(save_path)
+                inspection = await run_in_threadpool(inspect_csv, save_path)
                 inspections.append(inspection)
                 job = job_manager.create_session(
                     original_filename=safe_name,
@@ -671,7 +673,7 @@ async def quick_download(
         for line in link_lines:
             writer.writerow([line])
 
-    inspection = inspect_csv(save_path)
+    inspection = await run_in_threadpool(inspect_csv, save_path)
     job = job_manager.create_session(
         original_filename=safe_name,
         upload_path=save_path,
@@ -1208,7 +1210,7 @@ async def job_rows(job_id: str, offset: int = 0, limit: int = 50):
     if not source_path or not Path(source_path).exists():
         source_path = job.upload_path
     try:
-        inspection = inspect_csv(Path(source_path))
+        inspection = await run_in_threadpool(inspect_csv, Path(source_path))
     except (OSError, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=f"结果文件不存在或暂不可读：{exc}")
     dataframe = inspection.dataframe
@@ -1268,7 +1270,7 @@ async def api_preview_csv(files: List[UploadFile] = File(...)):
                     output.write(chunk)
 
             try:
-                inspection = inspect_csv(save_path)
+                inspection = await run_in_threadpool(inspect_csv, save_path)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"{safe_name}: {exc}")
 
@@ -1389,10 +1391,28 @@ async def download_batch_results(batch_id: str):
     if not ready_jobs:
         raise HTTPException(status_code=404, detail="当前批次还没有可下载的结果文件")
 
-    buffer = BytesIO()
-    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+    with tempfile.NamedTemporaryFile(prefix="douyin-batch-", suffix=".zip", delete=False) as temporary:
+        archive_path = Path(temporary.name)
+    try:
+        await run_in_threadpool(_write_batch_zip, ready_jobs, archive_path)
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+
+    filename = f"batch_{batch_id[:8]}.zip"
+    return FileResponse(
+        path=archive_path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
+    )
+
+
+def _write_batch_zip(jobs, archive_path: Path) -> None:
+    """Build a batch archive off the event loop and stream it from disk."""
+    with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
         used_names = set()
-        for job in ready_jobs:
+        for job in jobs:
             arcname = Path(job.output_path).name
             if arcname in used_names:
                 # 正常命名已含 job_id 前 8 位不会撞名；此处兜底防同名文件在 zip 内互相覆盖
@@ -1404,11 +1424,6 @@ async def download_batch_results(batch_id: str):
                     arcname = f"{stem}-{job.job_id[:8]}{suffix}"
             used_names.add(arcname)
             archive.write(job.output_path, arcname=arcname)
-
-    buffer.seek(0)
-    filename = f"batch_{batch_id[:8]}.zip"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return StreamingResponse(buffer, media_type="application/zip", headers=headers)
 
 
 @app.get("/health")

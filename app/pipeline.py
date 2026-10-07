@@ -55,6 +55,7 @@ from .douyin_service import (
 )
 from .job_manager import JobManager
 from .media_service import FfmpegService
+from .request_coordinator import RequestCoordinator
 from .transcription_service import TranscriptionService
 
 
@@ -203,6 +204,7 @@ class JobProcessor:
         self.douyin_service_factory = douyin_service_factory
         self.ffmpeg_service_factory = ffmpeg_service_factory
         self.transcription_service_factory = transcription_service_factory
+        self._request_coordinator = RequestCoordinator()
         self.sleep_fn = sleep_fn
         self.max_retries = max_retries
         self.retry_delay_seconds = retry_delay_seconds
@@ -216,7 +218,12 @@ class JobProcessor:
         self.cookie_switch_batch_threshold = max(1, int(cookie_switch_batch_threshold))
         self.cookie_strong_signal_switch_threshold = max(1, int(cookie_strong_signal_switch_threshold))
         self.cookie_retry_strong_signal_switch_threshold = max(1, int(cookie_retry_strong_signal_switch_threshold))
-        self._asr_local = threading.local()
+        # ASR model instances are large (especially SenseVoice). Keep one
+        # service per default model across ASR worker threads instead of
+        # loading a separate model copy in every thread.
+        self._transcriber_services: Dict[Tuple[str, str], TranscriptionService] = {}
+        self._transcriber_services_lock = threading.RLock()
+        self._transcriber_model_locks: Dict[Tuple[str, str], threading.Lock] = {}
         self._douyin_local = threading.local()
         self._douyin_services_by_job: Dict[str, List[DouyinService]] = {}
         self._douyin_services_lock = threading.Lock()
@@ -387,6 +394,7 @@ class JobProcessor:
             self.manager.mark_failed(job_id, str(exc))
         finally:
             self._close_job_douyin_services(job_id)
+            self._clear_job_transcribers(job_id)
             shutil.rmtree(workspace, ignore_errors=True)
 
     def _process_batches(
@@ -446,20 +454,27 @@ class JobProcessor:
                 for task in batch:
                     if self.manager.is_pause_requested(job_id):
                         break
-                    self._process_task(
-                        job_id=job_id,
-                        run_state=run_state,
-                        dataframe=dataframe,
-                        task=task,
-                        output_columns=output_columns,
-                        overwrite=overwrite,
-                        workspace=workspace,
-                        ffmpeg=ffmpeg,
-                        transcriber=transcriber,
-                        output_path=output_path,
-                        retry_queue=retry_queue,
-                        download_only=self._is_download_only(job_id),
-                    )
+                    try:
+                        self._process_task(
+                            job_id=job_id,
+                            run_state=run_state,
+                            dataframe=dataframe,
+                            task=task,
+                            output_columns=output_columns,
+                            overwrite=overwrite,
+                            workspace=workspace,
+                            ffmpeg=ffmpeg,
+                            transcriber=transcriber,
+                            output_path=output_path,
+                            retry_queue=retry_queue,
+                            download_only=self._is_download_only(job_id),
+                        )
+                    except Exception:
+                        # Normal rows are checkpointed once per batch. If an
+                        # unexpected exception escapes the row handler, keep
+                        # rows already completed in this batch before failing.
+                        self._persist_snapshot(job_id, dataframe, output_path)
+                        raise
 
             cooled_down = self._finalize_batch(
                 job_id=job_id,
@@ -553,20 +568,24 @@ class JobProcessor:
                     for task in batch:
                         if self.manager.is_pause_requested(job_id):
                             break
-                        self._process_task(
-                            job_id=job_id,
-                            run_state=run_state,
-                            dataframe=dataframe,
-                            task=task,
-                            output_columns=output_columns,
-                            overwrite=overwrite,
-                            workspace=workspace,
-                            ffmpeg=ffmpeg,
-                            transcriber=transcriber,
-                            output_path=output_path,
-                            retry_queue=next_round,
-                            download_only=self._is_download_only(job_id),
-                        )
+                        try:
+                            self._process_task(
+                                job_id=job_id,
+                                run_state=run_state,
+                                dataframe=dataframe,
+                                task=task,
+                                output_columns=output_columns,
+                                overwrite=overwrite,
+                                workspace=workspace,
+                                ffmpeg=ffmpeg,
+                                transcriber=transcriber,
+                                output_path=output_path,
+                                retry_queue=next_round,
+                                download_only=self._is_download_only(job_id),
+                            )
+                        except Exception:
+                            self._persist_snapshot(job_id, dataframe, output_path)
+                            raise
 
                 cooled_down = self._finalize_batch(
                     job_id=job_id,
@@ -765,6 +784,7 @@ class JobProcessor:
                         result,
                         output_columns,
                         default_model,
+                        job_id,
                     )
                 ] = result
             else:
@@ -1022,9 +1042,10 @@ class JobProcessor:
         prepared: PreparedRow,
         output_columns: Dict[str, str],
         default_model: str,
+        job_id: str = "",
     ) -> RowExecutionResult:
         ffmpeg = self.ffmpeg_service_factory()
-        transcriber = self._get_thread_transcriber(default_model)
+        transcriber = self._get_thread_transcriber(default_model, job_id=job_id)
         log_messages: List[str] = []
 
         try:
@@ -1038,6 +1059,7 @@ class JobProcessor:
                 prepared.plan,
                 prepared.audio_path,
                 transcriber,
+                job_id=job_id,
             )
             log_messages.extend(model_logs)
 
@@ -1106,6 +1128,8 @@ class JobProcessor:
         plan: RowPlan,
         audio_path: Path,
         transcriber: TranscriptionService,
+        *,
+        job_id: str = "",
     ) -> tuple[Dict[str, str], List[str], List[str]]:
         transcripts: Dict[str, str] = {}
         failures: List[str] = []
@@ -1114,7 +1138,8 @@ class JobProcessor:
         for model_name in plan.pending_models:
             try:
                 logs.append(f"第 {plan.task.csv_row_number} 行开始转写：{model_name}")
-                transcript = transcriber.transcribe(audio_path, model_name=model_name)
+                with self._transcriber_lock_for(model_name, job_id=job_id):
+                    transcript = transcriber.transcribe(audio_path, model_name=model_name)
                 transcripts[model_name] = transcript
                 logs.append(
                     f"第 {plan.task.csv_row_number} 行转写完成：{model_name}，文本长度 {len(transcript)}"
@@ -1184,12 +1209,25 @@ class JobProcessor:
             refresh_counters=False,
         )
 
-    def _get_thread_transcriber(self, default_model: str) -> TranscriptionService:
-        service = getattr(self._asr_local, "service", None)
-        if service is None or getattr(service, "default_model", None) != default_model:
-            service = self.transcription_service_factory(default_model=default_model)
-            self._asr_local.service = service
-        return service
+    def _get_thread_transcriber(self, default_model: str, *, job_id: str = "") -> TranscriptionService:
+        with self._transcriber_services_lock:
+            key = (job_id, default_model)
+            service = self._transcriber_services.get(key)
+            if service is None:
+                service = self.transcription_service_factory(default_model=default_model)
+                self._transcriber_services[key] = service
+            return service
+
+    def _transcriber_lock_for(self, model_name: str, *, job_id: str = "") -> threading.Lock:
+        with self._transcriber_services_lock:
+            return self._transcriber_model_locks.setdefault((job_id, model_name), threading.Lock())
+
+    def _clear_job_transcribers(self, job_id: str) -> None:
+        with self._transcriber_services_lock:
+            for key in [key for key in self._transcriber_services if key[0] == job_id]:
+                self._transcriber_services.pop(key, None)
+            for key in [key for key in self._transcriber_model_locks if key[0] == job_id]:
+                self._transcriber_model_locks.pop(key, None)
 
     def _prepare_cookie_account_for_batch(self, job_id: str) -> Optional[CookieAccount]:
         if self.cookie_account_manager is None:
@@ -1476,6 +1514,11 @@ class JobProcessor:
 
     def _create_douyin_service(self, *, account: Optional[CookieAccount] = None):
         service = self.douyin_service_factory()
+        if hasattr(service, "request_coordinator"):
+            service.request_coordinator = self._request_coordinator
+            existing_resolver = getattr(service, "browser_resolver", None)
+            if existing_resolver is not None:
+                existing_resolver.request_coordinator = self._request_coordinator
         if account is not None and hasattr(service, "request_coordinator"):
             existing_resolver = getattr(service, "browser_resolver", None)
             if existing_resolver is not None:

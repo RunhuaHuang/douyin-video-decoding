@@ -14,7 +14,7 @@
 
 ```bash
 cd "/Users/runhua/Runhua MBP/Python/抖音文案提取工具"
-uv sync                                  # 依赖
+uv sync --extra dev                      # 依赖（含测试工具）
 uv run playwright install chromium       # 浏览器兜底必需
 uv run douyin-dl --list-accounts         # 账号池：列出可用会话，空则见「登录抖音会话」
 uv run pytest                            # 全量测试
@@ -163,6 +163,7 @@ FunAudioLLM/SenseVoiceSmall
 ## 测试
 
 ```bash
+uv sync --extra dev
 uv run pytest
 ```
 

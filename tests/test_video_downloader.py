@@ -63,6 +63,15 @@ def test_skip_existing(tmp_path):
         downloader.close()
 
 
+def test_download_url_rejects_non_douyin_url(tmp_path):
+    downloader = VideoDownloader()
+    try:
+        with pytest.raises(ValueError, match="不是有效的抖音链接"):
+            downloader.download_url("https://example.com/internal", out_dir=tmp_path)
+    finally:
+        downloader.close()
+
+
 def test_cli_table_target_dir_logic(tmp_path):
     table_csv = tmp_path / "测试表格.csv"
     table_csv.write_text("视频链接\nhttps://v.douyin.com/123/\n", encoding="utf-8")
@@ -215,5 +224,28 @@ def test_download_file_explicit_accounts(tmp_path):
                 accounts=["思思", "老脏"],
             )
         assert (success, failed) == (1, 0)
+    finally:
+        downloader.close()
+
+
+def test_download_file_rejects_when_all_explicit_accounts_are_invalid(tmp_path):
+    table_csv = tmp_path / "指定账号失败.csv"
+    table_csv.write_text("视频链接\nhttps://www.douyin.com/video/1\n", encoding="utf-8")
+
+    class Account:
+        label = "可用账号"
+        storage_state_path = tmp_path / "可用账号.json"
+
+    class Manager:
+        def select_current_or_first_available_account(self):
+            return Account()
+
+        def list_available_accounts(self):
+            return [Account()]
+
+    downloader = VideoDownloader(account_manager=Manager())
+    try:
+        with pytest.raises(RuntimeError, match="指定的账号均不可用"):
+            downloader.download_file(table_csv, out_dir=tmp_path, accounts=["不存在"])
     finally:
         downloader.close()

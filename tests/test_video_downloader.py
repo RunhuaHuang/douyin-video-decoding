@@ -1,0 +1,219 @@
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+import pandas as pd
+import pytest
+
+from app.video_downloader import VideoDownloader, detect_url_column, main
+
+
+def test_detect_url_column():
+    df1 = pd.DataFrame({"视频标题": ["t1"], "视频链接": ["https://v.douyin.com/123/"]})
+    assert detect_url_column(df1) == "视频链接"
+
+    df2 = pd.DataFrame({"商品": ["p1"], "播放地址": ["https://www.douyin.com/video/1"]})
+    assert detect_url_column(df2) == "播放地址"
+
+    df3 = pd.DataFrame({"title": ["t1"], "custom_link": ["https://v.douyin.com/123/"]})
+    assert detect_url_column(df3, "custom_link") == "custom_link"
+
+    df4 = pd.DataFrame({"A": [1, 2], "B": [3, 4]})
+    with pytest.raises(ValueError, match="未能在表格中自动识别视频链接列"):
+        detect_url_column(df4)
+
+
+def test_video_url_can_be_converted_to_note_route():
+    assert (
+        VideoDownloader._note_url_for_video("https://www.douyin.com/video/7667890534388359355")
+        == "https://www.douyin.com/note/7667890534388359355"
+    )
+    assert VideoDownloader._note_url_for_video("https://www.douyin.com/note/123") is None
+    assert VideoDownloader._is_douyin_challenge_html(
+        '<script>byted_acrawler.init(); window.location.reload(); var __ac_signature="x"</script>'
+    )
+    assert not VideoDownloader._is_douyin_challenge_html("<html><body>normal</body></html>")
+
+
+def test_cli_list_accounts(capsys):
+    ret = main(["--list-accounts"])
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert "吴倩" in captured.out or "账号池" in captured.out
+
+
+def test_cli_no_args():
+    ret = main([])
+    assert ret == 2
+
+
+def test_skip_existing(tmp_path):
+    video_file = tmp_path / "视频-7674160480689018597.mp4"
+    video_file.write_bytes(b"0" * 2048)
+
+    downloader = VideoDownloader()
+    try:
+        ok, path, msg = downloader.download_url(
+            "https://www.douyin.com/video/7674160480689018597",
+            out_dir=tmp_path,
+            skip_existing=True,
+        )
+        assert ok is True
+        assert path == video_file
+        assert "已存在，跳过" in msg
+    finally:
+        downloader.close()
+
+
+def test_cli_table_target_dir_logic(tmp_path):
+    table_csv = tmp_path / "测试表格.csv"
+    table_csv.write_text("视频链接\nhttps://v.douyin.com/123/\n", encoding="utf-8")
+
+    downloader = VideoDownloader()
+    try:
+        with patch.object(downloader, "download_url", return_value=(True, tmp_path / "视频-123.mp4", "成功")) as mock_dl:
+            succ, fail = downloader.download_file(table_csv, out_dir=tmp_path / "测试表格", skip_existing=True, workers=1)
+            assert succ == 1
+            assert fail == 0
+            assert mock_dl.call_count == 1
+    finally:
+        downloader.close()
+
+
+def test_early_skip_without_browser(tmp_path):
+    # 当文件已存在时，应毫秒级返回，不应拉起浏览器上下文
+    target_file = tmp_path / "视频-7661240833752086186.mp4"
+    target_file.write_bytes(b"x" * 2048)
+
+    downloader = VideoDownloader()
+    try:
+        with patch.object(downloader.browser_resolver, "_ensure_context") as mock_ctx:
+            ok, path, msg = downloader.download_url(
+                "https://www.douyin.com/video/7661240833752086186",
+                out_dir=tmp_path,
+                skip_existing=True,
+            )
+            assert ok is True
+            assert path == target_file
+            assert "已存在，跳过" in msg
+            mock_ctx.assert_not_called()
+    finally:
+        downloader.close()
+
+
+def test_recycle_browser_trigger(tmp_path):
+    downloader = VideoDownloader(recycle_interval=2)
+    try:
+        with patch.object(downloader, "recycle_browser", wraps=downloader.recycle_browser) as mock_recycle:
+            with patch.object(downloader.browser_resolver, "_ensure_context") as mock_ensure:
+                mock_page = MagicMock()
+                mock_page.url = "https://www.douyin.com/video/111"
+                mock_ensure.return_value.new_page.return_value = mock_page
+                with patch.object(downloader.browser_resolver, "download_video") as mock_dl:
+                    # 第一次请求
+                    downloader.download_url("https://www.douyin.com/video/111", out_dir=tmp_path, skip_existing=False)
+                    assert downloader._active_downloads == 1
+                    assert mock_recycle.call_count == 0
+
+                    # 第二次请求
+                    downloader.download_url("https://www.douyin.com/video/222", out_dir=tmp_path, skip_existing=False)
+                    assert downloader._active_downloads == 2
+                    assert mock_recycle.call_count == 0
+
+                    # 第三次请求（达到 recycle_interval=2 触发回收）
+                    downloader.download_url("https://www.douyin.com/video/333", out_dir=tmp_path, skip_existing=False)
+                    assert mock_recycle.call_count == 1
+                    assert downloader._active_downloads == 1
+    finally:
+        downloader.close()
+
+
+def test_download_file_start_row(tmp_path):
+    table_csv = tmp_path / "测试表格.csv"
+    table_csv.write_text("视频链接\nhttps://v.douyin.com/1/\nhttps://v.douyin.com/2/\nhttps://v.douyin.com/3/\n", encoding="utf-8")
+
+    downloader = VideoDownloader()
+    try:
+        with patch.object(downloader, "download_url", return_value=(True, tmp_path / "out.mp4", "成功")) as mock_dl:
+            succ, fail = downloader.download_file(table_csv, out_dir=tmp_path, skip_existing=True, start_row=2, workers=1)
+            assert succ == 2
+            assert fail == 0
+            # 应只处理第 2 和第 3 条
+            assert mock_dl.call_count == 2
+            assert mock_dl.call_args_list[0][0][0] == "https://v.douyin.com/2/"
+            assert mock_dl.call_args_list[1][0][0] == "https://v.douyin.com/3/"
+    finally:
+        downloader.close()
+
+
+def test_download_file_uses_distinct_cookie_workers(tmp_path):
+    table_csv = tmp_path / "并发.csv"
+    table_csv.write_text(
+        "视频链接\n" + "\n".join(f"https://www.douyin.com/video/{i}" for i in range(1, 5)) + "\n",
+        encoding="utf-8",
+    )
+
+    class Account:
+        def __init__(self, label):
+            self.label = label
+            self.storage_state_path = tmp_path / f"{label}.json"
+
+    accounts = [Account("账号1"), Account("账号2")]
+
+    class Manager:
+        def select_current_or_first_available_account(self):
+            return accounts[0]
+
+        def list_available_accounts(self):
+            return accounts
+
+    downloader = VideoDownloader(account_manager=Manager())
+    try:
+        with patch.object(
+            VideoDownloader,
+            "download_url",
+            return_value=(True, tmp_path / "out.mp4", "成功"),
+        ) as mock_dl:
+            success, failed = downloader.download_file(
+                table_csv,
+                out_dir=tmp_path / "out",
+                workers=2,
+            )
+        assert (success, failed) == (4, 0)
+        assert mock_dl.call_count == 4
+    finally:
+        downloader.close()
+
+
+def test_download_file_explicit_accounts(tmp_path):
+    table_csv = tmp_path / "指定账号.csv"
+    table_csv.write_text("视频链接\nhttps://www.douyin.com/video/1\n", encoding="utf-8")
+
+    class Account:
+        def __init__(self, label):
+            self.label = label
+            self.storage_state_path = tmp_path / f"{label}.json"
+
+    accounts = [Account("吴倩"), Account("思思"), Account("老脏")]
+
+    class Manager:
+        def select_current_or_first_available_account(self):
+            return accounts[0]
+
+        def list_available_accounts(self):
+            return accounts
+
+    downloader = VideoDownloader(account_manager=Manager())
+    try:
+        with patch.object(
+            VideoDownloader,
+            "download_url",
+            return_value=(True, tmp_path / "out.mp4", "成功"),
+        ) as mock_dl:
+            success, failed = downloader.download_file(
+                table_csv,
+                out_dir=tmp_path / "out",
+                workers=2,
+                accounts=["思思", "老脏"],
+            )
+        assert (success, failed) == (1, 0)
+    finally:
+        downloader.close()

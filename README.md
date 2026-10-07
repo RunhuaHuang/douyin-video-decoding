@@ -165,3 +165,13 @@ FunAudioLLM/SenseVoiceSmall
 ```bash
 uv run pytest
 ```
+
+## NAS 视频下载部署
+
+项目包含面向 NAS 的视频下载 Compose，默认把 NAS 宿主机 `/volume5/视频下载` 映射为容器 `/nas/videos`，并将它设为仅下载模式的默认保存目录。完整的 SSH、账号会话复制、启动和更新步骤见 [`deploy/nas/README.md`](deploy/nas/README.md)。
+
+本机默认仍监听 `127.0.0.1:8000`；NAS Compose 通过 `DOUYIN_WEBUI_HOST=0.0.0.0` 和 `DOUYIN_WEBUI_PORT=8000` 对外提供 WebUI。视频保存目录也可以用 `DOUYIN_VIDEO_OUTPUT_DIR` 覆盖，留空时保持本机的 `output/videos/` 默认值。
+
+以后需要下载 NAS 上的某个 Excel 时，直接执行 `douyin-batch-download`；它会把 `视频链接` 列下载到 `/volume5/视频下载/视频下载/<Excel 文件名>/`，重复执行会跳过已完成文件并继续失败或中断的行。
+
+下载命令会输出 `PROGRESS` JSON 进度行；运行中的任务也可用 `douyin-batch-download --status <Excel路径>` 查询。

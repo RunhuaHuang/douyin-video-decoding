@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# 一键视频下载脚本（支持视频与图文合成MP4，自动命名: 视频-ID.mp4 / 图文-ID.mp4）
+set -e
+
+exec uv run douyin-video-dl "$@"

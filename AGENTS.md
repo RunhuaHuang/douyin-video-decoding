@@ -21,6 +21,8 @@ uv run pytest                                   # 全量测试应全部通过
 
 | 任务 | 做法 |
 |---|---|
+| 下载视频与图文（独立命名） | `uv run douyin-video-dl "链接1" "链接2" -o <目录>` 或 `./download_videos "表.xlsx" -o <目录>`（命名: `视频-ID.mp4` / `图文-ID.mp4`，图文 1秒1图合成） |
+| NAS 手动批量下载 | `ssh nas 'sudo docker exec douyin-video douyin-batch-download "/volume5/视频下载/目标目录/文件.xlsx"'`；输出到 `/volume5/视频下载/视频下载/<文件名>/`，重复执行可断点续接 |
 | 下载 1~几个视频 | `uv run douyin-dl "链接1" "链接2" -o <目录>`，默认存 `output/downloads/`，退出码 0/1 对应全成功/有失败 |
 | 粘贴链接快速下载 | WebUI 首页「快速下载」卡片，或 `POST /quick-download`（`links` 每行一个链接，`transcribe` 勾选同时转写），直接建批次并跳转批次页 |
 | 批量（无人值守） | 见下面 API 四步 |

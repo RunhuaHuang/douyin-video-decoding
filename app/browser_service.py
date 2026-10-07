@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+import httpx
+
 from .account_storage import write_storage_state
 from .media_service import FfmpegService
 from .config import (
@@ -35,6 +37,11 @@ CHROME_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
+
+# The fallback Playwright response API exposes ``body()`` only as a fully
+# materialized bytes object. Never use that path for a known large media body;
+# the streaming HTTP path above must handle it instead.
+MAX_BUFFERED_MEDIA_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -487,6 +494,26 @@ class PlaywrightFallback:
         for position, url in enumerate(urls, start=1):
             try:
                 self._throttle()
+                # APIResponse.body() materializes the entire media file in
+                # Python memory. Prefer a bounded stream; fall back to the
+                # Playwright request path when the signed URL needs browser
+                # handling that a plain HTTP request cannot reproduce.
+                streamed = self._try_stream_candidate(
+                    url=url,
+                    output_path=output_path,
+                    referer=referer,
+                    accept=accept,
+                    destination=destination,
+                    validator=validator,
+                    post_validator=post_validator,
+                    post_validation_error=post_validation_error,
+                )
+                if streamed is not None:
+                    if streamed == "ok":
+                        return url, position
+                    errors.append(streamed)
+                    continue
+
                 # Playwright 请求超时覆盖整个响应（含 body 读取），整文件下载
                 # 必须用独立大超时，不能沿用 15s 导航超时
                 response = request_context.get(
@@ -498,6 +525,13 @@ class PlaywrightFallback:
                 )
                 status = response.status
                 if 200 <= status < 300:
+                    try:
+                        content_length = int(response.headers.get("content-length", "0") or 0)
+                    except (TypeError, ValueError):
+                        content_length = 0
+                    if content_length > MAX_BUFFERED_MEDIA_BYTES:
+                        errors.append("媒体响应过大且流式下载未接管，已避免一次性读入内存")
+                        continue
                     body = response.body()
                     if not validator(
                         body,
@@ -526,6 +560,85 @@ class PlaywrightFallback:
 
         summary = ", ".join(self._summarize_errors(errors))
         raise RuntimeError(f"{fail_error_prefix}: {summary}")
+
+    def _try_stream_candidate(
+        self,
+        *,
+        url: str,
+        output_path: Path,
+        referer: str,
+        accept: str,
+        destination: str,
+        validator,
+        post_validator=None,
+        post_validation_error: str | None = None,
+    ) -> str | None:
+        """Stream a media candidate to disk without buffering its body.
+
+        ``None`` asks the caller to fall back to Playwright's request context.
+        A non-empty string is a handled candidate error.
+        """
+        headers = self._build_media_headers(referer, accept=accept, destination=destination)
+        cookie_header = self._cookie_header_for_url(url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=self.download_timeout_ms / 1000,
+            write=self.download_timeout_ms / 1000,
+            pool=self.download_timeout_ms / 1000,
+        )
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+                with client.stream("GET", url, headers=headers) as response:
+                    if not 200 <= response.status_code < 300:
+                        return None
+
+                    content_type = response.headers.get("content-type", "")
+                    prefix = bytearray()
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        with output_path.open("wb") as handle:
+                            for chunk in response.iter_bytes():
+                                if not chunk:
+                                    continue
+                                if len(prefix) < 1024:
+                                    prefix.extend(chunk[: 1024 - len(prefix)])
+                                handle.write(chunk)
+                    except Exception:
+                        output_path.unlink(missing_ok=True)
+                        raise
+
+                    if not validator(bytes(prefix), content_type, url):
+                        output_path.unlink(missing_ok=True)
+                        return None
+                    if post_validator is not None and not post_validator(output_path):
+                        output_path.unlink(missing_ok=True)
+                        return post_validation_error or "输出文件校验失败"
+        except Exception:
+            output_path.unlink(missing_ok=True)
+            return None
+
+        self._note_success()
+        self._persist_storage_state()
+        return "ok"
+
+    def _cookie_header_for_url(self, url: str) -> str:
+        if self._context is None:
+            return ""
+        try:
+            cookies = self._context.cookies([url])
+        except Exception:
+            try:
+                cookies = self._context.cookies()
+            except Exception:
+                return ""
+        return "; ".join(
+            f"{cookie.get('name')}={cookie.get('value')}"
+            for cookie in cookies
+            if cookie.get("name") and cookie.get("value") is not None
+        )
 
     @staticmethod
     def _dedupe_urls(urls: Sequence[str]) -> List[str]:

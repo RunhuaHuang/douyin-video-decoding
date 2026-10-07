@@ -1,0 +1,43 @@
+services:
+  douyin-video:
+    build:
+      context: ../..
+      dockerfile: deploy/nas/Dockerfile
+    image: douyin-video-nas:latest
+    container_name: douyin-video
+    restart: unless-stopped
+    init: true
+    shm_size: "1gb"
+    # Keep a pathological browser/media response from exhausting the NAS.
+    mem_limit: 4g
+    environment:
+      DOUYIN_WEBUI_HOST: 0.0.0.0
+      DOUYIN_WEBUI_PORT: 8000
+      # The application writes here by default in download-only mode.
+      DOUYIN_VIDEO_OUTPUT_DIR: /nas/videos
+      DOUYIN_STORAGE_ROOT: /nas/videos
+      DOUYIN_BATCH_OUTPUT_ROOT: /nas/videos/视频下载
+      PLAYWRIGHT_HEADLESS: "true"
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "${NAS_LAN_IP:-192.168.100.188}:8000:8000"
+      - "${NAS_TAILSCALE_IP:-100.68.215.29}:8000:8000"
+    volumes:
+      # Keep account cookies, uploaded tables, job state and result CSVs after
+      # image rebuilds. Copy the Mac account JSON files here before starting.
+      - ../../tmp:/app/tmp
+      - ../../output:/app/output
+      # NAS host path requested by the user -> container path used by the app.
+      - /volume5/视频下载:/nas/videos:rw
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"

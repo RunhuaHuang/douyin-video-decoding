@@ -1,7 +1,26 @@
+import os
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _path_from_env(name: str, default: Path) -> Path:
+    """Return a user supplied path while keeping local defaults unchanged."""
+    value = os.environ.get(name, "").strip()
+    return Path(value).expanduser() if value else default
+
+
+def _int_from_env(name: str, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"环境变量 {name} 必须是整数，当前值: {value!r}") from exc
+
+
 APP_DIR = PROJECT_ROOT / "app"
 TMP_DIR = PROJECT_ROOT / "tmp" / "spreadsheets"
 UPLOAD_DIR = TMP_DIR / "uploads"
@@ -9,9 +28,13 @@ JOB_DIR = TMP_DIR / "jobs"
 BROWSER_STATE_DIR = PROJECT_ROOT / "tmp" / "browser"
 BROWSER_ACCOUNTS_DIR = BROWSER_STATE_DIR / "accounts"
 OUTPUT_DIR = PROJECT_ROOT / "output" / "spreadsheet"
-VIDEO_OUTPUT_DIR = PROJECT_ROOT / "output" / "videos"
+VIDEO_OUTPUT_DIR = _path_from_env("DOUYIN_VIDEO_OUTPUT_DIR", PROJECT_ROOT / "output" / "videos")
 TEMPLATE_DIR = APP_DIR / "templates"
 STATIC_DIR = APP_DIR / "static"
+
+# WebUI 默认只监听本机，NAS Compose 可通过环境变量改为监听容器网卡。
+WEBUI_HOST = os.environ.get("DOUYIN_WEBUI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+WEBUI_PORT = _int_from_env("DOUYIN_WEBUI_PORT", 8000)
 
 DEFAULT_MODEL = "FunAudioLLM/SenseVoiceSmall"
 DEFAULT_TRANSCRIPT_COLUMN = "视频文本"

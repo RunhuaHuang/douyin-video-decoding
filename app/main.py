@@ -35,6 +35,8 @@ from .config import (
     STATIC_DIR,
     TEMPLATE_DIR,
     UPLOAD_DIR,
+    WEBUI_HOST,
+    WEBUI_PORT,
     ensure_directories,
 )
 from .cookie_accounts import CookieAccount, CookieAccountManager
@@ -1417,7 +1419,8 @@ async def health():
 def run() -> None:
     import uvicorn
 
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=False)
+    # 本机默认仍只监听回环地址；容器部署通过环境变量监听容器网卡。
+    uvicorn.run("app.main:app", host=WEBUI_HOST, port=WEBUI_PORT, reload=False)
 
 
 if __name__ == "__main__":

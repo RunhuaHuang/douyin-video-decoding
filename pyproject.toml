@@ -27,6 +27,8 @@ dev = [
 douyin-csv-webui = "app.main:run"
 douyin-csv-login = "app.login_session:run"
 douyin-dl = "app.cli:main"
+douyin-video-dl = "app.video_downloader:main"
+douyin-batch-download = "app.nas_download:main"
 
 [build-system]
 requires = ["hatchling"]

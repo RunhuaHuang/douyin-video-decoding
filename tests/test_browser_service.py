@@ -36,6 +36,32 @@ class _DummyContext:
         self.request = _DummyRequest(responses)
 
 
+class _StreamingResponse:
+    status_code = 200
+    headers = {"content-type": "video/mp4"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_bytes(self):
+        yield b"\x00\x00\x00\x18ftypisom"
+        yield b"payload"
+
+
+class _StreamingClient:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def stream(self, *args, **kwargs):
+        return _StreamingResponse()
+
+
 DASH_AUDIO_URL = (
     "https://v95-zjwz2tc-web.douyinvod.com/video/tos/cn/tos-cn-ve-15/oUM4p1Av/"
     "media-audio-und-mp4a/?a=6383&mime_type=video_mp4&qs=0&rc=PDhn"
@@ -52,6 +78,24 @@ def test_dash_stream_urls_are_classified_by_path():
     assert PlaywrightFallback._looks_like_audio(DASH_AUDIO_URL, "")
     assert PlaywrightFallback._looks_like_video(DASH_VIDEO_URL, "video/mp4")
     assert not PlaywrightFallback._looks_like_audio(DASH_VIDEO_URL, "")
+
+
+def test_large_media_path_streams_to_disk_without_playwright_body(monkeypatch, tmp_path):
+    fallback = PlaywrightFallback()
+    monkeypatch.setattr("app.browser_service.httpx.Client", lambda **kwargs: _StreamingClient())
+
+    output_path = tmp_path / "streamed.mp4"
+    result = fallback._try_stream_candidate(
+        url="https://v95-web.douyinvod.com/video.mp4",
+        output_path=output_path,
+        referer="https://www.douyin.com/video/123",
+        accept="video/mp4",
+        destination="video",
+        validator=fallback._looks_like_media_payload,
+    )
+
+    assert result == "ok"
+    assert output_path.read_bytes().endswith(b"payload")
 
 
 def test_download_video_demotes_misclassified_audio_stream(tmp_path, monkeypatch):

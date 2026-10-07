@@ -468,8 +468,12 @@ class JobProcessor:
                 output_columns=output_columns,
                 output_path=output_path,
                     retry_queue=retry_queue,
-                    allow_proactive_cooldown=batch_index < total_batches or bool(retry_queue),
-                )
+                allow_proactive_cooldown=batch_index < total_batches or bool(retry_queue),
+            )
+            # Persist once per batch. Writing the whole DataFrame after every
+            # row turns a large spreadsheet into quadratic disk I/O.
+            self._persist_snapshot(job_id, dataframe, output_path)
+            self._sync_progress(job_id, dataframe)
 
             self._finalize_cookie_rotation(
                 job_id=job_id,
@@ -573,6 +577,8 @@ class JobProcessor:
                     retry_queue=next_round,
                     allow_proactive_cooldown=batch_index < total_batches or bool(next_round),
                 )
+                self._persist_snapshot(job_id, dataframe, output_path)
+                self._sync_progress(job_id, dataframe)
 
                 self._finalize_cookie_rotation(
                     job_id=job_id,
@@ -716,6 +722,9 @@ class JobProcessor:
                         )
                     except Exception:
                         continue
+                # Preserve rows whose futures completed before the crash even
+                # though the normal end-of-batch checkpoint is unreachable.
+                self._persist_snapshot(job_id, dataframe, output_path)
                 raise
 
         for future in download_futures:
@@ -1167,12 +1176,12 @@ class JobProcessor:
         if result.cleanup_dir is not None:
             shutil.rmtree(result.cleanup_dir, ignore_errors=True)
 
-        self._persist_snapshot(job_id, dataframe, output_path)
         self._sync_progress(
             job_id,
             dataframe,
             current_row=result.plan.task.csv_row_number,
             current_url=result.plan.task.url_value,
+            refresh_counters=False,
         )
 
     def _get_thread_transcriber(self, default_model: str) -> TranscriptionService:
@@ -1890,8 +1899,13 @@ class JobProcessor:
             outcome=outcome,
         )
 
-        self._persist_snapshot(job_id, dataframe, output_path)
-        self._sync_progress(job_id, dataframe, current_row=task.csv_row_number, current_url=task.url_value)
+        self._sync_progress(
+            job_id,
+            dataframe,
+            current_row=task.csv_row_number,
+            current_url=task.url_value,
+            refresh_counters=False,
+        )
 
     def _process_task_once(
         self,
@@ -2293,7 +2307,17 @@ class JobProcessor:
         current_message: Optional[str] = None,
         current_row: Optional[int] = None,
         current_url: Optional[str] = None,
+        refresh_counters: bool = True,
     ) -> None:
+        if not refresh_counters:
+            self.manager.update_progress(
+                job_id,
+                current_row=current_row,
+                current_url=current_url,
+                current_message=current_message,
+            )
+            return
+
         processed, succeeded, failed, skipped = self._compute_counters(dataframe)
         self.manager.update_progress(
             job_id,

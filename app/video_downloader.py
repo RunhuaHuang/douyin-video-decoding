@@ -470,12 +470,14 @@ class VideoDownloader:
                         cmd.extend(["-loop", "1", "-i", str(local_pngs[0].resolve())])
                     else:
                         concat_txt = td / "concat.txt"
+                        # Images live beside the manifest. Relative generated names
+                        # avoid Windows drive letters, backslashes and quote escaping.
                         with open(concat_txt, "w", encoding="utf-8") as f:
                             for p in local_pngs:
-                                f.write(f"file '{p.resolve()}'\n")
+                                f.write(f"file '{p.name}'\n")
                                 f.write("duration 1.0\n")
                             # concat demuxer 需重复最后一张防尾帧跳过
-                            f.write(f"file '{local_pngs[-1].resolve()}'\n")
+                            f.write(f"file '{local_pngs[-1].name}'\n")
                         cmd.extend(["-f", "concat", "-safe", "0", "-i", str(concat_txt)])
 
                     if bgm_file and bgm_file.stat().st_size > 0:

@@ -44,7 +44,7 @@ def test_extract_audio_merges_supplemental_audio_when_video_has_no_audio(tmp_pat
     commands = []
     timeouts = []
 
-    def fake_run(command, capture_output=True, text=True, timeout=None):
+    def fake_run(command, capture_output=True, text=True, timeout=None, **kwargs):
         commands.append(command)
         timeouts.append(timeout)
         output_file = Path(command[-1])
@@ -98,7 +98,7 @@ def test_probe_media_timeout_raises_runtime_error(tmp_path, monkeypatch):
     service = FfmpegService()
     service.ffprobe_path = "ffprobe"
 
-    def hanging_run(command, capture_output=True, text=True, timeout=None):
+    def hanging_run(command, capture_output=True, text=True, timeout=None, **kwargs):
         raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
 
     monkeypatch.setattr("app.media_service.subprocess.run", hanging_run)
@@ -126,7 +126,7 @@ def test_extract_audio_timeout_raises_runtime_error(tmp_path, monkeypatch):
         lambda path: {"streams": [{"codec_type": "video"}, {"codec_type": "audio"}]},
     )
 
-    def hanging_run(command, capture_output=True, text=True, timeout=None):
+    def hanging_run(command, capture_output=True, text=True, timeout=None, **kwargs):
         raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
 
     monkeypatch.setattr("app.media_service.subprocess.run", hanging_run)
@@ -157,7 +157,7 @@ def test_merge_supplemental_audio_timeout_raises_runtime_error(tmp_path, monkeyp
             return {"streams": [{"codec_type": "audio"}]}
         raise AssertionError(f"unexpected probe path: {path}")
 
-    def hanging_merge_run(command, capture_output=True, text=True, timeout=None):
+    def hanging_merge_run(command, capture_output=True, text=True, timeout=None, **kwargs):
         if str(merged_path) in command:
             raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
         return _Result()

@@ -137,6 +137,8 @@ def write_csv(dataframe: pd.DataFrame, output_path: Path) -> None:
         else:
             dataframe.to_csv(temp_path, index=False, encoding="utf-8-sig")
         os.replace(temp_path, output_path)
+    except PermissionError as exc:
+        raise PermissionError(f"无法写入结果表格 {output_path}：请关闭占用它的 Excel/预览程序，并确认目录有写入权限后重试") from exc
     finally:
         if temp_path.exists():
             temp_path.unlink()

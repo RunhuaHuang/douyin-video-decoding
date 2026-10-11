@@ -7,7 +7,7 @@
 | 场景 | 入口 |
 |---|---|
 | 下载单个/少量视频 | 命令行 `uv run douyin-dl <链接>` |
-| 人工批量（浏览器界面） | `./run` 打开 WebUI |
+| 人工批量（浏览器界面） | Mac：`./run`；Windows：`run.bat` |
 | 无人值守批量（脚本/Agent） | WebUI 的 JSON API，见「无头批量」 |
 
 ## 前置自检
@@ -22,6 +22,52 @@ uv run pytest                            # 全量测试
 
 - ffmpeg：转写和长视频（音视频分离流）合并需要；`brew install ffmpeg`
 - 账号池为空时浏览器会话没有登录态，大部分视频会解析失败——先找人工执行 `./login`
+
+基础安装只包含下载和 WebUI 依赖。需要转写时运行 `uv sync --extra asr`，并用 `uv run --extra asr douyin-csv-webui` 启动；Mac 的 `./run` 会自动启用此依赖组。MLX Whisper 仅在 Apple Silicon Mac 安装，Windows/Linux 使用 SenseVoice。Python 最低 3.10，建议统一使用 3.12。
+
+## Windows 安装与使用
+
+目标环境为 Windows 10/11 x64。把项目放在可写目录（例如 `D:\DouyinTool`；也支持中文和空格），不要复制 Mac 的 `.venv`。在 PowerShell 或 CMD 中安装：
+
+```powershell
+winget install --id astral-sh.uv -e
+winget install --id Gyan.FFmpeg -e
+```
+
+安装后重新打开终端，进入项目根目录：
+
+```powershell
+.\setup.bat                 # 安装 Python 3.12、下载依赖和 Chromium，检查 FFmpeg/FFprobe
+.\login.bat "主号"          # 人工扫码，回终端按回车保存
+.\run.bat                   # 启动 WebUI 并自动打开浏览器；Ctrl+C 停止
+```
+
+也可以直接在 WebUI 首页点击「新增账号」扫码。下载时选择「仅下载视频」，或用命令行：
+
+```powershell
+uv run douyin-dl "抖音链接" -o "D:\视频下载"
+.\download_videos.bat "链接表.xlsx" -o "D:\视频下载"
+```
+
+`download_videos.bat` 支持图文合成 MP4；图文合成、长视频音视频合并和转写都需要 FFmpeg。上述脚本会自动切换到项目根目录，设置 Python UTF-8 模式并传递退出码。端口已占用时启动器会报错，请先停止旧服务，或在 PowerShell 设置 `$env:DOUYIN_WEBUI_PORT = "8001"` 后重启。
+
+需要文案转写时：
+
+```powershell
+.\setup.bat asr
+.\run.bat asr
+```
+
+选择默认的 `FunAudioLLM/SenseVoiceSmall`，首次使用需要下载模型和 VAD 模型。程序自动选择可用的 CUDA、MPS 或 CPU；GPU 加载/运行失败后回退 CPU。Windows 上 MPS 不可用；NVIDIA 加速还需要匹配驱动的 CUDA 版 PyTorch，普通安装不保证提供 CUDA。需要自定义 GPU 包时按 [PyTorch 官方安装说明](https://pytorch.org/get-started/locally/) 配置当前 `.venv`，随后用 `uv run --no-sync douyin-launch` 启动，避免重新同步替换自定义包。
+
+Windows 上不显示 MLX 模型预设；手动输入 MLX 模型时会提示改用 SenseVoice。纯下载无需安装任何转写模型。
+
+- 账号备注、上传文件和 CLI 视频标题会处理 Windows 保留名称（如 `CON`、`NUL`）和非法字符。
+- 结果 CSV 默认带 UTF-8 BOM，便于 Excel 读取中文；写入时若被 Excel 占用，会保留原结果并提示关闭文件后重试。
+- 避免把项目放在多层嵌套的长路径下。可在 WebUI 指定较短的输出目录；Windows 长路径策略及网络盘权限仍由系统管理。
+- 账号会话可以从原机器的 `tmp/browser/accounts/` 复制，但换设备或网络后可能需要重新扫码；Chromium 需在 Windows 重新安装。
+
+仓库提供 Windows/macOS/Linux CI 测试，涵盖跨进程账号锁、Chromium 工作线程和本地图文合成。CI 不使用真实抖音账号；正式部署仍需在目标机器验证扫码、短视频、长视频和图文下载。
 
 ## 命令行下载（douyin-dl）
 

@@ -40,7 +40,7 @@ class FfmpegService:
             str(video_path),
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=FFMPEG_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("媒体探测失败: 探测超时，请检查输入文件") from exc
         if result.returncode != 0:
@@ -92,7 +92,7 @@ class FfmpegService:
             str(output_path),
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=FFMPEG_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("音频提取失败: ffmpeg 执行超时") from exc
         if result.returncode != 0:
@@ -129,7 +129,7 @@ class FfmpegService:
             str(merged_path),
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=FFMPEG_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("音视频合并失败: ffmpeg 执行超时") from exc
         if result.returncode != 0:

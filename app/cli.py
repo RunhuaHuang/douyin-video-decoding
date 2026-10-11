@@ -5,7 +5,6 @@
 """
 import argparse
 import os
-import re
 import sys
 import tempfile
 from pathlib import Path
@@ -16,14 +15,13 @@ from .config import OUTPUT_DIR
 from .cookie_accounts import CookieAccountManager
 from .douyin_service import DouyinService, ParsedVideo
 from .media_service import FfmpegService
+from .path_utils import portable_name
 
 DEFAULT_CLI_OUTPUT_DIR = OUTPUT_DIR.parent / "downloads"
 
 
 def sanitize_title(title: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|\r\n\t]', " ", title)
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    return name[:80] or "video"
+    return portable_name(title, fallback="video", max_length=80)
 
 
 def build_service(

@@ -50,6 +50,7 @@ from .csv_service import (
 )
 from .job_manager import JobManager
 from .login_session import login_with_label
+from .path_utils import upload_filename
 from .media_service import FfmpegService
 from .pipeline import JobProcessor
 from .transcription_service import TranscriptionService
@@ -235,7 +236,7 @@ def process_batch(batch_id: str, mode: str = "full") -> None:
 
 
 def save_upload_file(file: UploadFile) -> Path:
-    safe_name = Path(file.filename or "").name
+    safe_name = upload_filename(file.filename or "")
     upload_dir = UPLOAD_DIR / uuid4().hex
     upload_dir.mkdir(parents=True, exist_ok=True)
     save_path = upload_dir / safe_name
@@ -598,7 +599,7 @@ async def preview_csv(request: Request, files: List[UploadFile] = File(...)):
     created_upload_dirs: List[Path] = []
     try:
         for file in valid_files:
-            safe_name = Path(file.filename or "").name
+            safe_name = upload_filename(file.filename or "")
             save_path = save_upload_file(file)
             created_upload_dirs.append(save_path.parent)
             with save_path.open("wb") as output:
@@ -1259,7 +1260,7 @@ async def api_preview_csv(files: List[UploadFile] = File(...)):
     created_upload_dirs: List[Path] = []
     try:
         for file in valid_files:
-            safe_name = Path(file.filename or "").name
+            safe_name = upload_filename(file.filename or "")
             save_path = save_upload_file(file)
             created_upload_dirs.append(save_path.parent)
             with save_path.open("wb") as output:

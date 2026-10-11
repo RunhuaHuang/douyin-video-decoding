@@ -4,8 +4,10 @@
 
 ## 环境
 
-- macOS Apple Silicon；Python 一律走 `uv run ...`，不要用裸 python3
+- macOS Apple Silicon / Windows x64 / Linux；建议 Python 3.12，一律走 `uv run ...`，不要用裸 python3
 - 工作目录固定为仓库根目录
+- 基础依赖仅含下载；转写使用 `uv sync --extra asr`。MLX 仅支持 Apple Silicon，Windows/Linux 使用 SenseVoice（可用 CUDA 优先，否则 CPU）
+- Windows 入口：`setup.bat`、`run.bat`、`login.bat "备注"`、`download_videos.bat`；需要转写时 `setup.bat asr` / `run.bat asr`
 
 ## 上手前自检（按顺序）
 

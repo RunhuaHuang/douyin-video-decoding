@@ -1,10 +1,11 @@
-"""会话文件的跨进程写入与删除协调（macOS / Unix）。"""
+"""会话文件的跨进程写入与删除协调（Windows / macOS / Linux）。"""
 
-import fcntl
 import os
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
+
+import portalocker
 
 
 def deleted_marker_path(state_path: Path) -> Path:
@@ -17,11 +18,11 @@ def account_storage_lock(state_path: Path):
     # 锁文件不能随账号删除，否则旧进程与新进程可能锁住不同 inode。
     lock_path = state_path.with_name(f"{state_path.name}.lock")
     with lock_path.open("a") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        portalocker.lock(lock_file, portalocker.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            portalocker.unlock(lock_file)
 
 
 def write_storage_state(state_path: Path, payload: str) -> bool:

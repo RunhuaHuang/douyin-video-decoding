@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 from typing import Dict, List, Tuple
 
-from .config import DEFAULT_MODEL
+from .config import DEFAULT_MODEL, MLX_SUPPORTED
 
 
 @dataclass(frozen=True)
@@ -21,10 +21,11 @@ class TranscriptionService:
         self.default_language = default_language
         self._sensevoice_cache: Dict[Tuple[str, str], object] = {}
         self._sensevoice_mps_disabled = False
+        self._sensevoice_cuda_disabled = False
 
     def runtime_status(self) -> Dict[str, str]:
         return {
-            "mlx": self._module_status("mlx_whisper"),
+            "mlx": self._module_status("mlx_whisper") if MLX_SUPPORTED else "此平台不支持，请使用 SenseVoice",
             "sensevoice": self._sensevoice_status(),
         }
 
@@ -34,14 +35,14 @@ class TranscriptionService:
             importlib.import_module(module_name)
             return "已检测"
         except Exception as exc:
-            return f"不可用: {exc}"
+            return f"不可用，请执行 uv sync --extra asr: {exc}"
 
     def _sensevoice_status(self) -> str:
         try:
             importlib.import_module("funasr")
             importlib.import_module("torchaudio")
         except Exception as exc:
-            return f"不可用: {exc}"
+            return f"不可用，请执行 uv sync --extra asr: {exc}"
 
         device = self._preferred_sensevoice_device()
         return f"已检测（{device.upper()}）" if device != "cpu" else "已检测（CPU）"
@@ -95,11 +96,13 @@ class TranscriptionService:
         return self._transcribe_mlx(audio_path, spec.repo_id, language)
 
     def _transcribe_mlx(self, audio_path: Path, model_name: str, language: str) -> str:
+        if not MLX_SUPPORTED:
+            raise RuntimeError("MLX Whisper 仅支持 Apple Silicon Mac；请改用 FunAudioLLM/SenseVoiceSmall")
         try:
             mlx_whisper = importlib.import_module("mlx_whisper")
         except Exception as exc:
             raise RuntimeError(
-                "无法导入 mlx_whisper，请先执行 `uv sync` 或安装项目依赖"
+                "无法导入 mlx_whisper，请先执行 `uv sync --extra asr`"
             ) from exc
 
         transcribe = getattr(mlx_whisper, "transcribe", None)
@@ -137,14 +140,14 @@ class TranscriptionService:
         try:
             return self._run_sensevoice_generate(model, audio_path, language, device)
         except Exception as exc:
-            if device == "mps":
-                self._sensevoice_mps_disabled = True
-                self._sensevoice_cache.pop((model_name, "mps"), None)
+            if device in {"mps", "cuda"}:
+                self._disable_sensevoice_device(device)
+                self._sensevoice_cache.pop((model_name, device), None)
                 try:
                     cpu_model, cpu_device = self._get_sensevoice_model(model_name)
                     return self._run_sensevoice_generate(cpu_model, audio_path, language, cpu_device)
                 except Exception as retry_exc:
-                    raise RuntimeError(f"SenseVoice 转写失败，MPS 和 CPU 回退都不可用: {retry_exc}") from retry_exc
+                    raise RuntimeError(f"SenseVoice 转写失败，{device.upper()} 和 CPU 回退都不可用: {retry_exc}") from retry_exc
             raise RuntimeError(f"SenseVoice 转写失败: {exc}") from exc
 
     def _run_sensevoice_generate(self, model: object, audio_path: Path, language: str, device: str) -> str:
@@ -175,10 +178,10 @@ class TranscriptionService:
                 return model, device
             except Exception as exc:
                 last_error = exc
-                if device == "mps":
-                    self._sensevoice_mps_disabled = True
+                if device in {"mps", "cuda"}:
+                    self._disable_sensevoice_device(device)
 
-        raise RuntimeError(f"无法加载 SenseVoice 模型 {model_name}: {last_error}") from last_error
+        raise RuntimeError(f"无法加载 SenseVoice 模型 {model_name}（请确认已执行 uv sync --extra asr）: {last_error}") from last_error
 
     @staticmethod
     def _sensevoice_hub(model_name: str) -> str:
@@ -210,7 +213,7 @@ class TranscriptionService:
     @staticmethod
     def _cleanup_sensevoice_runtime(device: str) -> None:
         gc.collect()
-        if device != "mps":
+        if device not in {"mps", "cuda"}:
             return
 
         try:
@@ -219,8 +222,8 @@ class TranscriptionService:
             return
 
         try:
-            mps_module = getattr(torch, "mps", None)
-            empty_cache = getattr(mps_module, "empty_cache", None)
+            device_module = getattr(torch, device, None)
+            empty_cache = getattr(device_module, "empty_cache", None)
             if callable(empty_cache):
                 empty_cache()
         except Exception:
@@ -253,12 +256,23 @@ class TranscriptionService:
         preferred = self._preferred_sensevoice_device()
         if preferred == "mps":
             return ["cpu"] if self._sensevoice_mps_disabled else ["mps", "cpu"]
+        if preferred == "cuda":
+            return ["cpu"] if self._sensevoice_cuda_disabled else ["cuda", "cpu"]
         return [preferred]
+
+    def _disable_sensevoice_device(self, device: str) -> None:
+        if device == "mps":
+            self._sensevoice_mps_disabled = True
+        elif device == "cuda":
+            self._sensevoice_cuda_disabled = True
 
     @staticmethod
     def _preferred_sensevoice_device() -> str:
         try:
             torch = importlib.import_module("torch")
+            cuda = getattr(torch, "cuda", None)
+            if cuda and cuda.is_available():
+                return "cuda"
             backends = getattr(torch, "backends", None)
             mps_backend = getattr(backends, "mps", None)
             if mps_backend and mps_backend.is_available():

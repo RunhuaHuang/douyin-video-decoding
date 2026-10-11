@@ -10,6 +10,7 @@ from typing import Callable, Dict, List, Optional, Union
 from uuid import uuid4
 
 from .account_storage import account_storage_lock, deleted_marker_path
+from .path_utils import portable_name
 from .config import (
     BROWSER_ACCOUNTS_DIR,
     COOKIE_INVALIDATION_STRIKE_THRESHOLD,
@@ -27,7 +28,7 @@ def _sanitize_account_id(label: str) -> str:
     normalized = re.sub(r'[\\/:*?"<>|]+', "-", str(label or "").strip())
     normalized = re.sub(r"\s+", "-", normalized)
     normalized = normalized.strip("._-")
-    return normalized or "cookie-account"
+    return portable_name(normalized, fallback="cookie-account").replace(" ", "-")
 
 
 class AccountMetadataError(RuntimeError):

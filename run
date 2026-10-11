@@ -76,7 +76,7 @@ stop_existing_server() {
 
 stop_existing_server
 
-uv run douyin-csv-webui &
+uv run --extra asr douyin-csv-webui &
 SERVER_PID="$!"
 
 for _ in {1..60}; do

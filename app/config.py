@@ -1,4 +1,6 @@
 import os
+import platform
+import sys
 from pathlib import Path
 
 
@@ -48,6 +50,7 @@ WEBUI_HOST = os.environ.get("DOUYIN_WEBUI_HOST", "127.0.0.1").strip() or "127.0.
 WEBUI_PORT = _int_from_env("DOUYIN_WEBUI_PORT", 8000)
 
 DEFAULT_MODEL = "FunAudioLLM/SenseVoiceSmall"
+MLX_SUPPORTED = sys.platform == "darwin" and platform.machine().lower() == "arm64"
 DEFAULT_TRANSCRIPT_COLUMN = "视频文本"
 STATUS_COLUMN = "处理状态"
 ERROR_COLUMN = "失败原因"
@@ -132,6 +135,12 @@ MODEL_PRESETS = [
         "note": "体积更小，适合快速试跑。",
     },
 ]
+if not MLX_SUPPORTED:
+    MODEL_PRESETS = [
+        preset for preset in MODEL_PRESETS
+        if all("sensevoice" in model.lower() for model in preset["models"])
+    ]
+
 CSV_ENCODINGS = [
     "utf-8-sig",
     "utf-8",

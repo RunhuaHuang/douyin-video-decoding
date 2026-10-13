@@ -29,6 +29,20 @@ HEADERS = {
     "Referer": "https://www.douyin.com/",
 }
 
+# 代理配置：若 Clash 开启 (127.0.0.1:7890)，元数据解析强制走代理换IP绕过风控；视频下载强制直连省流量
+CLASH_PROXY_URL = "http://127.0.0.1:7890"
+
+def is_clash_running() -> bool:
+    import socket
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        s.connect(("127.0.0.1", 7890))
+        s.close()
+        return True
+    except Exception:
+        return False
+
 def extract_video_id(url: str) -> Optional[str]:
     """从抖音链接中提取纯数字 ID"""
     if not url:
@@ -61,7 +75,8 @@ class WafCoordinator:
                 is_initiator = True
                 print(f"\n🚨 [{initiator_tag}] 检测到滑块/验证码风控！启动【全线程统一静默自愈】（休眠 {int(duration)} 秒）...", flush=True)
                 print(f"👉 所有后台浏览器将切断连接（完全零流量以让风控自然消退）。", flush=True)
-                print(f"👉 若在电脑前可随时双击桌面【完成抖音验证.bat】加速解除；若不在电脑前，静默倒计时结束后将自动恢复。\n", flush=True)
+                print(f"👉 【快捷加速解除】：在 Clash 客户端随意切换另一个节点，然后双击桌面【完成验证.bat】立即换IP全员复活！", flush=True)
+                print(f"👉 【无人值守模式】：静默倒计时结束后将自动全员恢复推进。\n", flush=True)
 
         if not is_initiator:
             cls._cooldown_event.wait()
@@ -94,17 +109,24 @@ class WafCoordinator:
         if not cls._cooldown_event.is_set():
             worker.close_browser()
             cls._cooldown_event.wait()
+            # 唤醒错峰机制：线程 2 及以上按 worker_id 阶梯多随机等待，彻底避免多线程在同一瞬间同时打向抖音
+            if worker.worker_id > 1:
+                stagger_sec = (worker.worker_id - 1) * 2.5 + random.uniform(1.0, 3.0)
+                print(f"[{worker_tag}] ⚡ 触发唤醒错峰保护，交错等待 {stagger_sec:.1f} 秒后再请求...", flush=True)
+                time.sleep(stagger_sec)
 
 class TableWorker:
     """独立的工作者实例，拥有自己的浏览器和 HTTP 客户端"""
     def __init__(self, worker_id: int, dest_dir: Path):
         self.worker_id = worker_id
         self.dest_dir = dest_dir
+        # 视频文件下载器：设置 trust_env=False 强制本地网络直连下载，不消耗代理流量、跑满宽带
         self.http_client = httpx.Client(
             headers=HEADERS,
             timeout=httpx.Timeout(connect=15.0, read=90.0, write=90.0, pool=90.0),
             follow_redirects=True,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=30)
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=30),
+            trust_env=False
         )
         self.playwright = None
         self.browser: Optional[Browser] = None
@@ -117,15 +139,21 @@ class TableWorker:
             return
         if not self.playwright:
             self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(
-            headless=True,
-            args=[
+
+        launch_kwargs = {
+            "headless": True,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
             ]
-        )
+        }
+        # 页面元数据解析器：若检测到 Clash 运行，接入代理；仅消耗微量文本流量，彻底规避风控
+        if is_clash_running():
+            launch_kwargs["proxy"] = {"server": CLASH_PROXY_URL}
+
+        self.browser = self.playwright.chromium.launch(**launch_kwargs)
         context_kwargs = {
             "user_agent": USER_AGENT,
             "viewport": {"width": 1280, "height": 720},
@@ -142,10 +170,22 @@ class TableWorker:
             else route.continue_()
         ))
         try:
-            self.page.goto("https://www.douyin.com/", wait_until="commit", timeout=8000)
-            self.page.wait_for_timeout(1500)
+            self.page.goto("https://www.douyin.com/", wait_until="commit", timeout=10000)
+            self.captcha_hit = False
+            for _ in range(35):
+                try:
+                    cur_t = self.page.title() or ""
+                    if "验证码" in cur_t or "verify" in self.page.url:
+                        self.captcha_hit = True
+                        break
+                    if "抖音" in cur_t:
+                        self.captcha_hit = False
+                        break
+                except Exception:
+                    pass
+                self.page.wait_for_timeout(100)
         except Exception:
-            pass
+            self.captcha_hit = False
         self.resolve_count = 0
 
     def close_browser(self):
@@ -223,11 +263,20 @@ class TableWorker:
                             return None, f"已删除/不可见({notice})"
                         return None, "未捕获到有效视频数据(空详情)"
 
-                    try:
-                        cur_title = self.page.title() or ""
-                        cur_url = self.page.url or ""
-                    except Exception:
-                        cur_title, cur_url = "", ""
+                    if getattr(self, "captcha_hit", False):
+                        return None, "触发验证码风控"
+
+                    cur_title, cur_url = "", ""
+                    for _ in range(15):
+                        try:
+                            cur_title = self.page.title() or ""
+                            cur_url = self.page.url or ""
+                            if cur_title:
+                                break
+                        except Exception:
+                            pass
+                        self.page.wait_for_timeout(100)
+
                     if "验证码" in cur_title or "verify" in cur_url or "captcha" in cur_url:
                         return None, "触发验证码风控"
                 except Exception as e:
@@ -451,12 +500,16 @@ class TableWorker:
                 elif "触发验证码风控" in err:
                     # 遇到风控：立即协同全线程统一静默自愈（首轮 180 秒静默），并重试当前视频
                     manual_ok = WafCoordinator.trigger_cooldown(tag, duration=180.0)
+                    if self.worker_id > 1:
+                        time.sleep(random.uniform(3.0, 5.0))
                     self.start_browser()
                     det, err = self.resolve_video_info(video_id)
 
                     if err and "触发验证码风控" in err and not manual_ok:
                         # 若首轮静默后频控仍在衰减中，触发二次深度静默（300 秒）
                         manual_ok = WafCoordinator.trigger_cooldown(tag, duration=300.0)
+                        if self.worker_id > 1:
+                            time.sleep(random.uniform(3.0, 5.0))
                         self.start_browser()
                         det, err = self.resolve_video_info(video_id)
 
@@ -544,8 +597,8 @@ class TableWorker:
             if (idx + 1) % 5 == 0 or ok:
                 save_manifest()
 
-            # 正常处理完成后的随机微抖动延迟，平滑流量（防止并发请求瞬时峰值触发风控）
-            time.sleep(random.uniform(1.2, 2.2))
+            # 正常处理完成后的随机微抖动延迟，平滑流量（2.5 ~ 3.5 秒彻底避开同 IP 高频风控）
+            time.sleep(random.uniform(2.5, 3.5))
 
         save_manifest()
         completion_flag.touch(exist_ok=True)

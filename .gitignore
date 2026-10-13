@@ -7,3 +7,9 @@ tmp/
 .v2c/
 .video_agent/
 out/
+*.png
+*.jpg
+*.mp4
+*.log
+*state*.json
+douyin_state.json

@@ -219,4 +219,4 @@ def login_with_label(
 
 def run() -> None:
     account_label = _resolve_account_label(sys.argv[1:])
-    login_with_label(account_label, wait_mode="enter", logger=print)
+    login_with_label(account_label, wait_mode="browser_close", logger=print)

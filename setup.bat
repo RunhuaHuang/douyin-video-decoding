@@ -8,9 +8,9 @@ if errorlevel 1 (
     exit /b 1
 )
 if /I "%~1"=="asr" (
-    uv sync --python 3.12 --extra asr
+    uv sync --no-editable --python 3.12 --extra asr
 ) else (
-    uv sync --python 3.12
+    uv sync --no-editable --python 3.12
 )
 if errorlevel 1 exit /b 1
 uv run --no-sync playwright install chromium

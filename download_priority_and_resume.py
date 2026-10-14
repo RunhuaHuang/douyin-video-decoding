@@ -25,11 +25,6 @@ PRIORITY_TASKS = [
         "dest": Path(r"D:\抖音视频下载\点赞总榜-星图"),
     },
     {
-        "name": "分享榜-总榜",
-        "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享总榜.xlsx"),
-        "dest": Path(r"D:\抖音视频下载\分享榜\1. 总榜"),
-    },
-    {
         "name": "分享榜-AI榜",
         "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享AI视频总榜.xlsx"),
         "dest": Path(r"D:\抖音视频下载\分享榜\2. AI榜"),

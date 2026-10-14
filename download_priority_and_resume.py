@@ -125,6 +125,8 @@ def worker_thread(
                         if counters["deleted"] % 5 == 0:
                             save_manifest_atomic(manifest_path, manifest)
                     print(f"[{tag}]   -> ⚠️ {err}", flush=True)
+                    task_queue.task_done()
+                    continue
                 elif "触发验证码风控" in err:
                     manual_ok = bdh.WafCoordinator.trigger_cooldown(tag, duration=180.0)
                     if worker_id > 1:
@@ -171,6 +173,9 @@ def worker_thread(
                     continue
 
             consecutive_fails = 0
+            if not det:
+                task_queue.task_done()
+                continue
 
             # 4. 判断类型：图文 note 还是普通视频
             aweme_type = det.get("aweme_type")

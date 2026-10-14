@@ -18,8 +18,28 @@ import httpx
 # 导入现有的经过充分验证的核心组件
 import batch_download_huitun as bdh
 
-TARGET_EXCEL = Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-点赞排序\点赞星图总榜.xlsx")
-TARGET_DEST = Path(r"D:\抖音视频下载\点赞总榜-星图")
+PRIORITY_TASKS = [
+    {
+        "name": "点赞总榜-星图",
+        "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-点赞排序\点赞星图总榜.xlsx"),
+        "dest": Path(r"D:\抖音视频下载\点赞总榜-星图"),
+    },
+    {
+        "name": "分享榜-总榜",
+        "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享总榜.xlsx"),
+        "dest": Path(r"D:\抖音视频下载\分享榜\1. 总榜"),
+    },
+    {
+        "name": "分享榜-AI榜",
+        "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享AI视频总榜.xlsx"),
+        "dest": Path(r"D:\抖音视频下载\分享榜\2. AI榜"),
+    },
+    {
+        "name": "分享榜-星图榜",
+        "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享星图总榜.xlsx"),
+        "dest": Path(r"D:\抖音视频下载\分享榜\3. 星图榜"),
+    },
+]
 
 def save_manifest_atomic(manifest_path: Path, manifest: dict):
     tmp = manifest_path.with_name(f"manifest_{int(time.time()*1000)}.tmp")
@@ -372,18 +392,31 @@ def main():
     parser.add_argument("--no-resume", action="store_true", help="完成后不自动恢复原 266 表任务")
     args = parser.parse_args()
 
-    # 步骤 1: 优先执行星图总榜下载
-    download_single_table_multithreaded(
-        excel_path=TARGET_EXCEL,
-        dest_folder=TARGET_DEST,
-        concurrency=args.concurrency,
-        max_test=args.test
-    )
+    # 步骤 1: 依次优先执行各个总榜的3线程合力下载
+    for t_idx, task_info in enumerate(PRIORITY_TASKS, 1):
+        t_name = task_info["name"]
+        t_excel = task_info["excel"]
+        t_dest = task_info["dest"]
+
+        print(f"\n" + "=" * 60)
+        print(f"🎬 启动优先级任务 [{t_idx}/{len(PRIORITY_TASKS)}]: {t_name}")
+        print(f"表格文件: {t_excel}")
+        print(f"目标目录: {t_dest}")
+        print(f"模式: 3 个工作线程合力下载该文件，完成后自动接续下一个")
+        print("=" * 60 + "\n", flush=True)
+
+        download_single_table_multithreaded(
+            excel_path=t_excel,
+            dest_folder=t_dest,
+            concurrency=args.concurrency,
+            max_test=args.test
+        )
 
     # 步骤 2: 恢复原先的 266 个表格批量下载任务
     if not args.no_resume:
         print("\n" + "=" * 60)
-        print("🚀 【优先级任务全部达成】立即无缝恢复原 266 个榜单批量轮询任务！")
+        print("🚀 【所有优先任务（点赞星图 + 分享榜3大总榜）全部达成！】")
+        print("🚀 立即无缝恢复原 266 个榜单批量轮询任务！")
         print("=" * 60 + "\n", flush=True)
 
         huitun_script = Path(__file__).parent / "batch_download_huitun.py"

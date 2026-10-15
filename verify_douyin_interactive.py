@@ -15,13 +15,26 @@ def run_interactive_verify():
     print("=" * 60, flush=True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=[
+        launch_kwargs = {
+            "headless": False,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
             ]
-        )
+        }
+        # 如果开启了 Clash，让验证浏览器也走 Clash 代理，确保解决的是当前节点的风控
+        import socket
+        s = socket.socket()
+        s.settimeout(0.3)
+        try:
+            s.connect(("127.0.0.1", 7890))
+            s.close()
+            launch_kwargs["proxy"] = {"server": "http://127.0.0.1:7890"}
+            print("💡 已自动连接 Clash 代理 (127.0.0.1:7890)，正在验证当前节点 IP...")
+        except Exception:
+            s.close()
+
+        browser = p.chromium.launch(**launch_kwargs)
         context_kwargs = {
             "user_agent": USER_AGENT,
             "viewport": {"width": 1280, "height": 800},
@@ -33,8 +46,8 @@ def run_interactive_verify():
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
 
-        # 打开目前触发了风控的视频页面
-        target_url = "https://www.douyin.com/video/7667889682693290106"
+        # 直接打开抖音首页，秒出验证码
+        target_url = "https://www.douyin.com/"
         try:
             page.goto(target_url, timeout=30000)
         except Exception as e:

@@ -71,6 +71,8 @@ Windows 上不显示 MLX 模型预设；手动输入 MLX 模型时会提示改�
 
 ## 灰豚 Excel 批量下载（Windows / macOS）
 
+本次稳定性修复、运行方式和 Windows 更新步骤见 [2026-10 稳定性说明](docs/stability-2026-10.md)。长期批量任务建议从 `--concurrency 1` 开始。
+
 `batch_download_huitun.py` 是独立的多表下载入口，支持视频与图文，不做文案转写。输入和输出目录按每次任务指定，中文、空格和外接盘路径均可。仍使用现有 WebUI 时，继续使用上面的 WebUI 入口。
 
 在仓库根目录运行（两种系统使用相同的 Python 命令）：

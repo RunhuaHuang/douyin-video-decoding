@@ -88,6 +88,27 @@ ssh nas 'sudo docker exec douyin-video douyin-video-dl \
 
 ## 更新和检查
 
+### 新版灰豚冷却下载入口
+
+镜像包含 `batch_download_huitun.py` 及共享会话模块。此入口使用全线程协同冷却：验证码后关闭浏览器，按 180 秒、300 秒冷却重试；会话文件更新可提前恢复。并发按表格分配，单表使用一个工作线程。
+
+输入、输出由每次任务指定；单表可用 `--output-name` 指定输出子目录。先预览，再去掉 `--dry-run` 下载：
+
+```bash
+ssh nas 'sudo docker exec douyin-video uv run --no-project --python /opt/venv/bin/python python /app/batch_download_huitun.py \
+  --source "/nas/videos/目标视频列表/点赞星图总榜.xlsx" \
+  -o "/nas/videos/视频下载" --output-name "点赞总榜-星图" \
+  --state-file /app/tmp/browser/huitun-zan-xingtu.json --proxy none --dry-run'
+```
+
+首次正式运行从账号池复制可用会话，也可通过 `--account` 指定。续跑会核对已有文件并跳过，输出目录保存 `manifest.json`。日志应重定向到本次任务独立文件，后台运行可使用 `docker exec -d`。
+
+若已确认旧 Cookie 导致空白页，灰豚入口改用 `--anonymous-state /app/tmp/browser/huitun-guest.json`，替代账号模式的 `--state-file` / `--account`。它不会复制账号池，也会拒绝包含登录凭据的文件；人工验证时也传同一个 `--anonymous-state`。部署验证准备的访客状态与旧登录状态分开保存，不会自动开启下载任务。
+
+旧版将账号拉黑、权限限制等提示记入 `deleted` 的记录，新版会在续跑时重查，不需要清空整个 manifest；已有有效视频继续跳过。
+
+基础镜像仓库不可达时，可用 `deploy/nas/Dockerfile.update` 基于已有运行镜像离线更新。先为旧镜像打备份标签，以 `--build-arg BASE_IMAGE=<备份标签>` 构建；在构建目录的 `wheels/` 中放置缺失依赖的 wheel，并按锁文件核对哈希，构建时禁用索引并检查全部运行依赖。系统库或浏览器依赖改变时仍须走完整 Dockerfile。容器代码不挂载宿主机目录，必须重建/切换镜像后才生效。
+
 代码更新后重新同步并重建：
 
 ```bash

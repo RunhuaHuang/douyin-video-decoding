@@ -184,6 +184,11 @@ def test_login_session_starts_with_clean_context(tmp_path, monkeypatch):
     monkeypatch.setattr("playwright.sync_api.sync_playwright", dummy_sync_playwright)
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
+    # CLI now waits for authenticated cookies/browser close instead of Enter.
+    monkeypatch.setattr(dummy_sync_playwright.instance.chromium.browser.context, "cookies", lambda *args: [
+        {"name": "sessionid", "value": "test-session"},
+        {"name": "uid_tt", "value": "test-user"},
+    ], raising=False)
     login_session.run()
 
     browser = dummy_sync_playwright.instance.chromium.browser

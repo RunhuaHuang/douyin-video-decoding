@@ -1,5 +1,8 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app import nas_download
 from app.nas_download import PROGRESS_FILENAME, run_download
@@ -12,13 +15,14 @@ class FakeDownloader:
     def __init__(self):
         pass
 
-    def download_file(self, *, table_path, out_dir, url_column, skip_existing, progress_callback=None, workers=2):
+    def download_file(self, *, table_path, out_dir, url_column, skip_existing, start_row=1, progress_callback=None, workers=2):
         self.__class__.calls.append(
             {
                 "table_path": table_path,
                 "out_dir": out_dir,
                 "url_column": url_column,
                 "skip_existing": skip_existing,
+                "start_row": start_row,
                 "workers": workers,
             }
         )
@@ -76,3 +80,43 @@ def test_batch_status_reports_not_started_as_json(tmp_path, capsys):
     assert nas_download.main(["--status", str(source), "-o", str(tmp_path / "视频下载")]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "not_started"
+
+
+def test_preserved_nas_guest_mode_and_start_row(tmp_path, monkeypatch):
+    source = tmp_path / "访客.xlsx"
+    source.write_bytes(b"xlsx-placeholder")
+    state = tmp_path / "anonymous.json"
+    state.write_text('{"cookies": [], "origins": []}')
+    options = []
+    monkeypatch.setattr(nas_download, "CookieAccountManager", lambda: pytest.fail("guest must not select a login account"))
+    monkeypatch.setattr(nas_download, "VideoDownloader", lambda **kwargs: options.append(kwargs) or FakeDownloader())
+    FakeDownloader.calls = []
+    assert run_download(source, output_root=tmp_path / "out", anonymous_state=state, start_row=4) == 0
+    assert options == [{"storage_state_path": state, "anonymous": True}]
+    assert FakeDownloader.calls[-1]["start_row"] == 4
+    progress = json.loads((tmp_path / "out/访客" / PROGRESS_FILENAME).read_text())
+    assert progress["access_mode"] == "anonymous"
+    assert progress["start_row"] == 4
+
+
+def test_preserved_nas_guest_mode_rejects_login_cookies(tmp_path):
+    state = tmp_path / "account.json"
+    state.write_text(json.dumps({"cookies": [{"name": "sessionid", "value": "fixture"}], "origins": []}))
+    with pytest.raises(ValueError, match="登录凭据"):
+        run_download(tmp_path / "source.xlsx", output_root=tmp_path / "out", anonymous_state=state)
+    assert not (tmp_path / "out").exists()
+
+
+def test_preserved_nas_explicit_account_is_isolated(tmp_path, monkeypatch):
+    source = tmp_path / "指定账号.xlsx"
+    source.write_bytes(b"xlsx-placeholder")
+    account = SimpleNamespace(label="指定", storage_state_path=tmp_path / "account.json")
+    monkeypatch.setattr(nas_download, "CookieAccountManager", lambda: SimpleNamespace(list_available_accounts=lambda: [account]))
+    constructors, accounts = [], []
+    class SelectedDownloader(FakeDownloader):
+        def download_file(self, *, accounts: list, **kwargs):
+            assert accounts == ["指定"]
+            return super().download_file(**kwargs)
+    monkeypatch.setattr(nas_download, "VideoDownloader", lambda **kwargs: constructors.append(kwargs) or SelectedDownloader())
+    assert run_download(source, output_root=tmp_path / "out", account_label="指定") == 0
+    assert constructors == [{"storage_state_path": account.storage_state_path}]

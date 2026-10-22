@@ -63,9 +63,14 @@ class VideoDownloader:
         storage_state_path: Optional[Path] = None,
         recycle_interval: int = 10,
         request_coordinator: Optional[RequestCoordinator] = None,
+        anonymous: bool = False,
     ) -> None:
+        self.anonymous = anonymous
         self.account_manager = account_manager or CookieAccountManager()
-        if storage_state_path is None:
+        if anonymous:
+            self.storage_state_path = storage_state_path or Path("tmp/browser/anonymous/storage_state.json")
+            self.account_label = "匿名（未登录）"
+        elif storage_state_path is None:
             account = self.account_manager.select_current_or_first_available_account()
             self.storage_state_path = account.storage_state_path if account else None
             self.account_label = account.label if account else "未登录/匿名"
@@ -208,7 +213,10 @@ class VideoDownloader:
                 fail_on_status_code=False,
                 max_retries=0,
             )
-            return self._is_douyin_challenge_html(response.text())
+            challenged = self._is_douyin_challenge_html(response.text())
+            if challenged:
+                self.browser_resolver._note_challenge("验证码挑战页")
+            return challenged
         except Exception:
             # A failed probe must not reject a valid browser navigation. The
             # normal page path still has its own bounded navigation timeout.
@@ -339,6 +347,7 @@ class VideoDownloader:
             except Exception:
                 challenge_html = ""
             if self._is_douyin_challenge_html(challenge_html):
+                self.browser_resolver._note_challenge("验证码挑战页")
                 note_url = self._note_url_for_video(share_url) if _allow_note_fallback else None
                 if note_url:
                     try:
@@ -584,7 +593,9 @@ class VideoDownloader:
         print(f"  匹配链接列: [{url_col}], 共 {len(urls)} 条链接")
         print(f"  保存目标目录: {target_dir}")
         print(f"  当前登录账号: {self.account_label}")
-        available_accounts = self.account_manager.list_available_accounts()
+        if self.anonymous and accounts:
+            raise ValueError("匿名模式不能同时指定登录账号")
+        available_accounts = [] if self.anonymous else self.account_manager.list_available_accounts()
         if accounts:
             matched_accounts = []
             avail_map = {a.label: a for a in available_accounts}

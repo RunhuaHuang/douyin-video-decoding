@@ -1,0 +1,11 @@
+# Offline update. Put wheels for any missing dependencies in the build's wheels/.
+# BASE_IMAGE must identify an existing, working NAS download image.
+ARG BASE_IMAGE=douyin-video-nas:latest
+FROM ${BASE_IMAGE}
+WORKDIR /app
+COPY wheels /opt/offline-wheels
+COPY deploy/nas/requirements-video.txt /tmp/requirements-video.txt
+RUN uv pip install --python /opt/venv/bin/python --no-index --find-links /opt/offline-wheels -r /tmp/requirements-video.txt
+COPY app ./app
+COPY README.md pyproject.toml ./
+COPY batch_download_huitun.py login_douyin.py verify_douyin_interactive.py ./

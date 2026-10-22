@@ -1,6 +1,9 @@
 @echo off
 chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
-echo 正在打开验证窗口...
-.\douyin-video-decoding\.venv\Scripts\python.exe verify_douyin_interactive.py
+set "PYTHONUTF8=1"
+uv run --no-sync python verify_douyin_interactive.py %*
+set "_DOUYIN_EXIT_CODE=%errorlevel%"
 pause
+exit /b %_DOUYIN_EXIT_CODE%

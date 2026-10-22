@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import VIDEO_OUTPUT_DIR
+from .cookie_accounts import CookieAccountManager
 from .video_downloader import VideoDownloader
 
 
@@ -81,8 +82,34 @@ def run_download(
     output_root: Path,
     url_column: str = "视频链接",
     skip_existing: bool = True,
+    start_row: int = 1,
     workers: int = 2,
+    account_label: Optional[str] = None,
+    anonymous_state: Optional[Path] = None,
 ) -> int:
+    if start_row < 1:
+        raise ValueError("start_row 必须大于等于 1")
+    if anonymous_state is not None:
+        if account_label is not None:
+            raise ValueError("匿名模式不能同时指定登录账号")
+        anonymous_state = Path(anonymous_state)
+        state = json.loads(anonymous_state.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or not isinstance(state.get("cookies"), list) or not isinstance(state.get("origins"), list):
+            raise ValueError("匿名会话格式无效")
+        login_cookies = {"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "uid_tt", "uid_tt_ss"}
+        if any(cookie.get("name") in login_cookies and cookie.get("value") for cookie in state["cookies"]):
+            raise ValueError("匿名会话包含登录凭据，请使用未登录窗口的会话")
+
+    selected_account = None
+    if account_label is not None:
+        selected_account = next(
+            (account for account in CookieAccountManager().list_available_accounts()
+             if account.label == account_label),
+            None,
+        )
+        if selected_account is None:
+            raise ValueError(f"指定账号不可用: {account_label}")
+
     output_dir = output_root / input_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
     progress_path = output_dir / PROGRESS_FILENAME
@@ -107,6 +134,10 @@ def run_download(
         "success_count": 0,
         "fail_count": 0,
         "percent": 0.0,
+        "start_row": start_row,
+        "account_label": "匿名" if anonymous_state is not None else account_label,
+        "access_mode": "anonymous" if anonymous_state is not None else "account_pool",
+        "anonymous_state_path": str(anonymous_state) if anonymous_state is not None else None,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "previous_status": previous.get("status", ""),
     }
@@ -140,15 +171,23 @@ def run_download(
             flush=True,
         )
 
-    downloader = VideoDownloader()
+    if anonymous_state is not None:
+        downloader = VideoDownloader(storage_state_path=anonymous_state, anonymous=True)
+    elif selected_account is not None:
+        downloader = VideoDownloader(storage_state_path=selected_account.storage_state_path)
+    else:
+        downloader = VideoDownloader()
+    account_options = {"accounts": [selected_account.label]} if selected_account is not None else {}
     try:
         success_count, fail_count = downloader.download_file(
             table_path=input_path,
             out_dir=output_dir,
             url_column=url_column or None,
             skip_existing=skip_existing,
+            start_row=start_row,
             progress_callback=report_progress,
             workers=workers,
+            **account_options,
         )
     except Exception as exc:
         progress.update(
@@ -192,7 +231,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="输出根目录；默认容器内 /nas/videos/视频下载",
     )
     parser.add_argument("--url-col", default="视频链接", help="链接列名（默认：视频链接）")
+    parser.add_argument("--start-row", type=int, default=1, help="从表格指定行（1 开始）继续处理")
     parser.add_argument("--workers", type=int, default=2, help="下载线程数（默认 2，最多 8；每线程使用独立 cookies）")
+    access = parser.add_mutually_exclusive_group()
+    access.add_argument("--account", default=None, help="只使用指定账号备注（实际单线程，不自动切换其他账号）")
+    access.add_argument("--anonymous-state", type=Path, help="使用独立匿名会话 JSON，单线程且完全不选择账号池")
     parser.add_argument("--no-skip", action="store_true", help="不跳过已存在文件")
     parser.add_argument("--status", action="store_true", help="只读取任务进度并输出 JSON，不启动下载")
     args = parser.parse_args(argv)
@@ -217,7 +260,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             output_root=output_root,
             url_column=args.url_col,
             skip_existing=not args.no_skip,
+            start_row=args.start_row,
             workers=args.workers,
+            account_label=args.account,
+            anonymous_state=args.anonymous_state,
         )
     except Exception as exc:
         print(f"下载任务失败: {exc}", file=sys.stderr)

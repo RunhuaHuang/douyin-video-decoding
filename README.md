@@ -38,7 +38,7 @@ winget install --id Gyan.FFmpeg -e
 
 ```powershell
 .\setup.bat                 # 安装 Python 3.12、下载依赖和 Chromium，检查 FFmpeg/FFprobe
-.\login.bat "主号"          # 人工扫码，回终端按回车保存
+.\login.bat "主号"          # 人工扫码，检测到登录后自动保存
 .\run.bat                   # 启动 WebUI 并自动打开浏览器；Ctrl+C 停止
 ```
 
@@ -68,6 +68,56 @@ Windows 上不显示 MLX 模型预设；手动输入 MLX 模型时会提示改�
 - 账号会话可以从原机器的 `tmp/browser/accounts/` 复制，但换设备或网络后可能需要重新扫码；Chromium 需在 Windows 重新安装。
 
 仓库提供 Windows/macOS/Linux CI 测试，涵盖跨进程账号锁、Chromium 工作线程和本地图文合成。CI 不使用真实抖音账号；正式部署仍需在目标机器验证扫码、短视频、长视频和图文下载。
+
+## 灰豚 Excel 批量下载（Windows / macOS）
+
+`batch_download_huitun.py` 是独立的多表下载入口，支持视频与图文，不做文案转写。输入和输出目录按每次任务指定，中文、空格和外接盘路径均可。仍使用现有 WebUI 时，继续使用上面的 WebUI 入口。
+
+在仓库根目录运行（两种系统使用相同的 Python 命令）：
+
+```bash
+# 先预览：不启动浏览器、不下载、不创建输出目录
+uv run python batch_download_huitun.py --source "/输入目录" -o "/输出目录" --dry-run
+
+# 正式下载：默认两张表并发；重复运行会核对现有文件并补跑失败/缺失项
+uv run python batch_download_huitun.py --source "/输入目录" -o "/输出目录" --concurrency 2
+
+# 单个表格、多个输入目录、指定月份或小范围试跑
+uv run python batch_download_huitun.py "/输入/榜单.xlsx" -o "/输出目录" --test 2
+uv run python batch_download_huitun.py --source "/目录一" --source "/目录二" -o "/输出目录" --month 2025-10
+```
+
+目录只扫描直接包含的 `.xlsx`，忽略 Excel 的 `~$` 临时文件；多目录中存在同名输出表时会报错，避免互相覆盖。输出为 `<输出目录>/<表名>/视频-ID.mp4` 或 `图文-ID.mp4`，同时保存 `manifest.json`。有失败行或仅试跑部分行时不写完成标记；旧版留下的 `_COMPLETED.flag` 也不会阻止补跑。退出码 `0` 表示本次范围没有失败项，`1` 表示有失败，`2` 表示参数/预检错误。
+
+视频先下载到本机临时目录，完成后通过输出目录内的独立临时文件替换目标文件；本机需保留至少一条视频大小的空闲空间。共享盘出现短暂的资源忙或超时会有限重试，清理临时文件失败不会中断整表。若记录文件持续不可读或内容损坏，任务会停止并保留原记录，避免将已有进度覆盖为空。持续断网仍需先恢复共享盘连接后续跑。
+
+Mac 可用 `./启动批量下载.command --source "/输入目录" -o "/输出目录"`；Windows 对应 `启动批量下载.bat`。所有启动脚本会切换到仓库根目录，不再依赖嵌套的 `douyin-video-decoding/.venv` 路径。只需下载依赖和 Chromium，并安装 FFmpeg；不需要安装 ASR。
+
+未指定输出时，Mac 默认 `~/Movies/抖音视频下载`，Windows 保留 `D:\抖音视频下载`。未指定输入时，尝试当前用户桌面的 `灰豚数据/带货视频榜-总销售额排序-每月` 和 `带货视频榜-分类`；agent 应始终使用用户本次提供的输入、输出参数。
+
+### 会话与人工验证
+
+Mac 默认共享会话为仓库的 `tmp/browser/huitun_state.json`；Windows 保留 `D:\抖音视频下载\douyin_state.json`。三个脚本均支持 `--state-file`；自定义时必须传入同一文件。批量下载首次运行可以自动复制现有账号池中的可用会话，也可以用 `--account "备注"` 指定账号；复制和后续人工验证不会修改原账号池文件，不会自动轮换账号。
+
+旧登录 Cookie 可能导致作品直达页空白，即使账号首页仍显示已登录。已确认需要访客模式时，批量入口可显式使用 `--anonymous-state "独立访客.json"`：只读取该未登录会话，不从账号池补入 Cookie，且不能与 `--account` 同用。访客文件必须包含 `cookies`、`origins` 数组，可以是全新的空状态，也可以是未登录浏览器保存的会话；含登录凭据时会拒绝启动。人工验证助手也支持相同 `--anonymous-state` 参数。先备份旧会话，再使用独立路径，不要删除账号池。
+
+“你已拉黑对方”、权限/隐私限制以及“因作品权限或已被删除”等含糊提示会保留为可重试失败。旧 manifest 中误标为 `deleted` 的这类记录会在续跑时重新解析；只有明确删除、下架或不存在的作品继续跳过。
+
+```bash
+# 尚无可用会话时，由人扫码；成功后自动保存
+uv run python login_douyin.py --proxy auto
+
+# 遇到验证码时，使用日志里的实际 video/note 链接，由人完成验证
+uv run python verify_douyin_interactive.py "https://www.douyin.com/video/实际ID" --proxy auto
+```
+
+Mac 也提供 `扫码登录.command`、`完成验证.command`，Windows 对应同名 `.bat`。验证助手不再打开写死的视频；未传链接时，可在交互终端粘贴。关闭窗口或超时且未确认成功时，会保留原会话。下载任务在冷却期间检测到共享会话文件更新后，会提前重试。
+
+### 代理行为
+
+三个脚本使用相同的 `--proxy` 参数：`auto` 检测本机 `127.0.0.1:7890`，`none` 禁用浏览器代理，也可指定 `http://127.0.0.1:其他端口`。扫码、验证与下载解析应使用同一设置。解析浏览器拦截常见媒体 CDN、媒体路径及通过 fetch/XHR 请求的媒体，拿到详情后关闭页面，保留浏览器会话供下次解析复用。
+
+文件下载使用 `trust_env=False` 忽略应用层/系统代理设置。**若希望视频不消耗代理节点流量，请关闭 TUN／虚拟网卡，或在代理客户端配置 DIRECT 分流；Python 参数不能绕过操作系统的 TUN 路由。** 本工具不会修改系统代理或 Clash 配置。验证码冷却是有界重试，不保证平台一定解除限制。
 
 ## 命令行下载（douyin-dl）
 

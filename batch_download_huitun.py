@@ -1,4 +1,3 @@
-import os
 import re
 import sys
 import time
@@ -15,33 +14,23 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import httpx
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+from app.huitun_support import (
+    add_session_arguments, browser_launch_options, browser_user_agent,
+    default_output_dir, default_source_dirs, default_state_file, positive_int,
+    prepare_anonymous_state_file, prepare_state_file, resolve_proxy, should_block_browser_request,
+)
+from app.path_utils import portable_name
+from app.huitun_storage import publish_local_file, read_manifest, write_manifest
 
 # 路径配置
-SOURCE_DIRS = [
-    Path(r"C:\Users\cuhksz\Desktop\灰豚数据\带货视频榜-总销售额排序-每月"),
-    Path(r"C:\Users\cuhksz\Desktop\带货视频榜-分类"),
-]
-DEST_DIR = Path(r"D:\抖音视频下载")
+SOURCE_DIRS = default_source_dirs()
+DEST_DIR = default_output_dir()
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+USER_AGENT = browser_user_agent()
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Referer": "https://www.douyin.com/",
 }
-
-# 代理配置：若 Clash 开启 (127.0.0.1:7890)，元数据解析强制走代理换IP绕过风控；视频下载强制直连省流量
-CLASH_PROXY_URL = "http://127.0.0.1:7890"
-
-def is_clash_running() -> bool:
-    import socket
-    s = socket.socket()
-    s.settimeout(0.3)
-    try:
-        s.connect(("127.0.0.1", 7890))
-        s.close()
-        return True
-    except Exception:
-        return False
 
 def extract_video_id(url: str) -> Optional[str]:
     """从抖音链接中提取纯数字 ID"""
@@ -53,6 +42,26 @@ def extract_video_id(url: str) -> Optional[str]:
     match = re.search(r"\b(\d{18,21})\b", str(url))
     return match.group(1) if match else None
 
+
+def is_permanent_unavailability(reason: str) -> bool:
+    """Account restrictions and ambiguous permission notices must be retried."""
+    message = str(reason or "").strip()
+    for prefix in ("已删除/不可见(", "访问受限("):
+        if message.startswith(prefix):
+            message = message[len(prefix):].removesuffix(")")
+            break
+    if any(word in message for word in (
+        "拉黑", "权限", "隐私", "私密", "好友", "登录", "验证", "风控", "地区", "暂", "审核",
+    )):
+        return False
+    return any(word in message for word in ("已删除", "已被删除", "不存在", "已下架", "已失效"))
+
+
+def detail_notice_error(notice: str) -> str:
+    label = "已删除/不可见" if is_permanent_unavailability(notice) else "访问受限"
+    return f"{label}({notice})"
+
+
 class WafCoordinator:
     """全局风控与休眠协调器：确保多线程在遇到滑块拦截时协同静默，不跨线程调用 Playwright"""
     _lock = threading.Lock()
@@ -61,11 +70,11 @@ class WafCoordinator:
     _cooldown_event.set()  # set = 正常运行状态; clear = 全局静默冷却中
 
     @classmethod
-    def trigger_cooldown(cls, initiator_tag: str, duration: float = 180.0) -> bool:
+    def trigger_cooldown(cls, initiator_tag: str, state_file: Path, duration: float = 180.0) -> bool:
         """
         触发全局统一静默冷却。
         调用该方法的线程已经在自己的线程内关闭了自己的浏览器。
-        该方法负责设置全局事件、计时、30s检测 douyin_state.json，并最终恢复事件。
+        该方法负责设置全局事件、计时、检测共享会话文件，并最终恢复事件。
         """
         is_initiator = False
         with cls._lock:
@@ -74,32 +83,36 @@ class WafCoordinator:
                 cls._cooldown_event.clear()
                 is_initiator = True
                 print(f"\n🚨 [{initiator_tag}] 检测到滑块/验证码风控！启动【全线程统一静默自愈】（休眠 {int(duration)} 秒）...", flush=True)
-                print(f"👉 所有后台浏览器将切断连接（完全零流量以让风控自然消退）。", flush=True)
-                print(f"👉 【快捷加速解除】：在 Clash 客户端随意切换另一个节点，然后双击桌面【完成验证.bat】立即换IP全员复活！", flush=True)
+                print("👉 其他线程将在下一检查点暂停新请求并关闭浏览器。", flush=True)
+                print(f"👉 可由人工运行完成验证脚本（同一会话路径；访客模式用 --anonymous-state），保存后提前恢复。会话: {state_file}", flush=True)
                 print(f"👉 【无人值守模式】：静默倒计时结束后将自动全员恢复推进。\n", flush=True)
 
         if not is_initiator:
             cls._cooldown_event.wait()
             return False
 
-        state_p = Path(r"D:\抖音视频下载\douyin_state.json")
-        init_mtime = state_p.stat().st_mtime if state_p.exists() else 0
-        end_time = time.time() + duration
+        def state_mtime():
+            try:
+                return state_file.stat().st_mtime_ns
+            except OSError:
+                return 0
+
+        init_mtime = state_mtime()
+        end_time = time.monotonic() + duration
         broken_early = False
-
-        while time.time() < end_time:
-            time.sleep(30.0)
-            cur_mtime = state_p.stat().st_mtime if state_p.exists() else 0
-            if cur_mtime > init_mtime:
-                print(f"\n⚡ [风控自愈系统] 检测到用户已手动完成滑块验证！立即全员提前唤醒，恢复满速下载！\n", flush=True)
-                broken_early = True
-                break
-
-        with cls._lock:
-            cls._in_cooldown = False
-            cls._cooldown_event.set()
-            if not broken_early:
-                print(f"\n⚡ [风控自愈系统] 静默期已满 {int(duration)} 秒，服务端频控已充分消退，全员唤醒并重启浏览器！\n", flush=True)
+        try:
+            while time.monotonic() < end_time:
+                time.sleep(min(1.0, max(0, end_time - time.monotonic())))
+                if state_mtime() != init_mtime and state_file.exists():
+                    print("\n⚡ 检测到会话已更新，提前恢复并重新尝试。\n", flush=True)
+                    broken_early = True
+                    break
+        finally:
+            with cls._lock:
+                cls._in_cooldown = False
+                cls._cooldown_event.set()
+        if not broken_early:
+            print(f"\n⚡ 冷却 {int(duration)} 秒结束，重新尝试解析。\n", flush=True)
 
         return broken_early
 
@@ -117,10 +130,13 @@ class WafCoordinator:
 
 class TableWorker:
     """独立的工作者实例，拥有自己的浏览器和 HTTP 客户端"""
-    def __init__(self, worker_id: int, dest_dir: Path):
+    def __init__(self, worker_id: int, dest_dir: Path, state_file: Optional[Path] = None, proxy: Optional[str] = None, output_name: Optional[str] = None):
         self.worker_id = worker_id
         self.dest_dir = dest_dir
-        # 视频文件下载器：设置 trust_env=False 强制本地网络直连下载，不消耗代理流量、跑满宽带
+        self.output_name = output_name
+        self.state_file = state_file or default_state_file()
+        self.proxy = proxy
+        # 忽略应用层/系统代理设置；操作系统 TUN 接管仍需在代理客户端关闭或分流。
         self.http_client = httpx.Client(
             headers=HEADERS,
             timeout=httpx.Timeout(connect=15.0, read=90.0, write=90.0, pool=90.0),
@@ -137,38 +153,28 @@ class TableWorker:
     def start_browser(self):
         if self.page and not self.page.is_closed():
             return
+        if self.context:
+            self.page = self.context.new_page()
+            return
         if not self.playwright:
             self.playwright = sync_playwright().start()
-
-        launch_kwargs = {
-            "headless": True,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-            ]
-        }
-        # 页面元数据解析器：若检测到 Clash 运行，接入代理；仅消耗微量文本流量，彻底规避风控
-        if is_clash_running():
-            launch_kwargs["proxy"] = {"server": CLASH_PROXY_URL}
-
-        self.browser = self.playwright.chromium.launch(**launch_kwargs)
+        self.browser = self.playwright.chromium.launch(**browser_launch_options(self.proxy, headless=True))
+        user_agent = browser_user_agent(self.browser.version)
+        self.http_client.headers["User-Agent"] = user_agent
         context_kwargs = {
-            "user_agent": USER_AGENT,
+            "user_agent": user_agent,
             "viewport": {"width": 1280, "height": 720},
             "locale": "zh-CN",
+            "service_workers": "block",
         }
-        state_file = Path(r"D:\抖音视频下载\douyin_state.json")
-        if state_file.exists():
-            context_kwargs["storage_state"] = str(state_file)
+        if self.state_file.exists():
+            context_kwargs["storage_state"] = str(self.state_file)
         self.context = self.browser.new_context(**context_kwargs)
-        self.page = self.context.new_page()
-        # 拦截图片和字体以提升解析效率
-        self.page.route("**/*", lambda route: (
-            route.abort() if route.request.resource_type in ["image", "media", "font"]
+        self.context.route("**/*", lambda route: (
+            route.abort() if should_block_browser_request(route.request.url, route.request.resource_type)
             else route.continue_()
         ))
+        self.page = self.context.new_page()
         try:
             self.page.goto("https://www.douyin.com/", wait_until="commit", timeout=10000)
             self.captcha_hit = False
@@ -189,15 +195,12 @@ class TableWorker:
         self.resolve_count = 0
 
     def close_browser(self):
-        try:
-            if self.context:
-                self.context.close()
-            if self.browser:
-                self.browser.close()
-            if self.playwright:
-                self.playwright.stop()
-        except Exception:
-            pass
+        for resource, method in [(self.context, "close"), (self.browser, "close"), (self.playwright, "stop")]:
+            if resource:
+                try:
+                    getattr(resource, method)()
+                except Exception:
+                    pass
         self.playwright = None
         self.browser = None
         self.context = None
@@ -260,7 +263,7 @@ class TableWorker:
                         filter_det = data.get("filter_detail") or {}
                         notice = filter_det.get("detail_msg") or filter_det.get("notice")
                         if notice:
-                            return None, f"已删除/不可见({notice})"
+                            return None, detail_notice_error(notice)
                         return None, "未捕获到有效视频数据(空详情)"
 
                     if getattr(self, "captcha_hit", False):
@@ -284,6 +287,14 @@ class TableWorker:
                         self.page.remove_listener("response", on_response)
                     except Exception:
                         pass
+                finally:
+                    # 元数据已经捕获，关闭页面以停止播放器预加载；保留 context 复用会话。
+                    if self.page:
+                        try:
+                            self.page.close()
+                        except Exception:
+                            pass
+                        self.page = None
 
             if attempt < max_retries - 1:
                 time.sleep(2.0)
@@ -292,25 +303,27 @@ class TableWorker:
         return None, "未捕获到视频元数据"
 
     def download_video_stream(self, cdn_urls: List[str], target_path: Path) -> bool:
-        """下载普通视频流"""
+        """先在本地完成下载，再通过独立临时文件发布到输出目录。"""
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target_path.with_name(f"{target_path.stem}.tmp")
-
-        for cdn_url in cdn_urls:
-            try:
-                with self.http_client.stream("GET", cdn_url) as resp:
-                    if resp.status_code == 200:
-                        with open(tmp_path, "wb") as f:
+        with tempfile.TemporaryDirectory(prefix="dy_video_") as local:
+            tmp_path = Path(local) / "download.mp4"
+            for cdn_url in cdn_urls:
+                WafCoordinator.check_and_wait(f"工作线程 {self.worker_id}", self)
+                try:
+                    with self.http_client.stream("GET", cdn_url) as resp:
+                        if resp.status_code != 200:
+                            continue
+                        with tmp_path.open("wb") as stream:
                             for chunk in resp.iter_bytes(chunk_size=65536):
-                                f.write(chunk)
-                        if tmp_path.exists() and tmp_path.stat().st_size > 10240:
-                            tmp_path.replace(target_path)
-                            return True
-            except Exception:
-                pass
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
+                                stream.write(chunk)
+                    if tmp_path.stat().st_size > 10240:
+                        publish_local_file(tmp_path, target_path)
+                        return True
+                except OSError as exc:
+                    print(f"[工作线程 {self.worker_id}] 文件写入失败: {target_path.name}: {exc}", flush=True)
+                    return False
+                except Exception:
+                    continue
 
         return False
 
@@ -322,6 +335,7 @@ class TableWorker:
                 td = Path(tmpdir)
                 local_pngs = []
                 for i, img_u in enumerate(img_urls):
+                    WafCoordinator.check_and_wait(f"工作线程 {self.worker_id}", self)
                     try:
                         r = self.http_client.get(img_u)
                         if r.status_code == 200:
@@ -348,6 +362,7 @@ class TableWorker:
                 # 下载 BGM
                 bgm_file = None
                 for bgm_u in bgm_urls:
+                    WafCoordinator.check_and_wait(f"工作线程 {self.worker_id}", self)
                     try:
                         r_a = self.http_client.get(bgm_u)
                         if r_a.status_code == 200 and len(r_a.content) > 1024:
@@ -391,41 +406,33 @@ class TableWorker:
                 )
 
                 if temp_out.exists() and temp_out.stat().st_size > 10240:
-                    tmp_final = target_path.with_name(f"{target_path.stem}.tmp")
-                    shutil.copyfile(temp_out, tmp_final)
-                    tmp_final.replace(target_path)
+                    publish_local_file(temp_out, target_path)
                     return True
         except Exception as e:
             return False
 
         return False
 
-    def process_excel(self, excel_path: Path, max_limit: Optional[int] = None):
-        subfolder_name = excel_path.stem
+    def process_excel(self, excel_path: Path, max_limit: Optional[int] = None) -> int:
+        subfolder_name = self.output_name or portable_name(excel_path.stem, fallback="表格")
         folder_dest = self.dest_dir / subfolder_name
         folder_dest.mkdir(parents=True, exist_ok=True)
         completion_flag = folder_dest / "_COMPLETED.flag"
         tag = f"[工作线程 {self.worker_id} | {subfolder_name}]"
 
-        if completion_flag.exists():
-            print(f"\n{tag} 该表格之前已全部处理完成（检测到 _COMPLETED.flag），立即跳过！", flush=True)
-            return
+        # 旧版标记即使有失败/仅试跑也会写入。始终核对表格和文件，避免永远漏掉失败行。
+        completion_flag.unlink(missing_ok=True)
 
         manifest_path = folder_dest / "manifest.json"
         print(f"\n{tag} 开始处理表格: {excel_path.name}", flush=True)
 
-        manifest = {}
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except Exception:
-                manifest = {}
+        manifest = read_manifest(manifest_path)
 
         try:
             df = pd.read_excel(excel_path)
         except Exception as e:
             print(f"{tag} 读取 Excel 失败: {e}", flush=True)
-            return
+            return 1
 
         link_col = None
         for col in ["播放地址", "视频链接", "链接", "url", "URL"]:
@@ -441,7 +448,7 @@ class TableWorker:
 
         if not link_col:
             print(f"{tag} 未找到链接列，跳过！", flush=True)
-            return
+            return 1
 
         total_rows = len(df)
         if max_limit:
@@ -450,7 +457,7 @@ class TableWorker:
         print(f"{tag} 找到链接列 [{link_col}]，待处理 {len(df)} 行（总计 {total_rows} 行）", flush=True)
 
         def save_manifest():
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_manifest(manifest_path, manifest)
 
         success_count = 0
         skip_count = 0
@@ -464,6 +471,8 @@ class TableWorker:
             video_id = extract_video_id(raw_url)
 
             if not video_id:
+                fail_count += 1
+                print(f"{tag} 第 {idx + 1} 行无法提取视频 ID，请提供完整 video/note 链接。", flush=True)
                 continue
 
             # 1. 检查物理文件是否已存在（无论是 视频-{video_id}.mp4 还是 图文-{video_id}.mp4）
@@ -482,7 +491,8 @@ class TableWorker:
                 continue
 
             # 2. 检查 manifest 是否已确认原片已删除/不可见
-            if manifest.get(video_id, {}).get("status") == "deleted":
+            previous = manifest.get(video_id, {})
+            if previous.get("status") == "deleted" and is_permanent_unavailability(previous.get("reason", "")):
                 deleted_count += 1
                 consecutive_fails = 0
                 continue
@@ -490,38 +500,21 @@ class TableWorker:
             # 3. 解析视频元数据
             print(f"{tag} [{idx+1}/{len(df)}] 解析第{rank}名 (ID: {video_id})...", flush=True)
             det, err = self.resolve_video_info(video_id)
-
+            if err and "触发验证码风控" in err:
+                for duration in (180.0, 300.0):
+                    self.close_browser()
+                    manual_ok = WafCoordinator.trigger_cooldown(tag, self.state_file, duration=duration)
+                    if self.worker_id > 1:
+                        time.sleep(random.uniform(3.0, 5.0))
+                    det, err = self.resolve_video_info(video_id)
+                    if not err or "触发验证码风控" not in err or manual_ok:
+                        break
             if err:
-                if "已删除" in err:
+                if is_permanent_unavailability(err):
                     deleted_count += 1
                     consecutive_fails = 0
                     manifest[video_id] = {"status": "deleted", "reason": err}
                     print(f"{tag}   -> ⚠️ {err}", flush=True)
-                elif "触发验证码风控" in err:
-                    # 遇到风控：立即协同全线程统一静默自愈（首轮 180 秒静默），并重试当前视频
-                    manual_ok = WafCoordinator.trigger_cooldown(tag, duration=180.0)
-                    if self.worker_id > 1:
-                        time.sleep(random.uniform(3.0, 5.0))
-                    self.start_browser()
-                    det, err = self.resolve_video_info(video_id)
-
-                    if err and "触发验证码风控" in err and not manual_ok:
-                        # 若首轮静默后频控仍在衰减中，触发二次深度静默（300 秒）
-                        manual_ok = WafCoordinator.trigger_cooldown(tag, duration=300.0)
-                        if self.worker_id > 1:
-                            time.sleep(random.uniform(3.0, 5.0))
-                        self.start_browser()
-                        det, err = self.resolve_video_info(video_id)
-
-                    # 如果经历了两轮静默（总计 8 分钟全域零流量）依然报错，再跳入下一行防止永久挂起
-                    if err:
-                        fail_count += 1
-                        consecutive_fails += 1
-                        manifest[video_id] = {"status": "failed", "reason": err}
-                        print(f"{tag}   -> ❌ 多轮静默后仍受限，跳过该行: {err}", flush=True)
-                        if (idx + 1) % 5 == 0:
-                            save_manifest()
-                        continue
                 else:
                     fail_count += 1
                     consecutive_fails += 1
@@ -597,17 +590,20 @@ class TableWorker:
             if (idx + 1) % 5 == 0 or ok:
                 save_manifest()
 
-            # 正常处理完成后的随机微抖动延迟，平滑流量（2.5 ~ 3.5 秒彻底避开同 IP 高频风控）
+            # 正常处理完成后加入随机延迟，降低并发请求峰值。
             time.sleep(random.uniform(2.5, 3.5))
 
         save_manifest()
-        completion_flag.touch(exist_ok=True)
+        if fail_count == 0 and (max_limit is None or max_limit >= total_rows):
+            completion_flag.touch(exist_ok=True)
         print(f"\n{tag} 表格处理完毕: 成功 {success_count} | 跳过 {skip_count} | 已删除 {deleted_count} | 失败 {fail_count}\n", flush=True)
+        return fail_count
 
 
-def worker_thread_loop(worker_id: int, task_queue: queue.Queue, dest_dir: Path, max_limit: Optional[int]):
-    worker = TableWorker(worker_id, dest_dir)
+def worker_thread_loop(worker_id, task_queue, dest_dir, max_limit, state_file, proxy, results, output_name=None):
+    worker = None
     try:
+        worker = TableWorker(worker_id, dest_dir, state_file, proxy, output_name)
         while True:
             try:
                 excel_file = task_queue.get_nowait()
@@ -615,36 +611,70 @@ def worker_thread_loop(worker_id: int, task_queue: queue.Queue, dest_dir: Path, 
                 break
 
             try:
-                worker.process_excel(excel_file, max_limit=max_limit)
+                results.put(worker.process_excel(excel_file, max_limit=max_limit))
             except Exception as e:
+                results.put(1)
                 print(f"[工作线程 {worker_id}] 处理表格 {excel_file.name} 异常: {e}", flush=True)
             finally:
                 task_queue.task_done()
+    except Exception as e:
+        results.put(1)
+        print(f"[工作线程 {worker_id}] 初始化失败: {e}", flush=True)
     finally:
-        worker.close()
+        if worker:
+            worker.close()
         print(f"[工作线程 {worker_id}] 全部任务结束，已退出并清理资源。", flush=True)
 
 
-def main():
+def main(argv=None):
     import argparse
-    parser = argparse.ArgumentParser(description="灰豚数据带货视频双线程轮询批量下载器")
-    parser.add_argument("--test", type=int, default=None, help="每个表格仅测试前 N 个视频")
+    parser = argparse.ArgumentParser(description="灰豚 Excel 批量下载（Windows / macOS）")
+    parser.add_argument("inputs", nargs="*", type=Path, help="Excel 文件或包含 Excel 的目录，可指定多个")
+    parser.add_argument("--source", action="append", type=Path, default=[], help="输入目录/文件，可重复指定")
+    parser.add_argument("-o", "--output", type=Path, default=DEST_DIR, help=f"视频输出根目录（默认 {DEST_DIR}）")
+    parser.add_argument("--output-name", help="单表任务的输出子目录名（默认使用表名）")
+    parser.add_argument("--test", type=positive_int, default=None, help="每个表格仅测试前 N 行，不标记整表完成")
     parser.add_argument("--month", type=str, default=None, help="指定月份文件名匹配，例如 2025-10")
-    parser.add_argument("--concurrency", type=int, default=2, help="同时下载的表格数量（默认 2 个）")
-    args = parser.parse_args()
+    parser.add_argument("--concurrency", type=positive_int, default=2, help="同时下载的表格数量（默认 2 个）")
+    access = parser.add_mutually_exclusive_group()
+    access.add_argument("--account", help="从现有账号池复制指定账号的会话（备注或账号 ID）")
+    access.add_argument("--anonymous-state", type=Path, help="使用独立未登录会话；完全不读取或复制账号池")
+    parser.add_argument("--dry-run", action="store_true", help="仅列出输入、输出和任务，不启动浏览器或下载")
+    add_session_arguments(parser)
+    args = parser.parse_args(argv)
 
     files = []
-    for s_dir in SOURCE_DIRS:
-        if s_dir.exists():
-            found = sorted(list(s_dir.glob("*.xlsx")))
-            files.extend(found)
-
-    if not files:
-        print("未在源目录中找到 Excel 文件！")
-        return
+    sources = args.inputs + args.source
+    if not sources:
+        sources = [path for path in SOURCE_DIRS if path.is_dir()]
+    for source in sources:
+        source = source.expanduser().resolve()
+        if source.is_dir():
+            files.extend(sorted(path for path in source.iterdir()
+                                if path.is_file() and path.suffix.lower() == ".xlsx" and not path.name.startswith("~$")))
+        elif source.is_file() and source.suffix.lower() == ".xlsx":
+            files.append(source)
+        else:
+            parser.error(f"输入不存在或不是 xlsx 文件/目录: {source}")
+    files = list(dict.fromkeys(files))
 
     if args.month:
         files = [f for f in files if args.month in f.name]
+    if not files:
+        parser.error("没有找到匹配的 Excel；请通过 --source 输入目录（或直接传入 xlsx 文件），并用 -o 指定输出目录。")
+    if args.output_name is not None:
+        if len(files) != 1:
+            parser.error("--output-name 仅支持单表任务")
+        if not args.output_name or args.output_name in {".", ".."} or portable_name(args.output_name) != args.output_name:
+            parser.error("--output-name 必须是有效的单层目录名")
+    names = {}
+    for path in files:
+        name = portable_name(path.stem, fallback="表格").casefold()
+        if name in names:
+            parser.error(f"两个表格的输出目录重名，请先改名或分开运行: {names[name]} / {path}")
+        names[name] = path
+    dest_dir = args.output.expanduser().resolve()
+    state_file = (args.anonymous_state or args.state_file).expanduser().resolve()
 
     print(f"=======================================================")
     print(f"共发现 {len(files)} 个待处理表格任务，准备进入队列轮询调度:")
@@ -653,11 +683,28 @@ def main():
     if len(files) > 15:
         print(f"  ... 以及后续 {len(files) - 15} 个分类表格")
     print(f"并发表格数: {args.concurrency}（同时下载 {args.concurrency} 张表，完成一张接续下一张）")
-    print(f"保存目录: {DEST_DIR}")
+    print(f"保存目录: {dest_dir}")
+    print(f"会话文件: {state_file}")
+    if args.anonymous_state:
+        print("会话模式: 独立访客（不使用账号池）")
     print(f"命名规范: 视频-视频ID.mp4 / 图文-视频ID.mp4")
     print(f"=======================================================\n", flush=True)
+    if args.dry_run:
+        for path in files:
+            print(f"{path} -> {dest_dir / (args.output_name or portable_name(path.stem, fallback='表格'))}")
+        return 0
+    if not shutil.which("ffmpeg"):
+        parser.error("缺少 ffmpeg；Mac 请运行 brew install ffmpeg，Windows 请安装 FFmpeg 并加入 PATH。")
+    try:
+        proxy = resolve_proxy(args.proxy)
+        state_file = (prepare_anonymous_state_file(state_file) if args.anonymous_state
+                      else prepare_state_file(state_file, args.account))
+    except (ValueError, RuntimeError, OSError) as e:
+        parser.error(str(e))
+    print(f"浏览器解析: {'使用代理' if proxy else '直连'}；文件下载: 忽略系统代理（请关闭 TUN，或配置 DIRECT 分流）。", flush=True)
 
     task_queue = queue.Queue()
+    results = queue.Queue()
     for f in files:
         task_queue.put(f)
 
@@ -666,7 +713,7 @@ def main():
     for i in range(1, concurrency + 1):
         t = threading.Thread(
             target=worker_thread_loop,
-            args=(i, task_queue, DEST_DIR, args.test),
+            args=(i, task_queue, dest_dir, args.test, state_file, proxy, results, args.output_name),
             name=f"TableWorker-{i}",
             daemon=False
         )
@@ -678,8 +725,12 @@ def main():
     for t in threads:
         t.join()
 
-    print("\n🎉 所有表格视频已全部处理完成！", flush=True)
+    failures = 0
+    while not results.empty():
+        failures += results.get_nowait()
+    print(f"\n全部表格处理结束，失败项: {failures}。重复同一命令可补跑失败/缺失文件。", flush=True)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

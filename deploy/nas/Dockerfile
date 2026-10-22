@@ -28,6 +28,7 @@ RUN uv venv /opt/venv --python 3.12 \
 
 COPY app ./app
 COPY README.md pyproject.toml ./
+COPY batch_download_huitun.py login_douyin.py verify_douyin_interactive.py ./
 COPY deploy/nas/docker-entrypoint.sh /usr/local/bin/douyin-entrypoint
 RUN uv pip install --python /opt/venv/bin/python --no-deps . \
     && chmod 0755 /usr/local/bin/douyin-entrypoint

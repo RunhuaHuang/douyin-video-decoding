@@ -27,12 +27,12 @@ PRIORITY_TASKS = [
     {
         "name": "分享榜-AI榜",
         "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享AI视频总榜.xlsx"),
-        "dest": Path(r"D:\抖音视频下载\分享榜\2. AI榜"),
+        "dest": Path(r"D:\抖音视频下载\分享榜\AI榜"),
     },
     {
         "name": "分享榜-星图榜",
         "excel": Path(r"C:\Users\cuhksz\Desktop\灰豚数据\热门视频-分享排序\分享星图总榜.xlsx"),
-        "dest": Path(r"D:\抖音视频下载\分享榜\3. 星图榜"),
+        "dest": Path(r"D:\抖音视频下载\分享榜\星图榜"),
     },
 ]
 

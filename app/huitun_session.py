@@ -26,8 +26,18 @@ def verification_complete(page, detail_seen):
         if any(token in frame.url.lower() for token in ("verifycenter", "captcha")):
             # Douyin keeps an invisible rmc-nocaptcha iframe on normal video
             # pages. Only an actually displayed challenge blocks completion.
-            if frame.frame_element().is_visible():
+            try:
+                el = frame.frame_element()
+                if el and el.is_visible():
+                    return False
+            except Exception:
                 return False
+    try:
+        captcha_el = page.locator("#captcha_container, .captcha_verify_container, .secsdk-captcha-drag-wrapper")
+        if captcha_el.count() > 0 and captcha_el.first.is_visible():
+            return False
+    except Exception:
+        pass
     return detail_seen or page.locator("video").count() > 0
 
 

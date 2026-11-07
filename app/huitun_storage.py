@@ -53,7 +53,7 @@ def publish_local_file(source: Path, target: Path):
 
 def read_manifest(path: Path):
     try:
-        raw = retry_storage(lambda: path.read_text(encoding="utf-8"))
+        raw = retry_storage(lambda: path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return {}
     # Unreadable or malformed state must never be replaced with an empty map.

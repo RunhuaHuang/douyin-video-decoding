@@ -286,7 +286,7 @@ class LibraryStore:
 
     def register(self, work_id, worker, lease, path, kind, probe, sha256, storage_root='new'):
         base = Path(self.roots[storage_root]).resolve()
-        relative = str(path.resolve().relative_to(base))
+        relative = path.resolve().relative_to(base).as_posix()
         stat = path.stat()
         with self.transaction() as db:
             self._check(db, work_id, worker, lease)

@@ -147,7 +147,7 @@ def test_find_latest_processed_path_ignores_non_processed_files(tmp_path, monkey
 
 def test_find_latest_processed_path_supports_glob_metacharacters_in_stem(tmp_path, monkeypatch):
     monkeypatch.setattr(csv_service, "OUTPUT_DIR", tmp_path)
-    result = tmp_path / "clip[1]*.abcd1234.processed.csv"
+    result = tmp_path / "clip[1].abcd1234.processed.csv"
     result.write_text("result", encoding="utf-8")
 
-    assert find_latest_processed_path("clip[1]*.csv") == result
+    assert find_latest_processed_path("clip[1].csv") == result

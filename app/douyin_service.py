@@ -595,18 +595,19 @@ class DouyinService:
             self._note_response_result(response)
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
-            with output_path.open("wb") as file_handle:
-                try:
+            try:
+                with output_path.open("wb") as file_handle:
                     for chunk in response.iter_bytes():
                         if chunk:
                             if len(buffer) < 1024:
                                 remaining = 1024 - len(buffer)
                                 buffer.extend(chunk[:remaining])
                             file_handle.write(chunk)
-                except Exception:
-                    # 中途异常时清理半成品文件，避免误用截断内容
-                    output_path.unlink(missing_ok=True)
-                    raise
+            except Exception:
+                # Windows forbids unlinking an open file. Close it first, then
+                # remove the partial output without masking the stream error.
+                output_path.unlink(missing_ok=True)
+                raise
         if not self._looks_like_media_payload(bytes(buffer), content_type, url):
             # 流式响应未 read 时 .text 会抛 ResponseNotRead，前 1024 字节 buffer 判定 HTML 挑战页
             if self._looks_like_challenge_page(bytes(buffer).decode("utf-8", errors="ignore")):

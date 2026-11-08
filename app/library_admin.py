@@ -15,12 +15,12 @@ def flatten(store):
     for row in rows:
         prefix='图文' if row['kind']=='note' else '视频'
         new=Path('媒体库')/f"{prefix}-{row['work_id']}.mp4"
-        if str(new)==row['relative_path']:continue
+        if new.as_posix()==row['relative_path']:continue
         old=store.root/row['relative_path'];target=store.root/new
         if not old.exists():raise ValueError('Missing indexed source: '+str(old))
         if file_hash(old)!=row['sha256']:raise ValueError('Checksum mismatch: '+str(old))
         if target.exists():raise ValueError('Destination already exists: '+str(target))
-        actions.append({'asset_id':row['asset_id'],'old':str(old),'new':str(target),'relative_path':str(new)})
+        actions.append({'asset_id':row['asset_id'],'old':str(old),'new':str(target),'relative_path':new.as_posix()})
     journal=store.root/'任务'/f'flat-layout-{time.time_ns()}.json'
     journal.write_text(json.dumps(actions,ensure_ascii=False,indent=2))
     moved=[]

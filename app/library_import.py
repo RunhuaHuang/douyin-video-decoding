@@ -88,7 +88,7 @@ def import_candidates(store, inventory_path, root_prefixes):
             if not m or m[2] not in known or int(size)<1024:continue
             root_key=next((key for key,prefix in root_prefixes.items() if p.is_relative_to(Path(prefix))),None)
             if root_key is None:continue
-            relative=str(p.relative_to(Path(root_prefixes[root_key])))
+            relative=p.relative_to(Path(root_prefixes[root_key])).as_posix()
             db.execute('INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?)',(m[2],root_key,relative,int(size),'note' if m[1]=='图文' else 'video'))
             count+=1
     return count

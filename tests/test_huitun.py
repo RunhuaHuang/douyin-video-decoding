@@ -20,7 +20,7 @@ from app import huitun_session as session
 
 
 VIDEO_ID = "7667889682693290106"
-DETAIL = {"aweme_type": 0, "video": {"play_addr": {"url_list": ["https://cdn.example/video.mp4"]}}}
+DETAIL = {"aweme_id": VIDEO_ID, "aweme_type": 0, "video": {"play_addr": {"url_list": ["https://cdn.example/video.mp4"]}}}
 
 
 def make_table(path, ids=(VIDEO_ID,)):
@@ -98,7 +98,7 @@ def test_guest_cli_bypasses_pool_and_passes_selected_state(tmp_path, monkeypatch
     monkeypatch.setattr(batch.shutil, "which", lambda _: "/fixture/ffmpeg")
     monkeypatch.setattr(batch, "prepare_state_file", lambda *args: pytest.fail("must not seed old cookies"))
     calls = []
-    def run_worker(worker_id, task_queue, dest_dir, limit, state_file, proxy, results, output_name):
+    def run_worker(worker_id, task_queue, dest_dir, limit, state_file, proxy, results, output_name, anonymous=False):
         calls.append(state_file)
         results.put(0)
     monkeypatch.setattr(batch, "worker_thread_loop", run_worker)
@@ -345,6 +345,7 @@ def test_verification_survives_navigation_after_captcha(tmp_path, monkeypatch):
     page.title.side_effect = [Error("Execution context was destroyed, most likely because of a navigation"), "抖音视频"]
     page.frames = []
     page.locator.return_value.count.return_value = 1
+    page.locator.return_value.first.is_visible.return_value = False
     manager = MagicMock()
     manager.__enter__.return_value = playwright
     monkeypatch.setattr(session, "sync_playwright", lambda: manager)
@@ -434,6 +435,8 @@ def test_real_browser_blocks_fetch_media_and_httpx_download_bypasses_proxy(tmp_p
     worker = batch.TableWorker(1, tmp_path, tmp_path / "absent.json", proxy)
     try:
         worker.start_browser()
+        assert worker.page.url == 'about:blank'
+        worker.page.goto('https://www.douyin.com/')
         blocked = worker.page.evaluate("async () => {try {await fetch('/video.mp4'); return false;} catch {return true;}}")
         assert blocked
         assert not any("video.mp4" in path for path in hits)
@@ -463,3 +466,117 @@ def test_note_synthesis_with_unicode_and_spaces(worker):
     info = json.loads(result.stdout)
     assert {stream["codec_type"] for stream in info["streams"]} == {"video", "audio"}
     assert abs(float(info["format"]["duration"]) - 2.0) < 0.2
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="requires ffmpeg")
+def test_note_preserves_different_sized_images_in_order(worker):
+    images = []
+    for color, size in (("red", "320x240"), ("blue", "240x320")):
+        images.append(subprocess.run([
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"color={color}:s={size}", "-vf", "noise=alls=8:allf=t",
+            "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1",
+        ], capture_output=True, check=True, timeout=30).stdout)
+    worker.http_client.close()
+    worker.http_client = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=images[int(request.url.path[-1]) - 1])))
+    target = worker.dest_dir / "不同尺寸.mp4"
+    assert worker.synthesize_note_mp4(["https://fixture/1", "https://fixture/2"], [], target)
+    for timestamp, dominant in (("0.5", 0), ("1.5", 2)):
+        pixels = subprocess.run([
+            "ffmpeg", "-v", "error", "-ss", timestamp, "-i", str(target),
+            "-vf", "crop=10:10:355:635,scale=1:1", "-frames:v", "1",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ], capture_output=True, check=True, timeout=30).stdout
+        assert len(pixels) == 3 and pixels[dominant] > 180 and pixels[2-dominant] < 60
+
+
+def test_note_rejects_missing_image(worker):
+    worker.http_client.close()
+    worker.http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(404)))
+    assert not worker.synthesize_note_mp4(["https://fixture/missing"], [], worker.dest_dir / "缺失.mp4")
+
+
+@pytest.mark.parametrize('url,expected',[
+    ('https://verify.zijieapi.com/captcha/get?x=1',True),
+    ('https://verify.zijieapi.com/captcha/verify',True),
+    ('https://www.douyin.com/captcha/v2/get',True),
+    ('https://lf.douyin.com/rc-verifycenter/captcha/index.js',False),
+    ('https://verify.zijieapi.com/captcha/get.js',False),
+    ('https://www.douyin.com/aweme/v1/web/aweme/detail/',False),
+])
+def test_captcha_api_detection_excludes_normal_static_assets(url,expected):
+    assert support.is_captcha_response(url) is expected
+
+
+def metadata_page(worker,monkeypatch,responses):
+    callbacks={}
+    page=MagicMock()
+    page.url=f'https://www.douyin.com/video/{VIDEO_ID}'
+    page.title.return_value='抖音视频'
+    page.locator.return_value.count.return_value=0
+    page.on.side_effect=lambda event,callback:callbacks.update(response=callback)
+    def goto(*args,**kwargs):
+        for url,payload in responses:
+            callbacks['response'](SimpleNamespace(url=url,json=lambda p=payload:p))
+    page.goto.side_effect=goto
+    monkeypatch.setattr(worker,'start_browser',lambda:setattr(worker,'page',page))
+    return page
+
+
+def test_metadata_ignores_another_works_response(worker,monkeypatch):
+    wrong={**DETAIL,'aweme_id':'123'}
+    metadata_page(worker,monkeypatch,[
+        ('https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=123',{'aweme_detail':wrong}),
+        (f'https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={VIDEO_ID}',{'aweme_detail':DETAIL}),
+    ])
+    assert worker.resolve_video_info(VIDEO_ID)==(DETAIL,None)
+
+
+@pytest.mark.parametrize('payload,expected',[
+    ({'aweme_filter_detail':{'detail_msg':'因作品权限或已被删除，无法观看'}},'访问受限'),
+    ({'aweme_filter_detail':{'filter_reason':0,'aweme_id':VIDEO_ID}},'访问受限'),
+    ({'status_msg':'请完成安全验证'},'触发验证码风控'),
+])
+def test_windows_detail_variants_preserve_ambiguous_failures(worker,monkeypatch,payload,expected):
+    metadata_page(worker,monkeypatch,[('https://www.douyin.com/aweme/v1/web/aweme/detail/',payload)])
+    detail,error=worker.resolve_video_info(VIDEO_ID)
+    assert detail is None and error.startswith(expected)
+    assert not batch.is_permanent_unavailability(error)
+
+
+def test_captcha_response_returns_early_and_closes_only_page(worker,monkeypatch):
+    page=metadata_page(worker,monkeypatch,[('https://verify.zijieapi.com/captcha/get',{})])
+    assert worker.resolve_video_info(VIDEO_ID)==(None,'触发验证码风控')
+    page.close.assert_called_once()
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_work_count_recycles_browser_only_at_configured_boundary(worker,monkeypatch):
+    metadata_page(worker,monkeypatch,[('https://www.douyin.com/aweme/v1/web/aweme/detail/',{'aweme_detail':DETAIL})])
+    worker.browser_recycle_works=25
+    worker.resolve_count=24
+    restarts=[]
+    def restart():
+        restarts.append(True)
+        worker.resolve_count=0
+    monkeypatch.setattr(worker,'restart_browser',restart)
+    assert worker.resolve_video_info(VIDEO_ID)[0]==DETAIL
+    assert restarts==[]
+    assert worker.resolve_video_info(VIDEO_ID)[0]==DETAIL
+    assert restarts==[True] and worker.resolve_count==1
+
+
+@pytest.mark.skipif(os.environ.get('DOUYIN_BROWSER_SMOKE')!='1',reason='requires installed Chromium')
+def test_visible_captcha_prevents_false_manual_verification_success():
+    with session.sync_playwright() as playwright:
+        browser=playwright.chromium.launch(**support.browser_launch_options(None,headless=True))
+        try:
+            page=browser.new_page()
+            page.route('**/*',lambda route:route.fulfill(content_type='text/html',body=(
+                '<title>抖音视频</title><video></video><div id="captcha_container">验证</div>')))
+            page.goto(f'https://www.douyin.com/video/{VIDEO_ID}')
+            assert not session.verification_complete(page,True)
+            page.locator('#captcha_container').evaluate("el => el.style.display='none'")
+            assert session.verification_complete(page,True)
+        finally:
+            browser.close()

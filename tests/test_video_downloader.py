@@ -180,11 +180,18 @@ def test_preflight_challenge_routes_to_note_before_page_navigation(tmp_path, mon
         downloader.close()
 
 
-def test_cli_list_accounts(capsys):
-    ret = main(["--list-accounts"])
-    assert ret == 0
-    captured = capsys.readouterr()
-    assert "吴倩" in captured.out or "账号池" in captured.out
+def test_cli_list_accounts(capsys, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("app.video_downloader.CookieAccountManager.list_available_accounts",
+                        lambda self: [SimpleNamespace(label="fixture-account", storage_state_path="fixture.json")])
+    assert main(["--list-accounts"]) == 0
+    assert "fixture-account" in capsys.readouterr().out
+
+
+def test_cli_list_accounts_empty(capsys, monkeypatch):
+    monkeypatch.setattr("app.video_downloader.CookieAccountManager.list_available_accounts", lambda self: [])
+    assert main(["--list-accounts"]) == 1
+    assert "账号池为空" in capsys.readouterr().out
 
 
 def test_cli_no_args():

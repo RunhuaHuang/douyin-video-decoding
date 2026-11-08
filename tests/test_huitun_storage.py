@@ -156,3 +156,10 @@ def test_manifest_invalid_temporary_handle_uses_a_new_file(tmp_path, monkeypatch
     storage.write_manifest(path, updated)
     assert storage.read_manifest(path) == updated
     assert len(failed_paths) == 2 and failed_paths[0] != failed_paths[1]
+
+
+def test_manifest_accepts_windows_utf8_bom(tmp_path):
+    path=tmp_path/'manifest.json'
+    data={'123':{'status':'success','file':'视频-123.mp4'}}
+    path.write_text(json.dumps(data,ensure_ascii=False),encoding='utf-8-sig')
+    assert storage.read_manifest(path)==data

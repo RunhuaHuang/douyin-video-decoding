@@ -127,6 +127,10 @@ def should_block_browser_request(url, resource_type):
         return True
     parsed = urlsplit(url)
     host, path = (parsed.hostname or "").lower(), parsed.path.lower()
+    if host in {"mon.zijieapi.com", "mcs.zijieapi.com"} or (
+        (host == "snssdk.com" or host.endswith(".snssdk.com")) and path.startswith("/log")
+    ):
+        return True
     # MediaSource players use fetch/XHR; resource_type alone misses those bytes.
     return (
         any(host == domain or host.endswith("." + domain) for domain in ("douyinvod.com", "bytevod.com"))
@@ -136,6 +140,25 @@ def should_block_browser_request(url, resource_type):
         or "mime_type=video" in parsed.query.lower()
         or "mime_type=audio" in parsed.query.lower()
     )
+
+
+def is_captcha_response(url):
+    """Recognize challenge API responses, never the normally loaded SDK assets."""
+    parsed = urlsplit(url)
+    path = parsed.path.lower().rstrip('/')
+    return (
+        (parsed.hostname == 'verify.zijieapi.com' and path in {'/captcha/get','/captcha/verify'})
+        or path.endswith(('/captcha/v2/get','/captcha/v2/verify'))
+    )
+
+
+def has_visible_captcha(page):
+    try:
+        elements = page.locator('#captcha_container, .captcha_verify_container, .secsdk-captcha-drag-wrapper')
+        return elements.count() > 0 and elements.first.is_visible()
+    except Exception:
+        # Navigation can remove the old DOM; the next page check will decide.
+        return False
 
 
 def positive_int(value):

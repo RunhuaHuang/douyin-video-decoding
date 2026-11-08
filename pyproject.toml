@@ -12,6 +12,7 @@ dependencies = [
   "pandas>=2.2.0",
   "playwright==1.64.0",
   "portalocker>=3.2.0",
+  "psutil>=5.9",
   "python-multipart>=0.0.9",
   "uvicorn[standard]>=0.30.0",
 ]
